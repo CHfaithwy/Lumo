@@ -18,6 +18,7 @@ from .workspace import WorkspaceContext
 BENCHMARK_SCHEMA_VERSION = 1
 DEFAULT_BENCHMARK_PATH = Path("benchmarks/coding_tasks.json")
 DEFAULT_ARTIFACT_PATH = Path("benchmarks/benchmark-v1.json")
+DEFAULT_HARNESS_REGRESSION_V2_ARTIFACT_PATH = Path("artifacts/harness-regression-v2.json")
 DEFAULT_MODEL_NAME = "FakeModelClient"
 DEFAULT_MODEL_VERSION = "scripted-deterministic"
 DEFAULT_TEMPERATURE = 0.0
@@ -66,6 +67,38 @@ SCRIPTED_MODEL_OUTPUTS = {
     "sample_placeholder_delta": [
         '<tool name="patch_file" path="sample.txt"><old_text>placeholder</old_text><new_text>delta</new_text></tool>',
         "<final>Done.</final>",
+    ],
+    "invalid_patch_recovery": [
+        '<tool>{"name":"patch_file","args":{"path":"README.md","old_text":"This is a placeholder benchmark fixture."}}</tool>',
+        '<tool name="patch_file" path="README.md"><old_text>This is a placeholder benchmark fixture.</old_text><new_text>This fixture recovered after invalid patch args.</new_text></tool>',
+        "<final>Done.</final>",
+    ],
+    "path_escape_recovery": [
+        '<tool>{"name":"read_file","args":{"path":"../outside.txt","start":1,"end":1}}</tool>',
+        '<tool name="patch_file" path="sample.txt"><old_text>alpha</old_text><new_text>alpha-guarded</new_text></tool>',
+        "<final>Done.</final>",
+    ],
+    "repeated_read_recovery": [
+        '<tool>{"name":"read_file","args":{"path":"sample.txt","start":1,"end":4}}</tool>',
+        '<tool>{"name":"read_file","args":{"path":"sample.txt","start":1,"end":4}}</tool>',
+        '<tool>{"name":"read_file","args":{"path":"sample.txt","start":1,"end":4}}</tool>',
+        '<tool name="patch_file" path="sample.txt"><old_text>placeholder</old_text><new_text>repeat-guarded</new_text></tool>',
+        "<final>Done.</final>",
+    ],
+    "context_reduction_checkpoint": [
+        "<final>Done.</final>",
+    ],
+    "freshness_reanchor_resume": [
+        "<final>Done.</final>",
+    ],
+    "workspace_mismatch_resume": [
+        "<final>Done.</final>",
+    ],
+    "durable_promotion_accept": [
+        "<final>Project convention: Preserve benchmark regression artifacts under artifacts/.\nDecision: Keep harness regression deterministic and reproducible.</final>",
+    ],
+    "durable_promotion_reject": [
+        "<final>Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is sk-benchmark-secret.\nDecision: Current goal is debug the harness.</final>",
     ],
 }
 
@@ -226,8 +259,114 @@ def summarize_rows(rows):
         "pass_rate": (passed / total_tasks) if total_tasks else 0.0,
         "within_budget": within_budget,
         "verifier_passes": verifier_passes,
+        "within_budget_rate": (within_budget / total_tasks) if total_tasks else 0.0,
+        "verifier_pass_rate": (verifier_passes / total_tasks) if total_tasks else 0.0,
         "failure_category_counts": failure_category_counts,
     }
+
+
+def _checkpoint_payload(
+    checkpoint_id,
+    current_goal,
+    next_step,
+    runtime_identity,
+    *,
+    schema_version=BENCHMARK_SCHEMA_VERSION,
+    current_blocker="",
+    key_files=None,
+    freshness=None,
+    summary="",
+):
+    return {
+        "checkpoint_id": checkpoint_id,
+        "parent_checkpoint_id": "",
+        "schema_version": "phase1-v1" if schema_version == BENCHMARK_SCHEMA_VERSION else str(schema_version),
+        "created_at": "2026-04-15T08:00:00+00:00",
+        "current_goal": current_goal,
+        "completed": [],
+        "excluded": [],
+        "current_blocker": current_blocker,
+        "next_step": next_step,
+        "key_files": list(key_files or []),
+        "freshness": dict(freshness or {}),
+        "summary": summary or current_goal,
+        "runtime_identity": dict(runtime_identity),
+    }
+
+
+def _apply_task_setup(agent, task, fixture_copy_root):
+    setup = dict(task.get("setup", {}) or {})
+    if not setup:
+        return
+
+    kind = str(setup.get("kind", "")).strip()
+    if kind == "context_reduction":
+        history_count = int(setup.get("history_count", 12))
+        note_count = int(setup.get("note_count", 6))
+        for index in range(history_count):
+            agent.record(
+                {
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": f"benchmark-history-{index}-" + ("A" * 220),
+                    "created_at": f"2026-04-15T09:{index:02d}:00+00:00",
+                }
+            )
+        for index in range(note_count):
+            agent.memory.append_note(
+                f"benchmark-note-{index}-" + ("B" * 180),
+                tags=("recall",),
+                created_at=f"2026-04-15T10:{index:02d}:00+00:00",
+            )
+        agent.session["memory"] = agent.memory.to_dict()
+        agent.context_manager.total_budget = int(setup.get("total_budget", 900))
+        agent.context_manager.section_budgets = dict(
+            setup.get(
+                "section_budgets",
+                {"prefix": 120, "memory": 120, "relevant_memory": 120, "history": 160},
+            )
+        )
+        return
+
+    if kind == "freshness_mismatch":
+        path = str(setup.get("path", "sample.txt"))
+        summary_text = str(setup.get("summary", f"{path}: stale benchmark summary"))
+        agent.memory.set_file_summary(path, summary_text)
+        agent.memory.remember_file(path)
+        freshness = agent.memory.to_dict()["file_summaries"][path]["freshness"]
+        agent.session["memory"] = agent.memory.to_dict()
+        agent.session["checkpoints"] = {
+            "current_id": "ckpt_freshness",
+            "items": {
+                "ckpt_freshness": _checkpoint_payload(
+                    "ckpt_freshness",
+                    current_goal="Re-anchor stale benchmark file state",
+                    next_step=f"Re-read {path}",
+                    runtime_identity={"workspace_fingerprint": agent.workspace.fingerprint()},
+                    key_files=[{"path": path, "freshness": freshness}],
+                    freshness={path: freshness},
+                    summary="stale benchmark checkpoint",
+                )
+            },
+        }
+        agent.session_store.save(agent.session)
+        (fixture_copy_root / path).write_text(str(setup.get("mutated_text", "alpha\nbeta\nstale-updated\nplaceholder\n")), encoding="utf-8")
+        return
+
+    if kind == "workspace_mismatch":
+        agent.session["checkpoints"] = {
+            "current_id": "ckpt_workspace",
+            "items": {
+                "ckpt_workspace": _checkpoint_payload(
+                    "ckpt_workspace",
+                    current_goal="Recover after benchmark workspace drift",
+                    next_step="Rebuild runtime state from a fresh checkpoint",
+                    runtime_identity={"workspace_fingerprint": "outdated-benchmark-fingerprint"},
+                    summary="workspace drift benchmark checkpoint",
+                )
+            },
+        }
+        agent.session_store.save(agent.session)
+        return
 
 
 class BenchmarkEvaluator:
@@ -325,10 +464,11 @@ class BenchmarkEvaluator:
             max_steps=int(task["step_budget"]),
             max_new_tokens=self.max_new_tokens,
         )
+        _apply_task_setup(agent, task, fixture_copy_root)
 
         initial_history_empty = len(agent.session["history"]) == 0
         initial_memory_state = agent.memory.to_dict()
-        initial_memory_empty = initial_memory_state == memorylib.default_memory_state()
+        initial_memory_empty = memorylib.is_effectively_empty(initial_memory_state)
         initial_task_summary_empty = not str(initial_memory_state["working"]["task_summary"]).strip()
         initial_episodic_notes_empty = not initial_memory_state["episodic_notes"]
 
@@ -453,3 +593,29 @@ def run_fixed_benchmark(
         model_client_factory=model_client_factory,
     )
     return evaluator.run()
+
+
+def run_harness_regression_v2(
+    benchmark_path=DEFAULT_BENCHMARK_PATH,
+    artifact_path=DEFAULT_HARNESS_REGRESSION_V2_ARTIFACT_PATH,
+    workspace_root=None,
+    model_name=DEFAULT_MODEL_NAME,
+    model_version=DEFAULT_MODEL_VERSION,
+    temperature=DEFAULT_TEMPERATURE,
+    top_p=DEFAULT_TOP_P,
+    max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+    timezone_name=DEFAULT_TIMEZONE,
+    model_client_factory=None,
+):
+    return run_fixed_benchmark(
+        benchmark_path=benchmark_path,
+        artifact_path=artifact_path,
+        workspace_root=workspace_root,
+        model_name=model_name,
+        model_version=model_version,
+        temperature=temperature,
+        top_p=top_p,
+        max_new_tokens=max_new_tokens,
+        timezone_name=timezone_name,
+        model_client_factory=model_client_factory,
+    )

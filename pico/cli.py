@@ -52,6 +52,8 @@ DEFAULT_OPENAI_MODEL = "gpt-5.4"
 DEFAULT_OPENAI_BASE_URL = "https://www.right.codes/codex/v1"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
+LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
+SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
 
 
 def _effective_model(args, provider):
@@ -81,6 +83,21 @@ def _first_env(*names):
         if value:
             return value
     return ""
+
+
+def _configured_secret_names(args):
+    configured_secret_names = set(DEFAULT_SECRET_ENV_NAMES)
+    configured_secret_names.update(str(name).upper() for name in args.secret_env_names)
+    extra_names = os.environ.get(SECRET_ENV_NAMES_VAR, "")
+    if not extra_names.strip():
+        extra_names = os.environ.get(LEGACY_SECRET_ENV_NAMES_VAR, "")
+    if extra_names.strip():
+        configured_secret_names.update(
+            item.strip().upper()
+            for item in extra_names.split(",")
+            if item.strip()
+        )
+    return sorted(configured_secret_names)
 
 
 def _build_model_client(args):
@@ -185,15 +202,7 @@ def build_agent(args):
     # 这里是 CLI 到 runtime 的装配点：
     # 先整理 secret 名单，再采集工作区快照，随后决定是恢复旧 session
     # 还是创建一个新的 Pico 实例。
-    configured_secret_names = set(DEFAULT_SECRET_ENV_NAMES)
-    configured_secret_names.update(str(name).upper() for name in args.secret_env_names)
-    extra_names = os.environ.get("PICO_SECRET_ENV_NAMES", "")
-    if extra_names.strip():
-        configured_secret_names.update(
-            item.strip().upper()
-            for item in extra_names.split(",")
-            if item.strip()
-        )
+    configured_secret_names = _configured_secret_names(args)
     workspace = WorkspaceContext.build(args.cwd)
     store = SessionStore(workspace.repo_root + "/.pico/sessions")
     model = _build_model_client(args)
@@ -209,7 +218,7 @@ def build_agent(args):
             approval_policy=args.approval,
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
-            secret_env_names=sorted(configured_secret_names),
+            secret_env_names=configured_secret_names,
         )
     return Pico(
         model_client=model,
@@ -218,7 +227,7 @@ def build_agent(args):
         approval_policy=args.approval,
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
-        secret_env_names=sorted(configured_secret_names),
+        secret_env_names=configured_secret_names,
     )
 
 
