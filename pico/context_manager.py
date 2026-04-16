@@ -111,6 +111,11 @@ class ContextManager:
             "history": "",
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
         }
+        checkpoint_text = ""
+        if hasattr(self.agent, "render_checkpoint_text"):
+            checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
+        if checkpoint_text:
+            section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
@@ -294,17 +299,27 @@ class ContextManager:
         raw = self._raw_history_text(history)
         if not history:
             rendered = "Transcript:\n- empty"
-            return SectionRender(raw=raw, budget=budget, rendered=rendered, details={"rendered_entries": []})
+            return SectionRender(
+                raw=raw,
+                budget=budget,
+                rendered=rendered,
+                details={
+                    "rendered_entries": [],
+                    "older_entries_count": 0,
+                    "collapsed_duplicate_reads": 0,
+                    "reused_file_summary_count": 0,
+                    "summarized_tool_count": 0,
+                },
+            )
 
         # 优先保留最近的历史，因为下一步决策通常最依赖刚刚发生的工具结果。
         recent_window = 6
         recent_start = max(0, len(history) - recent_window)
+        history_entries, history_details = self._compressed_history_entries(history, recent_start)
         rendered_entries = []
-        for index in reversed(range(len(history))):
-            item = history[index]
-            recent = index >= recent_start
-            line_limit = 900 if recent else 60
-            candidate_lines = self._render_history_item(item, line_limit)
+        for entry in reversed(history_entries):
+            recent = bool(entry.get("recent", False))
+            candidate_lines = list(entry.get("lines", []))
             candidate_entries = candidate_lines + rendered_entries
             candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
             if len(candidate_rendered) <= budget:
@@ -315,13 +330,13 @@ class ContextManager:
                 if rendered_entries:
                     available -= sum(len(line) + 1 for line in rendered_entries)
                 available = max(20, available - 1)
-                candidate_lines = self._render_history_item(item, available)
+                candidate_lines = [_tail_clip(line, available) for line in candidate_lines]
                 candidate_entries = candidate_lines + rendered_entries
                 candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
                 if len(candidate_rendered) <= budget:
                     rendered_entries = candidate_entries
             else:
-                smaller_lines = self._render_history_item(item, 20)
+                smaller_lines = [_tail_clip(line, 20) for line in candidate_lines]
                 smaller_entries = smaller_lines + rendered_entries
                 smaller_rendered = "\n".join(["Transcript:", *smaller_entries])
                 if len(smaller_rendered) <= budget:
@@ -339,8 +354,73 @@ class ContextManager:
                 "recent_window": recent_window,
                 "recent_start": recent_start,
                 "rendered_entries": rendered_entries,
+                **history_details,
             },
         )
+
+    def _compressed_history_entries(self, history, recent_start):
+        entries = []
+        seen_older_reads = set()
+        details = {
+            "older_entries_count": 0,
+            "collapsed_duplicate_reads": 0,
+            "reused_file_summary_count": 0,
+            "summarized_tool_count": 0,
+        }
+
+        for index, item in enumerate(history):
+            recent = index >= recent_start
+            if recent:
+                line_limit = 900
+                entries.append(
+                    {
+                        "recent": True,
+                        "lines": self._render_history_item(item, line_limit),
+                    }
+                )
+                continue
+
+            if item["role"] == "tool" and item["name"] == "read_file":
+                path = str(item["args"].get("path", "")).strip()
+                if path in seen_older_reads:
+                    details["collapsed_duplicate_reads"] += 1
+                    continue
+                seen_older_reads.add(path)
+                summary = self._reusable_file_summary(path)
+                if summary:
+                    entries.append({"recent": False, "lines": [f"{path} -> {summary}"]})
+                    details["older_entries_count"] += 1
+                    details["reused_file_summary_count"] += 1
+                    continue
+
+            if item["role"] == "tool":
+                summary_line = self._summarize_old_tool_item(item)
+                entries.append({"recent": False, "lines": [summary_line]})
+                details["older_entries_count"] += 1
+                details["summarized_tool_count"] += 1
+                continue
+
+            entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
+
+        return entries, details
+
+    def _reusable_file_summary(self, path):
+        memory = getattr(self.agent, "memory", None)
+        if memory is None or not hasattr(memory, "to_dict"):
+            return ""
+        snapshot = memory.to_dict()
+        summary = snapshot.get("file_summaries", {}).get(str(path), {})
+        if not summary:
+            return ""
+        return str(summary.get("summary", "")).strip()
+
+    def _summarize_old_tool_item(self, item):
+        if item["name"] == "run_shell":
+            command = str(item["args"].get("command", "")).strip() or "shell"
+            lines = [line.strip() for line in str(item.get("content", "")).splitlines() if line.strip()]
+            summary = " | ".join(lines[:3]) if lines else "(empty)"
+            return f"{command} -> {summary}"
+        return self._render_history_item(item, 60)[0]
 
     def _raw_history_text(self, history):
         if not history:
@@ -402,10 +482,23 @@ class ContextManager:
                 "limit": RELEVANT_MEMORY_LIMIT,
                 "selected_count": len(selected_notes),
                 "selected_notes": [note["text"] for note in selected_notes],
+                "selected_sources": [str(note.get("source", "")).strip() for note in selected_notes],
+                "selected_kinds": [str(note.get("kind", "episodic")).strip() or "episodic" for note in selected_notes],
+                "selected_durable_count": sum(
+                    1 for note in selected_notes if (str(note.get("kind", "episodic")).strip() or "episodic") == "durable"
+                ),
                 "raw_chars": rendered["relevant_memory"].raw_chars,
                 "rendered_chars": rendered["relevant_memory"].rendered_chars,
                 "rendered_notes": list(rendered["relevant_memory"].details.get("rendered_notes", [])),
                 "rendered_count": int(rendered["relevant_memory"].details.get("rendered_count", 0)),
+            },
+            "history": {
+                "raw_chars": rendered["history"].raw_chars,
+                "rendered_chars": rendered["history"].rendered_chars,
+                "older_entries_count": int(rendered["history"].details.get("older_entries_count", 0)),
+                "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
+                "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
+                "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
             },
             "current_request": {
                 "text": user_message,
