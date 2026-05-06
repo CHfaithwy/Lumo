@@ -18,10 +18,11 @@
 - 模块入口是 `python -m pico`
 - 会话保存在 `.pico/sessions/`
 - 每次运行的工件保存在 `.pico/runs/<run_id>/`
-- 支持三类模型后端：
+- 支持四类模型后端：
   - Ollama
   - OpenAI 兼容 Responses API
   - Anthropic 兼容 Messages API
+  - DeepSeek Anthropic 兼容 API
 
 ## 使用截图
 
@@ -55,10 +56,10 @@ pip install -e .
 
 ## 快速开始
 
-在当前仓库里启动交互模式：
+在当前仓库里启动交互模式。当前推荐使用 DeepSeek：
 
 ```bash
-uv run pico
+uv run pico --provider deepseek
 ```
 
 指定另一个工作目录：
@@ -70,16 +71,30 @@ uv run pico --cwd /path/to/repo
 直接跑一次性任务：
 
 ```bash
-uv run pico "inspect the test failures and propose a fix"
+uv run pico --provider deepseek "inspect the test failures and propose a fix"
 ```
 
 如果当前环境已经安装过包，也可以直接这样启动：
 
 ```bash
-python -m pico
+python -m pico --provider deepseek
 ```
 
 ## 模型后端
+
+Pico 启动时会读取项目根目录的 `.env`。本地真实 key 放在 `.env`，仓库只保留 `.env.example`。配置优先级是：
+
+```text
+显式 CLI 参数 > .env 里的 PICO_* 变量 > 旧环境变量 > 代码默认值
+```
+
+本地第一次配置：
+
+```bash
+cp .env.example .env
+```
+
+然后把要使用的 provider key 填进去。`.env` 已经被 `.gitignore` 忽略，不要提交真实 key。
 
 ### Ollama
 
@@ -91,23 +106,54 @@ uv run pico --provider ollama --model qwen3.5:4b
 
 ### OpenAI 兼容接口
 
+默认 OpenAI 兼容接口使用 right.codes 的 Codex endpoint：
+
 ```bash
-export OPENAI_API_BASE="https://your-api.example/v1"
-export OPENAI_API_KEY="your-api-key"
-export OPENAI_MODEL="gpt-5.4"
+PICO_OPENAI_API_BASE="https://www.right.codes/codex/v1"
+PICO_OPENAI_API_KEY="your-api-key"
+PICO_OPENAI_MODEL="gpt-5.4"
+```
+
+也可以改成其他 OpenAI-compatible 服务：
+
+```bash
+PICO_OPENAI_API_BASE="https://your-api.example/v1"
+PICO_OPENAI_API_KEY="your-api-key"
+PICO_OPENAI_MODEL="gpt-5.4"
+```
+
+```bash
 uv run pico --provider openai
 ```
 
 ### Anthropic 兼容接口
 
+默认 Anthropic 兼容接口使用 right.codes 的 Claude endpoint：
+
 ```bash
-export ANTHROPIC_API_BASE="https://www.right.codes/claude/v1"
-export ANTHROPIC_API_KEY="your-api-key"
-export ANTHROPIC_MODEL="claude-sonnet-4-6"
+PICO_ANTHROPIC_API_BASE="https://www.right.codes/claude/v1"
+PICO_ANTHROPIC_API_KEY="your-api-key"
+PICO_ANTHROPIC_MODEL="claude-sonnet-4-6"
+```
+
+```bash
 uv run pico --provider anthropic
 ```
 
-如果你的服务端对多个兼容接口复用了同一套密钥，`pico` 也支持从 `ANTHROPIC_API_KEY` 回退到 `RIGHT_CODES_API_KEY` 或 `OPENAI_API_KEY`。
+如果你的服务端对多个兼容接口复用了同一套密钥，`pico` 也支持从 `PICO_ANTHROPIC_API_KEY` 回退到 `ANTHROPIC_API_KEY`、`PICO_RIGHT_CODES_API_KEY`、`RIGHT_CODES_API_KEY`、`PICO_OPENAI_API_KEY` 或 `OPENAI_API_KEY`。
+
+### DeepSeek
+
+```bash
+PICO_DEEPSEEK_API_KEY="your-api-key"
+PICO_DEEPSEEK_MODEL="deepseek-v4-pro"
+```
+
+```bash
+uv run pico --provider deepseek
+```
+
+默认 DeepSeek base URL 是 `https://api.deepseek.com/anthropic`，走 DeepSeek 的 Anthropic 兼容接口。如果需要改到代理服务，可以设置 `PICO_DEEPSEEK_API_BASE` 或启动时传 `--base-url`。
 
 ## 常用交互命令
 

@@ -11,15 +11,21 @@ import shutil
 import sys
 import textwrap
 
+from .config import load_project_env, provider_env
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import Pico, SessionStore
 from .workspace import WorkspaceContext, middle
 
 DEFAULT_SECRET_ENV_NAMES = (
+    "PICO_OPENAI_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_API_TOKEN",
+    "PICO_ANTHROPIC_API_KEY",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
+    "PICO_DEEPSEEK_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "PICO_RIGHT_CODES_API_KEY",
     "RIGHT_CODES_API_KEY",
     "GITHUB_PAT",
     "GH_PAT",
@@ -52,6 +58,8 @@ DEFAULT_OPENAI_MODEL = "gpt-5.4"
 DEFAULT_OPENAI_BASE_URL = "https://www.right.codes/codex/v1"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
 
@@ -65,24 +73,21 @@ def _effective_model(args, provider):
     if explicit_model:
         return explicit_model
     if provider == "openai":
-        model = os.environ.get("OPENAI_MODEL")
+        model = provider_env("PICO_OPENAI_MODEL", ("OPENAI_MODEL",))
         if model:
             return model
         return DEFAULT_OPENAI_MODEL
     if provider == "anthropic":
-        model = os.environ.get("ANTHROPIC_MODEL")
+        model = provider_env("PICO_ANTHROPIC_MODEL", ("ANTHROPIC_MODEL",))
         if model:
             return model
         return DEFAULT_ANTHROPIC_MODEL
+    if provider == "deepseek":
+        model = provider_env("PICO_DEEPSEEK_MODEL", ("DEEPSEEK_MODEL",))
+        if model:
+            return model
+        return DEFAULT_DEEPSEEK_MODEL
     return DEFAULT_OLLAMA_MODEL
-
-
-def _first_env(*names):
-    for name in names:
-        value = os.environ.get(name)
-        if value:
-            return value
-    return ""
 
 
 def _configured_secret_names(args):
@@ -106,8 +111,8 @@ def _build_model_client(args):
     # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
     if provider == "openai":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or os.environ.get("OPENAI_API_BASE") or DEFAULT_OPENAI_BASE_URL
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        base_url = getattr(args, "base_url", None) or provider_env("PICO_OPENAI_API_BASE", ("OPENAI_API_BASE",), DEFAULT_OPENAI_BASE_URL)
+        api_key = provider_env("PICO_OPENAI_API_KEY", ("OPENAI_API_KEY",))
         return OpenAICompatibleModelClient(
             model=model,
             base_url=base_url,
@@ -117,8 +122,22 @@ def _build_model_client(args):
         )
     if provider == "anthropic":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or os.environ.get("ANTHROPIC_API_BASE") or DEFAULT_ANTHROPIC_BASE_URL
-        api_key = _first_env("ANTHROPIC_API_KEY", "RIGHT_CODES_API_KEY", "OPENAI_API_KEY")
+        base_url = getattr(args, "base_url", None) or provider_env("PICO_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",), DEFAULT_ANTHROPIC_BASE_URL)
+        api_key = provider_env(
+            "PICO_ANTHROPIC_API_KEY",
+            ("ANTHROPIC_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "PICO_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        )
+        return AnthropicCompatibleModelClient(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            temperature=args.temperature,
+            timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
+        )
+    if provider == "deepseek":
+        model = _effective_model(args, provider)
+        base_url = getattr(args, "base_url", None) or provider_env("PICO_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",), DEFAULT_DEEPSEEK_BASE_URL)
+        api_key = provider_env("PICO_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",))
         return AnthropicCompatibleModelClient(
             model=model,
             base_url=base_url,
@@ -200,10 +219,10 @@ def build_agent(args):
     得到 agent 后，后面无论是 one-shot 还是 REPL 模式，都会落到 `ask()`。
     """
     # 这里是 CLI 到 runtime 的装配点：
-    # 先整理 secret 名单，再采集工作区快照，随后决定是恢复旧 session
-    # 还是创建一个新的 Pico 实例。
-    configured_secret_names = _configured_secret_names(args)
+    # 先采集工作区快照和加载项目级环境，再整理 secret 名单、模型后端和 session。
     workspace = WorkspaceContext.build(args.cwd)
+    load_project_env(workspace.repo_root)
+    configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.pico/sessions")
     model = _build_model_client(args)
     session_id = args.resume
@@ -234,18 +253,18 @@ def build_agent(args):
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Minimal coding agent for Ollama, OpenAI-compatible, or Anthropic-compatible models.",
+        description="Minimal coding agent for Ollama, OpenAI-compatible, Anthropic-compatible, or DeepSeek models.",
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
-    parser.add_argument("--provider", choices=("ollama", "openai", "anthropic"), default="openai", help="Model backend to use.")
+    parser.add_argument("--provider", choices=("ollama", "openai", "anthropic", "deepseek"), default="openai", help="Model backend to use.")
     parser.add_argument(
         "--model",
         default=None,
-        help="Model name override. Defaults to qwen3.5:4b for Ollama, OPENAI_MODEL for openai, and ANTHROPIC_MODEL for anthropic when set.",
+        help="Model name override. Defaults to qwen3.5:4b for Ollama, PICO_OPENAI_MODEL for openai, PICO_ANTHROPIC_MODEL for anthropic, and PICO_DEEPSEEK_MODEL for deepseek when set.",
     )
     parser.add_argument("--host", default=DEFAULT_OLLAMA_HOST, help="Ollama server URL.")
-    parser.add_argument("--base-url", default=None, help="Provider API base URL for openai or anthropic.")
+    parser.add_argument("--base-url", default=None, help="Provider API base URL for openai, anthropic, or deepseek.")
     parser.add_argument("--ollama-timeout", type=int, default=300, help="Ollama request timeout in seconds.")
     parser.add_argument("--openai-timeout", type=int, default=300, help="OpenAI-compatible request timeout in seconds.")
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")

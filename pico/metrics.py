@@ -1,10 +1,10 @@
 import json
-import os
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+from .config import load_project_env, provider_env
 from .evaluator import run_fixed_benchmark
 from .models import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
 from .runtime import Pico, SessionStore
@@ -678,25 +678,40 @@ def _provider_summary_from_artifact(payload):
 
 
 def _provider_profile(provider):
+    load_project_env(Path.cwd())
     if provider == "gpt":
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        api_key = provider_env("PICO_OPENAI_API_KEY", ("OPENAI_API_KEY",))
         if not api_key:
-            return {"provider": provider, "status": "blocked", "reason": "OPENAI_API_KEY missing"}
+            return {"provider": provider, "status": "blocked", "reason": "PICO_OPENAI_API_KEY or OPENAI_API_KEY missing"}
         return {
             "provider": provider,
             "status": "ready",
-            "model": os.environ.get("OPENAI_MODEL", "gpt-5.4"),
-            "base_url": os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
+            "model": provider_env("PICO_OPENAI_MODEL", ("OPENAI_MODEL",), "gpt-5.4"),
+            "base_url": provider_env("PICO_OPENAI_API_BASE", ("OPENAI_API_BASE",), "https://api.openai.com/v1"),
             "api_key": api_key,
         }
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if provider == "deepseek":
+        api_key = provider_env("PICO_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",))
+        if not api_key:
+            return {"provider": provider, "status": "blocked", "reason": "PICO_DEEPSEEK_API_KEY or DEEPSEEK_API_KEY missing"}
+        return {
+            "provider": provider,
+            "status": "ready",
+            "model": provider_env("PICO_DEEPSEEK_MODEL", ("DEEPSEEK_MODEL",), "deepseek-v4-pro"),
+            "base_url": provider_env("PICO_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",), "https://api.deepseek.com/anthropic"),
+            "api_key": api_key,
+        }
+    api_key = provider_env(
+        "PICO_ANTHROPIC_API_KEY",
+        ("ANTHROPIC_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "PICO_OPENAI_API_KEY", "OPENAI_API_KEY"),
+    )
     if not api_key:
-        return {"provider": "claude", "status": "blocked", "reason": "ANTHROPIC_API_KEY missing"}
+        return {"provider": "claude", "status": "blocked", "reason": "PICO_ANTHROPIC_API_KEY or ANTHROPIC_API_KEY missing"}
     return {
         "provider": "claude",
         "status": "ready",
-        "model": os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-        "base_url": os.environ.get("ANTHROPIC_API_BASE", "https://www.right.codes/claude/v1"),
+        "model": provider_env("PICO_ANTHROPIC_MODEL", ("ANTHROPIC_MODEL",), "claude-sonnet-4-6"),
+        "base_url": provider_env("PICO_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",), "https://www.right.codes/claude/v1"),
         "api_key": api_key,
     }
 
@@ -735,7 +750,7 @@ def run_provider_experiments(benchmark_path, workspace_root, artifact_root, max_
     workspace_root = Path(workspace_root)
     artifact_root = Path(artifact_root)
     providers = []
-    for provider_name in ("gpt", "claude"):
+    for provider_name in ("gpt", "claude", "deepseek"):
         profile = _provider_profile(provider_name)
         if profile["status"] != "ready":
             providers.append(profile)
@@ -1098,7 +1113,7 @@ def collect_resume_metrics(
         "experiment_mode": experiment_mode,
         "real_provider": real_provider if experiment_mode == "real" else "",
         "facts": {
-            "model_backend_count": 2,
+            "model_backend_count": 3,
             "tool_count": 7,
             "run_artifact_count": 3,
         },

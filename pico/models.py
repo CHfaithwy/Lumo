@@ -11,6 +11,8 @@ from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
 
+OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
+
 
 class FakeModelClient:
     def __init__(self, outputs):
@@ -276,7 +278,11 @@ class OpenAICompatibleModelClient:
         if self.supports_prompt_cache and prompt_cache_retention:
             payload["prompt_cache_retention"] = prompt_cache_retention
 
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": OPENAI_COMPATIBLE_USER_AGENT,
+        }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 

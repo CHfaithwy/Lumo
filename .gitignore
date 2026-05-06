@@ -35,6 +35,11 @@ tmp/
 artifacts/
 readme_intro_locked/
 
+# Local secrets and provider configuration
+.env
+.env.*
+!.env.example
+
 # Local docs not intended for publication
 docs/
 
