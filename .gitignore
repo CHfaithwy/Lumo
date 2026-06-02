@@ -21,7 +21,6 @@ dist/
 htmlcov/
 
 # Temporary files
-.mini-coding-agent
 *.tmp
 *.temp
 *.swp
@@ -33,6 +32,7 @@ tmp/
 .worktrees/
 .pico/
 artifacts/
+release/
 readme_intro_locked/
 
 # Local secrets and provider configuration

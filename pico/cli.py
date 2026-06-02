@@ -60,7 +60,6 @@ DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
-LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
 
 
@@ -94,8 +93,6 @@ def _configured_secret_names(args):
     configured_secret_names = set(DEFAULT_SECRET_ENV_NAMES)
     configured_secret_names.update(str(name).upper() for name in args.secret_env_names)
     extra_names = os.environ.get(SECRET_ENV_NAMES_VAR, "")
-    if not extra_names.strip():
-        extra_names = os.environ.get(LEGACY_SECRET_ENV_NAMES_VAR, "")
     if extra_names.strip():
         configured_secret_names.update(
             item.strip().upper()
