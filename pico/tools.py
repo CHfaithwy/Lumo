@@ -9,7 +9,7 @@ import subprocess
 import textwrap
 from functools import partial
 
-from .workspace import IGNORED_PATH_NAMES, clip
+from .workspace import IGNORED_PATH_NAMES
 
 BASE_TOOL_SPECS = {
     "list_files": {
@@ -50,6 +50,10 @@ DELEGATE_TOOL_SPEC = {
     "description": "Ask a bounded read-only child agent to investigate.",
 }
 
+
+def legal_tool_names():
+    return set(BASE_TOOL_SPECS) | {"delegate"}
+
 TOOL_EXAMPLES = {
     "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
@@ -61,17 +65,17 @@ TOOL_EXAMPLES = {
 }
 
 
-def build_tool_registry(agent):
+def build_tool_registry(context):
     # 工具不是动态发现的，而是显式注册的。
     # 这样模型看到的是一个有边界、可审计的动作集合。
     tools = {
-        name: {**spec, "run": partial(_TOOL_RUNNERS[name], agent)}
+        name: {**spec, "run": partial(_TOOL_RUNNERS[name], context)}
         for name, spec in BASE_TOOL_SPECS.items()
     }
     # 子 agent 是刻意做成受限能力的：一旦深度耗尽，
     # 就连 delegate 这个工具都不再暴露给模型。
-    if agent.depth < agent.max_depth:
-        tools["delegate"] = {**DELEGATE_TOOL_SPEC, "run": partial(tool_delegate, agent)}
+    if context.depth < context.max_depth:
+        tools["delegate"] = {**DELEGATE_TOOL_SPEC, "run": partial(tool_delegate, context)}
     return tools
 
 
@@ -79,17 +83,17 @@ def tool_example(name):
     return TOOL_EXAMPLES.get(name, "")
 
 
-def validate_tool(agent, name, args):
+def validate_tool(context, name, args):
     args = args or {}
 
     if name == "list_files":
-        path = agent.path(args.get("path", "."))
+        path = context.path(args.get("path", "."))
         if not path.is_dir():
             raise ValueError("path is not a directory")
         return
 
     if name == "read_file":
-        path = agent.path(args["path"])
+        path = context.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
         start = int(args.get("start", 1))
@@ -102,7 +106,7 @@ def validate_tool(agent, name, args):
         pattern = str(args.get("pattern", "")).strip()
         if not pattern:
             raise ValueError("pattern must not be empty")
-        agent.path(args.get("path", "."))
+        context.path(args.get("path", "."))
         return
 
     if name == "run_shell":
@@ -115,7 +119,7 @@ def validate_tool(agent, name, args):
         return
 
     if name == "write_file":
-        path = agent.path(args["path"])
+        path = context.path(args["path"])
         if path.exists() and path.is_dir():
             raise ValueError("path is a directory")
         if "content" not in args:
@@ -125,7 +129,7 @@ def validate_tool(agent, name, args):
     if name == "patch_file":
         # patch_file 故意做得很严格：old_text 必须精确命中且只能出现一次，
         # 这样修改行为才是确定的，失败原因也更容易解释。
-        path = agent.path(args["path"])
+        path = context.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
         old_text = str(args.get("old_text", ""))
@@ -143,11 +147,13 @@ def validate_tool(agent, name, args):
         task = str(args.get("task", "")).strip()
         if not task:
             raise ValueError("task must not be empty")
+        if context.depth >= context.max_depth:
+            raise ValueError("delegate depth exceeded")
         return
 
 
-def tool_list_files(agent, args):
-    path = agent.path(args.get("path", "."))
+def tool_list_files(context, args):
+    path = context.path(args.get("path", "."))
     if not path.is_dir():
         raise ValueError("path is not a directory")
     entries = [
@@ -157,12 +163,12 @@ def tool_list_files(agent, args):
     lines = []
     for entry in entries[:200]:
         kind = "[D]" if entry.is_dir() else "[F]"
-        lines.append(f"{kind} {entry.relative_to(agent.root)}")
+        lines.append(f"{kind} {entry.relative_to(context.root)}")
     return "\n".join(lines) or "(empty)"
 
 
-def tool_read_file(agent, args):
-    path = agent.path(args["path"])
+def tool_read_file(context, args):
+    path = context.path(args["path"])
     if not path.is_file():
         raise ValueError("path is not a file")
     start = int(args.get("start", 1))
@@ -171,20 +177,20 @@ def tool_read_file(agent, args):
         raise ValueError("invalid line range")
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
-    return f"# {path.relative_to(agent.root)}\n{body}"
+    return f"# {path.relative_to(context.root)}\n{body}"
 
 
-def tool_search(agent, args):
+def tool_search(context, args):
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
         raise ValueError("pattern must not be empty")
-    path = agent.path(args.get("path", "."))
+    path = context.path(args.get("path", "."))
 
     if shutil.which("rg"):
         # 优先用 rg，因为搜索会非常频繁，搜索延迟会直接影响 agent 控制循环。
         result = subprocess.run(
             ["rg", "-n", "--smart-case", "--max-count", "200", pattern, str(path)],
-            cwd=agent.root,
+            cwd=context.root,
             capture_output=True,
             text=True,
         )
@@ -193,18 +199,18 @@ def tool_search(agent, args):
     matches = []
     files = [path] if path.is_file() else [
         item for item in path.rglob("*")
-        if item.is_file() and not any(part in IGNORED_PATH_NAMES for part in item.relative_to(agent.root).parts)
+        if item.is_file() and not any(part in IGNORED_PATH_NAMES for part in item.relative_to(context.root).parts)
     ]
     for file_path in files:
         for number, line in enumerate(file_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
             if pattern.lower() in line.lower():
-                matches.append(f"{file_path.relative_to(agent.root)}:{number}:{line}")
+                matches.append(f"{file_path.relative_to(context.root)}:{number}:{line}")
                 if len(matches) >= 200:
                     return "\n".join(matches)
     return "\n".join(matches) or "(no matches)"
 
 
-def tool_run_shell(agent, args):
+def tool_run_shell(context, args):
     command = str(args.get("command", "")).strip()
     if not command:
         raise ValueError("command must not be empty")
@@ -213,14 +219,14 @@ def tool_run_shell(agent, args):
         raise ValueError("timeout must be in [1, 120]")
     result = subprocess.run(
         command,
-        cwd=agent.root,
+        cwd=context.root,
         shell=True,
         capture_output=True,
         text=True,
         timeout=timeout,
         # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
         # 目的是减少敏感信息被意外带进命令执行环境的风险。
-        env=agent.shell_env(),
+        env=context.shell_env(),
     )
     return textwrap.dedent(
         f"""\
@@ -233,16 +239,16 @@ def tool_run_shell(agent, args):
     ).strip()
 
 
-def tool_write_file(agent, args):
-    path = agent.path(args["path"])
+def tool_write_file(context, args):
+    path = context.path(args["path"])
     content = str(args["content"])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    return f"wrote {path.relative_to(agent.root)} ({len(content)} chars)"
+    return f"wrote {path.relative_to(context.root)} ({len(content)} chars)"
 
 
-def tool_patch_file(agent, args):
-    path = agent.path(args["path"])
+def tool_patch_file(context, args):
+    path = context.path(args["path"])
     if not path.is_file():
         raise ValueError("path is not a file")
     old_text = str(args.get("old_text", ""))
@@ -255,37 +261,16 @@ def tool_patch_file(agent, args):
     if count != 1:
         raise ValueError(f"old_text must occur exactly once, found {count}")
     path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
-    return f"patched {path.relative_to(agent.root)}"
+    return f"patched {path.relative_to(context.root)}"
 
 
-def tool_delegate(agent, args):
-    if agent.depth >= agent.max_depth:
+def tool_delegate(context, args):
+    if context.depth >= context.max_depth:
         raise ValueError("delegate depth exceeded")
     task = str(args.get("task", "")).strip()
     if not task:
         raise ValueError("task must not be empty")
-
-    from .runtime import Pico
-
-    child = Pico(
-        model_client=agent.model_client,
-        workspace=agent.workspace,
-        session_store=agent.session_store,
-        run_store=agent.run_store,
-        approval_policy="never",
-        max_steps=int(args.get("max_steps", 3)),
-        max_new_tokens=agent.max_new_tokens,
-        depth=agent.depth + 1,
-        max_depth=agent.max_depth,
-        read_only=True,
-        secret_env_names=agent.secret_env_names,
-        shell_env_allowlist=agent.shell_env_allowlist,
-    )
-    # 委派的目标是“调查”，不是“放权执行”。
-    # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
-    child.session["memory"]["task"] = task
-    child.session["memory"]["notes"] = [clip(agent.history_text(), 300)]
-    return "delegate_result:\n" + child.ask(task)
+    return context.spawn_delegate(args)
 
 
 _TOOL_RUNNERS = {

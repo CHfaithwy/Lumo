@@ -20,3 +20,6 @@ dev = [
 
 [tool.setuptools]
 packages = ["pico"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

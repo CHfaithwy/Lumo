@@ -13,6 +13,7 @@ from .models import FakeModelClient
 from .runtime import Pico, SessionStore
 from .run_store import RunStore
 from .task_state import STOP_REASON_FINAL_ANSWER_RETURNED
+from .tools import legal_tool_names
 from .workspace import WorkspaceContext
 
 BENCHMARK_SCHEMA_VERSION = 1
@@ -202,11 +203,14 @@ def validate_benchmark(data, repo_root=None):
         allowed_tools = task["allowed_tools"]
         if not isinstance(allowed_tools, list) or not allowed_tools:
             raise ValueError(f"benchmark task {task_id} allowed_tools must be a non-empty list")
+        valid_tools = legal_tool_names()
         normalized_allowed_tools = []
         for tool in allowed_tools:
             tool_name = str(tool).strip()
             if not tool_name:
                 raise ValueError(f"benchmark task {task_id} has an empty allowed_tools entry")
+            if tool_name not in valid_tools:
+                raise ValueError(f"benchmark task {task_id} has an unknown allowed_tools entry: {tool_name}")
             normalized_allowed_tools.append(tool_name)
 
         step_budget = int(task["step_budget"])
@@ -463,6 +467,7 @@ class BenchmarkEvaluator:
             approval_policy="auto",
             max_steps=int(task["step_budget"]),
             max_new_tokens=self.max_new_tokens,
+            allowed_tools=task["allowed_tools"],
         )
         _apply_task_setup(agent, task, fixture_copy_root)
 
