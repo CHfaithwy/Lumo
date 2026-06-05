@@ -680,9 +680,12 @@ def _provider_summary_from_artifact(payload):
 def _provider_profile(provider):
     load_project_env(Path.cwd())
     if provider == "gpt":
-        api_key = provider_env("PICO_OPENAI_API_KEY", ("OPENAI_API_KEY",))
+        api_key = provider_env(
+            "PICO_OPENAI_API_KEY",
+            ("OPENAI_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "PICO_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+        )
         if not api_key:
-            return {"provider": provider, "status": "blocked", "reason": "PICO_OPENAI_API_KEY or OPENAI_API_KEY missing"}
+            return {"provider": provider, "status": "blocked", "reason": "PICO_OPENAI_API_KEY, OPENAI_API_KEY, or shared right.codes key missing"}
         return {
             "provider": provider,
             "status": "ready",

@@ -109,7 +109,10 @@ def _build_model_client(args):
     if provider == "openai":
         model = _effective_model(args, provider)
         base_url = getattr(args, "base_url", None) or provider_env("PICO_OPENAI_API_BASE", ("OPENAI_API_BASE",), DEFAULT_OPENAI_BASE_URL)
-        api_key = provider_env("PICO_OPENAI_API_KEY", ("OPENAI_API_KEY",))
+        api_key = provider_env(
+            "PICO_OPENAI_API_KEY",
+            ("OPENAI_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "PICO_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+        )
         return OpenAICompatibleModelClient(
             model=model,
             base_url=base_url,
