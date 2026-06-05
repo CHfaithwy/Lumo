@@ -18,8 +18,8 @@ dev = [
   "ruff>=0.4.4",
 ]
 
-[tool.setuptools]
-packages = ["pico"]
+[tool.setuptools.packages.find]
+include = ["pico*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

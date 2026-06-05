@@ -2,7 +2,7 @@
 
 import uuid
 
-from . import memory as memorylib
+from .features import memory as memorylib
 from .workspace import clip, now
 
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"

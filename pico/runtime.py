@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import checkpoint as checkpointlib
-from . import memory as memorylib
+from .features import memory as memorylib
 from . import security as securitylib
 from .context_manager import ContextManager
 from .checkpoint import CHECKPOINT_NONE_STATUS
