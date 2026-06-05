@@ -140,7 +140,8 @@ class AgentLoop:
                 args = payload.get("args", {})
                 task_state.record_tool(name)
                 tool_started_at = time.monotonic()
-                result = agent.run_tool(name, args)
+                tool_result = agent.execute_tool(name, args)
+                result = tool_result.content
                 agent.record(
                     {
                         "role": "tool",
@@ -159,7 +160,7 @@ class AgentLoop:
                         "args": args,
                         "result": clip(result, 500),
                         "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
-                        **dict(agent._last_tool_result_metadata or {}),
+                        **dict(tool_result.metadata or {}),
                     },
                 )
                 checkpoint = agent.create_checkpoint(task_state, user_message, trigger="tool_executed")
@@ -236,4 +237,3 @@ class AgentLoop:
         )
         agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
         return final
-

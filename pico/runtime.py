@@ -22,6 +22,7 @@ from .run_store import RunStore
 from .security import REDACTED_VALUE
 from .session_store import SessionStore
 from .tool_context import ToolContext
+from .tool_executor import ToolExecutor
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
@@ -99,6 +100,7 @@ class Pico:
         )
         self.session["memory"] = self.memory.to_dict()
         self.tools = self._apply_tool_allowlist(self.build_tools())
+        self.tool_executor = ToolExecutor(self)
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
         self.context_manager = ContextManager(self)
@@ -502,6 +504,11 @@ class Pico:
 
         return AgentLoop(self).run(user_message)
 
+    def execute_tool(self, name, args):
+        result = self.tool_executor.execute(name, args)
+        self._last_tool_result_metadata = dict(result.metadata)
+        return result
+
     def run_tool(self, name, args):
         """执行一次工具调用，并在执行前后套上完整护栏。
 
@@ -521,127 +528,7 @@ class Pico:
         工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
         是否需要回写记忆。
         """
-        # 工具执行不是“直接调函数”，而是一条带护栏的流水线：
-        # 工具是否存在 -> 参数是否合法 -> 是否重复调用 -> 是否通过审批
-        # -> 真正执行 -> 更新记忆。
-        if self.allowed_tools is not None and name not in self.allowed_tools:
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "tool_not_allowed",
-                "security_event_type": "",
-                "risk_level": "high",
-                "read_only": False,
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
-            return f"error: tool '{name}' is not allowed in this run"
-        tool = self.tools.get(name)
-        if tool is None:
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "unknown_tool",
-                "security_event_type": "",
-                "risk_level": "high",
-                "read_only": False,
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
-            return f"error: unknown tool '{name}'"
-        try:
-            self.validate_tool(name, args)
-        except Exception as exc:
-            example = self.tool_example(name)
-            message = f"error: invalid arguments for {name}: {exc}"
-            if example:
-                message += f"\nexample: {example}"
-            security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "invalid_arguments",
-                "security_event_type": security_event_type,
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
-            return message
-        if self.repeated_tool_call(name, args):
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "repeated_identical_call",
-                "security_event_type": "",
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
-            return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
-        if tool["risky"] and not self.approve(name, args):
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "approval_denied",
-                "security_event_type": "read_only_block" if self.read_only else "approval_denied",
-                "risk_level": "high",
-                "read_only": False,
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
-            return f"error: approval denied for {name}"
-        before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
-        after_snapshot = before_snapshot
-        try:
-            result = clip(tool["run"](args))
-            after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
-            affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
-            workspace_changed = bool(affected_paths)
-            tool_status = "ok"
-            tool_error_code = ""
-            if name == "run_shell":
-                match = re.search(r"exit_code:\s*(-?\d+)", result)
-                exit_code = int(match.group(1)) if match else 0
-                if exit_code != 0 and workspace_changed:
-                    tool_status = "partial_success"
-                    tool_error_code = "tool_partial_success"
-                elif exit_code != 0:
-                    tool_status = "error"
-                    tool_error_code = "tool_failed"
-            self.update_memory_after_tool(name, args, result)
-            self._last_tool_result_metadata = {
-                "tool_status": tool_status,
-                "tool_error_code": tool_error_code,
-                "security_event_type": "",
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": affected_paths,
-                "workspace_changed": workspace_changed,
-                "workspace_fingerprint": self.workspace.fingerprint(),
-                "diff_summary": diff_summary,
-            }
-            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
-            return result
-        except Exception as exc:
-            after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
-            affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
-            workspace_changed = bool(affected_paths)
-            security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
-            self._last_tool_result_metadata = {
-                "tool_status": "partial_success" if workspace_changed else "error",
-                "tool_error_code": "tool_partial_success" if workspace_changed else "tool_failed",
-                "security_event_type": security_event_type,
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": affected_paths,
-                "workspace_changed": workspace_changed,
-                "workspace_fingerprint": self.workspace.fingerprint(),
-                "diff_summary": diff_summary,
-            }
-            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
-            return f"error: tool {name} failed: {exc}"
+        return self.execute_tool(name, args).content
 
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
