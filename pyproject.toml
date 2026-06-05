@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pico"
 version = "0.1.0"
-description = "Small local coding agent for Ollama, OpenAI-compatible, Anthropic-compatible, and DeepSeek models"
+description = "Small local coding agent for DeepSeek, OpenAI-compatible, Anthropic-compatible, and Ollama models"
 requires-python = ">=3.10"
 dependencies = []
 
