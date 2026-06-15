@@ -8,14 +8,14 @@ from ..config import load_project_env, provider_env
 from .evaluator import run_fixed_benchmark
 from ..providers.clients import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
 from ..runtime import Pico, SessionStore
-from ..workspace import WorkspaceContext
+from ..workspace import AGENT_STATE_DIR, WorkspaceContext
 
 METRICS_SCHEMA_VERSION = 2
 DEFAULT_HARNESS_REGRESSION_V2_PATH = Path("artifacts/harness-regression-v2.json")
 DEFAULT_CONTEXT_ABLATION_V2_PATH = Path("artifacts/context-ablation-v2.json")
 DEFAULT_MEMORY_ABLATION_V2_PATH = Path("artifacts/memory-ablation-v2.json")
 DEFAULT_RECOVERY_ABLATION_V2_PATH = Path("artifacts/recovery-ablation-v2.json")
-DEFAULT_CORE_REPORT_PATH = Path("docs/metrics/pico-benchmark-core-report.md")
+DEFAULT_CORE_REPORT_PATH = Path("docs/metrics/lumo-benchmark-core-report.md")
 
 
 def _safe_mean(values):
@@ -193,7 +193,7 @@ def build_stress_agent_metrics():
         workspace_root = Path(temp_dir)
         (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
         workspace = WorkspaceContext.build(workspace_root)
-        store = SessionStore(workspace_root / ".pico" / "sessions")
+        store = SessionStore(workspace_root / AGENT_STATE_DIR / "sessions")
         agent = Pico(
             model_client=FakeModelClient([]),
             workspace=workspace,
@@ -255,7 +255,7 @@ class _MemoryExperimentModelClient(FakeModelClient):
 
 def _build_memory_experiment_agent(workspace_root, expected_fact, filename):
     workspace = WorkspaceContext.build(workspace_root)
-    store = SessionStore(workspace_root / ".pico" / "sessions")
+    store = SessionStore(workspace_root / AGENT_STATE_DIR / "sessions")
     return Pico(
         model_client=_MemoryExperimentModelClient(expected_fact, filename),
         workspace=workspace,
@@ -451,7 +451,7 @@ def run_context_stress_matrix(repetitions=5):
                         workspace_root = Path(temp_dir)
                         (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
                         workspace = WorkspaceContext.build(workspace_root)
-                        store = SessionStore(workspace_root / ".pico" / "sessions")
+                        store = SessionStore(workspace_root / AGENT_STATE_DIR / "sessions")
                         agent = Pico(
                             model_client=FakeModelClient([]),
                             workspace=workspace,
@@ -521,7 +521,7 @@ def run_context_stress_matrix(repetitions=5):
 
 def _security_agent(workspace_root, approval_policy="auto", read_only=False):
     workspace = WorkspaceContext.build(workspace_root)
-    store = SessionStore(workspace_root / ".pico" / "sessions")
+    store = SessionStore(workspace_root / AGENT_STATE_DIR / "sessions")
     return Pico(
         model_client=FakeModelClient([]),
         workspace=workspace,
@@ -839,7 +839,7 @@ def _truncate_read_history(agent):
 
 def _build_real_agent(workspace_root, provider, approval_policy="auto", read_only=False):
     workspace = WorkspaceContext.build(workspace_root)
-    store = SessionStore(workspace_root / ".pico" / "sessions")
+    store = SessionStore(workspace_root / AGENT_STATE_DIR / "sessions")
     return Pico(
         model_client=_make_provider_client(provider),
         workspace=workspace,
@@ -1353,7 +1353,7 @@ RECOVERY_ABLATION_TASKS = [
 
 def _build_recovery_agent(workspace_root, required_fragments):
     workspace = WorkspaceContext.build(workspace_root)
-    store = SessionStore(workspace_root / ".pico" / "sessions")
+    store = SessionStore(workspace_root / AGENT_STATE_DIR / "sessions")
     return Pico(
         model_client=_RecoveryScenarioModelClient(required_fragments, "recovery state restored."),
         workspace=workspace,

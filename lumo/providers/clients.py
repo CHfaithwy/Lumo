@@ -11,7 +11,7 @@ from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
 
-OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
+OPENAI_COMPATIBLE_USER_AGENT = "lumo/0.1"
 PROMPT_CACHE_COMPATIBLE_HOSTS = ("openai.com", "right.codes", "codex2api.com")
 
 

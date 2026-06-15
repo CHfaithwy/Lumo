@@ -106,7 +106,7 @@ class AgentLoop:
             if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
                 # 立刻创建一个新的 checkpoint
                 checkpoint = agent.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
-                # 把更新后的 task_state 写回 .pico/runs/<run_id>/task_state.json
+                # 把更新后的 task_state 写回 .lumo/runs/<run_id>/task_state.json
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,
@@ -159,7 +159,7 @@ class AgentLoop:
             )
             prompt_cache_key = None
             prompt_cache_retention = None
-            # prefix_state.hash hash 的其实是You are pico...Rules:Tools:Valid response examples:workspace.text()
+            # prefix_state.hash hash 的其实是You are lumo...Rules:Tools:Valid response examples:workspace.text()
             if getattr(agent.model_client, "supports_prompt_cache", False):
                 # 只有后端明确支持时，才把稳定前缀的 hash 作为 cache key 发出去。
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")

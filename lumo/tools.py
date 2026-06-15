@@ -154,7 +154,7 @@ def validate_tool(context, name, args):
 
 
 def tool_list_files(context, args):
-    # 读取目录内容，排序，并过滤掉 .git、.pico、__pycache__ 这类忽略目录。
+    # 读取目录内容，排序，并过滤掉 .git、.lumo、__pycache__ 这类忽略目录。
     path = context.path(args.get("path", "."))
     if not path.is_dir():
         raise ValueError("path is not a directory")

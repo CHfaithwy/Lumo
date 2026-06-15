@@ -24,7 +24,7 @@ from .session_store import SessionStore
 from .tool_context import ToolContext
 from .tool_executor import ToolExecutor
 from . import tools as toolkit
-from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from .workspace import AGENT_STATE_DIR, IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
 DEFAULT_FEATURE_FLAGS = {
@@ -85,7 +85,7 @@ class Pico:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
-        self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
+        self.run_store = run_store or RunStore(Path(workspace.repo_root) / AGENT_STATE_DIR / "runs")
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),

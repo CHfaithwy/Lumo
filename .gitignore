@@ -31,6 +31,7 @@ htmlcov/
 tmp/
 .worktrees/
 .pico/
+.lumo/
 .mini-pico/
 artifacts/
 release/
@@ -52,4 +53,4 @@ docs/*
 .DS_Store
 
 # Packaging metadata
-pico.egg-info/
+lumo.egg-info/

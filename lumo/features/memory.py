@@ -10,7 +10,7 @@ from datetime import datetime
 import re
 from pathlib import Path
 
-from ..workspace import clip, now
+from ..workspace import AGENT_STATE_DIR, clip, now
 
 WORKING_FILE_LIMIT = 8
 EPISODIC_NOTE_LIMIT = 12
@@ -58,7 +58,7 @@ DURABLE_TOPIC_DEFAULTS = {
 - files 旧兼容字段，含义和 working.recent_files 基本一样。
 - notes 旧兼容字段，含义和 episodic_notes 的简化版差不多。 这里只保留笔记文本，不带 tags/source 这些结构化信息。
 - next_note_index 下一条笔记该分配的编号。避免新加 note 时 index 重复。
-- durable_topics 长期记忆主题列表。这是从 .pico/memory/ 里读取出来的“持久记忆主题”，比如项目约定、关键决策、依赖事实等，不属于这次临时会话的短期记忆。
+- durable_topics 长期记忆主题列表。这是从 .lumo/memory/ 里读取出来的“持久记忆主题”，比如项目约定、关键决策、依赖事实等，不属于这次临时会话的短期记忆。
 """
 def default_memory_state():
     # 用一个小而结构化的状态，而不是一大段自由文本摘要。
@@ -438,7 +438,7 @@ def normalize_memory_state(state, workspace_root=None):
     state["task"] = working["task_summary"]
     state["files"] = list(working["recent_files"])
     state["notes"] = [note["text"] for note in episodic_notes]
-    durable_root = Path(workspace_root) / ".pico" / "memory" if workspace_root is not None else None
+    durable_root = Path(workspace_root) / AGENT_STATE_DIR / "memory" if workspace_root is not None else None
     durable_store = DurableMemoryStore(durable_root) if durable_root is not None else None
     state["durable_topics"] = durable_store.topic_slugs() if durable_store is not None else []
     return state
@@ -554,7 +554,7 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
         ranked.append(((exact_tag_match, keyword_overlap, recency, note_index), note))
 
     if workspace_root is not None:
-        durable_store = DurableMemoryStore(Path(workspace_root) / ".pico" / "memory")
+        durable_store = DurableMemoryStore(Path(workspace_root) / AGENT_STATE_DIR / "memory")
         for note in durable_store.retrieval_candidates(query, limit=limit):
             note_tags = {tag.lower() for tag in note.get("tags", [])}
             note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
@@ -620,7 +620,7 @@ class LayeredMemory:
     def __init__(self, state=None, workspace_root=None):
         self.workspace_root = workspace_root
         self.state = normalize_memory_state(state, workspace_root)
-        self.durable_store = DurableMemoryStore(Path(workspace_root) / ".pico" / "memory") if workspace_root is not None else None
+        self.durable_store = DurableMemoryStore(Path(workspace_root) / AGENT_STATE_DIR / "memory") if workspace_root is not None else None
 
     def to_dict(self):
         self.state = normalize_memory_state(self.state, self.workspace_root)

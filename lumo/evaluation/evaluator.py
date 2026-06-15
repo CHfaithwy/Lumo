@@ -14,7 +14,7 @@ from ..runtime import Pico, SessionStore
 from ..run_store import RunStore
 from ..task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 from ..tools import legal_tool_names
-from ..workspace import WorkspaceContext
+from ..workspace import AGENT_STATE_DIR, WorkspaceContext
 
 BENCHMARK_SCHEMA_VERSION = 1
 DEFAULT_BENCHMARK_PATH = Path("benchmarks/coding_tasks.json")
@@ -390,7 +390,7 @@ class BenchmarkEvaluator:
         self.benchmark_path = Path(benchmark_path)
         self.artifact_path = Path(artifact_path)
         self.workspace_root = Path(workspace_root) if workspace_root is not None else Path(
-            tempfile.mkdtemp(prefix="pico-benchmark-")
+            tempfile.mkdtemp(prefix="lumo-benchmark-")
         )
         self.model_name = model_name
         self.model_version = model_version
@@ -453,8 +453,8 @@ class BenchmarkEvaluator:
             fixture_copy_root,
             repo_root_override=fixture_copy_root,
         )
-        session_store = SessionStore(fixture_copy_root / ".pico" / "sessions")
-        run_store = RunStore(fixture_copy_root / ".pico" / "runs")
+        session_store = SessionStore(fixture_copy_root / AGENT_STATE_DIR / "sessions")
+        run_store = RunStore(fixture_copy_root / AGENT_STATE_DIR / "runs")
         if self.model_client_factory is not None:
             model_client = self.model_client_factory(task=task, workspace=workspace)
         else:

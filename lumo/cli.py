@@ -1,20 +1,23 @@
 """命令行入口。
 
-这个模块负责把“用户怎么启动 pico”翻译成 runtime 能理解的对象：
+这个模块负责把“用户怎么启动 Lumo”翻译成 runtime 能理解的对象：
 解析参数、挑模型后端、构建工作区快照、恢复或新建 session，
 最后进入 one-shot 或交互式循环。
 """
 
 import argparse
 import os
+import re
 import shutil
 import sys
 import textwrap
+import unicodedata
+from pathlib import Path
 
 from .config import load_project_env, provider_env
 from .providers.clients import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import Pico, SessionStore
-from .workspace import WorkspaceContext, middle
+from .workspace import AGENT_STATE_DIR, WorkspaceContext
 
 DEFAULT_SECRET_ENV_NAMES = (
     "PICO_OPENAI_API_KEY",
@@ -31,15 +34,21 @@ DEFAULT_SECRET_ENV_NAMES = (
     "GH_PAT",
 )
 
-WELCOME_ART = (
-    "        /\\___/\\\\",
-    "       (  o o  )",
-    "       /   ^   \\\\",
-    "      /|       |\\\\",
+WELCOME_ART = tuple(
+    "  ".join(parts)
+    for parts in (
+        ("██     ", "██   ██", "██   ██", "███████"),
+        ("██     ", "██   ██", "███ ███", "██   ██"),
+        ("██     ", "██   ██", "███████", "██   ██"),
+        ("██     ", "██   ██", "██ █ ██", "██   ██"),
+        ("██     ", "██   ██", "██   ██", "██   ██"),
+        ("██     ", "██   ██", "██   ██", "██   ██"),
+        ("███████", "███████", "██   ██", "███████"),
+    )
 )
-WELCOME_NAME = "pico"
-WELCOME_SUBTITLE = "local coding agent"
-WELCOME_STATUS = "calm shell, ready for work"
+WELCOME_NAME = "Lumo"
+WELCOME_SUBTITLE = "Code is cheap, Show me your talk"
+# WELCOME_STATUS = "calm shell, ready for work"
 HELP_DETAILS = textwrap.dedent(
     """\
     Commands:
@@ -61,6 +70,84 @@ DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
 SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
+ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+ANSI_RESET = "\x1b[0m"
+WELCOME_BORDER_COLOR = "\x1b[38;2;125;211;252m"
+WELCOME_GRADIENT_START = (255, 255, 255)
+WELCOME_GRADIENT_END = (125, 211, 252)
+
+
+def _strip_ansi(text):
+    return ANSI_PATTERN.sub("", str(text))
+
+
+def _ansi_rgb(red, green, blue):
+    return f"\x1b[38;2;{red};{green};{blue}m"
+
+
+def _color(text, ansi_color):
+    return f"{ansi_color}{text}{ANSI_RESET}"
+
+
+def _gradient_text(text, start_rgb=WELCOME_GRADIENT_START, end_rgb=WELCOME_GRADIENT_END):
+    text = str(text)
+    span = max(1, len(text) - 1)
+    parts = []
+    for index, char in enumerate(text):
+        if char == " ":
+            parts.append(char)
+            continue
+        ratio = index / span
+        rgb = tuple(round(start + (end - start) * ratio) for start, end in zip(start_rgb, end_rgb))
+        parts.append(_color(char, _ansi_rgb(*rgb)))
+    return "".join(parts)
+
+
+def _terminal_char_width(char):
+    return 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+
+
+def _terminal_width(text):
+    return sum(_terminal_char_width(char) for char in _strip_ansi(text))
+
+
+def _terminal_ljust(text, width):
+    text = str(text)
+    return text + " " * max(0, width - _terminal_width(text))
+
+
+def _terminal_center(text, width):
+    text = str(text)
+    padding = max(0, width - _terminal_width(text))
+    left = padding // 2
+    right = padding - left
+    return " " * left + text + " " * right
+
+
+def _take_terminal_width(text, width, from_end=False):
+    chars = reversed(str(text)) if from_end else str(text)
+    selected = []
+    used = 0
+    for char in chars:
+        char_width = _terminal_char_width(char)
+        if used + char_width > width:
+            break
+        selected.append(char)
+        used += char_width
+    if from_end:
+        selected.reverse()
+    return "".join(selected)
+
+
+def _terminal_middle(text, limit):
+    text = str(text).replace("\n", " ")
+    if _terminal_width(text) <= limit:
+        return text
+    if limit <= 3:
+        return _take_terminal_width(text, limit)
+    left = (limit - 3) // 2
+    right = limit - 3 - left
+    return _take_terminal_width(text, left) + "..." + _take_terminal_width(text, right, from_end=True)
 
 
 def _effective_model(args, provider):
@@ -165,41 +252,50 @@ def build_welcome(agent, model, host):
     right_width = inner - gap - left_width
 
     def row(text):
-        body = middle(text, width - 4)
-        return f"| {body.ljust(width - 4)} |"
+        body = _terminal_middle(text, width - 4)
+        return _border_row(_terminal_ljust(body, width - 4))
 
-    def divider(char="-"):
-        return "+" + char * (width - 2) + "+"
+    def divider(style="solid"):
+        char = "═" if style == "strong" else "─"
+        left = "╔" if style == "strong" else "├"
+        right = "╗" if style == "strong" else "┤"
+        return _color(left + char * (width - 2) + right, WELCOME_BORDER_COLOR)
+
+    def bottom_divider():
+        return _color("╚" + "═" * (width - 2) + "╝", WELCOME_BORDER_COLOR)
+
+    def _border_row(body):
+        return f"{_color('║', WELCOME_BORDER_COLOR)} {body} {_color('║', WELCOME_BORDER_COLOR)}"
 
     def center(text):
-        body = middle(text, inner)
-        return f"| {body.center(inner)} |"
+        body = _terminal_middle(text, inner)
+        return _border_row(_terminal_center(body, inner))
 
     def cell(label, value, size):
-        body = middle(f"{label:<9} {value}", size)
-        return body.ljust(size)
+        body = _terminal_middle(f"{label:<9} {value}", size)
+        return _terminal_ljust(body, size)
 
     def pair(left_label, left_value, right_label, right_value):
         left = cell(left_label, left_value, left_width)
         right = cell(right_label, right_value, right_width)
-        return f"| {left}{' ' * gap}{right} |"
+        return _border_row(f"{left}{' ' * gap}{right}")
 
-    line = divider("=")
-    rows = [center(text) for text in WELCOME_ART]
+    line = divider("strong")
+    rows = [center(_gradient_text(text)) for text in WELCOME_ART]
     rows.extend(
         [
             center(WELCOME_NAME),
             center(WELCOME_SUBTITLE),
-            center(WELCOME_STATUS),
-            divider("-"),
+            # center(WELCOME_STATUS),
+            divider(),
             row(""),
-            row("WORKSPACE  " + middle(agent.workspace.cwd, inner - 11)),
+            row("WORKSPACE  " + _terminal_middle(agent.workspace.cwd, inner - 11)),
             pair("MODEL", model, "BRANCH", agent.workspace.branch),
             pair("APPROVAL", agent.approval_policy, "SESSION", agent.session["id"]),
             row(""),
         ]
     )
-    return "\n".join([line, *rows, line])
+    return "\n".join([line, *rows, bottom_divider()])
 
 
 def build_agent(args):
@@ -226,7 +322,7 @@ def build_agent(args):
 #   “整理出一份最终要被当成敏感信息处理的环境变量名列表。”
 # 也就是说，后面程序在写 trace、report、session 之类内容时，看到这些环境变量名，就会把它们脱敏，不直接暴露真实值。
     configured_secret_names = _configured_secret_names(args)
-    store = SessionStore(workspace.repo_root + "/.pico/sessions")
+    store = SessionStore(Path(workspace.repo_root) / AGENT_STATE_DIR / "sessions")
     # return OpenAICompatibleModelClient
     model = _build_model_client(args)
     session_id = args.resume
@@ -261,7 +357,7 @@ def build_arg_parser():
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
-    parser.add_argument("--provider", choices=("ollama", "openai", "anthropic", "deepseek"), default="deepseek", help="Model backend to use.")
+    parser.add_argument("--provider", choices=("ollama", "openai", "anthropic", "deepseek"), default="openai", help="Model backend to use.")
     parser.add_argument(
         "--model",
         default=None,
@@ -312,7 +408,7 @@ def main(argv=None):
         # 交互模式：每次读取一条用户输入，交给同一个 agent，
         # 因此 session history 和 working memory 会跨轮延续。
         try:
-            user_input = input("\npico> ").strip()
+            user_input = input("\nLUMO> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("")
             return 0
