@@ -538,6 +538,11 @@ class Pico:
 
         return AgentLoop(self).run(user_message)
 
+    async def ask_async(self, user_message):
+        from .agent_loop import AgentLoop
+
+        return await AgentLoop(self).run_async(user_message)
+
     def execute_tool(self, name, args):
         result = self.tool_executor.execute(name, args)
         self._last_tool_result_metadata = dict(result.metadata)

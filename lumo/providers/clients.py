@@ -5,14 +5,65 @@ runtime 只关心一件事：给我一个 prompt，我拿回一段文本。
 这些差异都在这里被抹平成统一的 complete() 接口。
 """
 
+import asyncio
 import json
 import time
-from http.client import RemoteDisconnected
-import urllib.error
-import urllib.request
+
+import httpx
 
 OPENAI_COMPATIBLE_USER_AGENT = "lumo/0.1"
 PROMPT_CACHE_COMPATIBLE_HOSTS = ("openai.com", "right.codes", "codex2api.com")
+
+
+def _retry_delay(attempt):
+    return 0.5 * (attempt + 1)
+
+
+def _http_status_error_message(prefix, exc):
+    response = exc.response
+    body = response.text if response is not None else str(exc)
+    status_code = response.status_code if response is not None else "unknown"
+    return f"{prefix} failed with HTTP {status_code}: {body}"
+
+
+def _post_json_with_retries(url, payload, headers, timeout, http_error_prefix, connection_error_message, attempts=3):
+    with httpx.Client(timeout=timeout) as client:
+        for attempt in range(attempts):
+            try:
+                response = client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                return response.text, response.headers.get("Content-Type", "")
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else 0
+                if status_code >= 500 and attempt < attempts - 1:
+                    time.sleep(_retry_delay(attempt))
+                    continue
+                raise RuntimeError(_http_status_error_message(http_error_prefix, exc)) from exc
+            except httpx.RequestError as exc:
+                if attempt < attempts - 1:
+                    time.sleep(_retry_delay(attempt))
+                    continue
+                raise RuntimeError(connection_error_message) from exc
+
+
+async def _post_json_with_retries_async(url, payload, headers, timeout, http_error_prefix, connection_error_message, attempts=3):
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(attempts):
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                return response.text, response.headers.get("Content-Type", "")
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else 0
+                if status_code >= 500 and attempt < attempts - 1:
+                    await asyncio.sleep(_retry_delay(attempt))
+                    continue
+                raise RuntimeError(_http_status_error_message(http_error_prefix, exc)) from exc
+            except httpx.RequestError as exc:
+                if attempt < attempts - 1:
+                    await asyncio.sleep(_retry_delay(attempt))
+                    continue
+                raise RuntimeError(connection_error_message) from exc
 
 
 class FakeModelClient:
@@ -29,6 +80,9 @@ class FakeModelClient:
         if not self.outputs:
             raise RuntimeError("fake model ran out of outputs")
         return self.outputs.pop(0)
+
+    async def complete_async(self, prompt, max_new_tokens, **kwargs):
+        return self.complete(prompt, max_new_tokens, **kwargs)
 
 
 class OllamaModelClient:
@@ -57,26 +111,53 @@ class OllamaModelClient:
                 "top_p": self.top_p,
             },
         }
-        request = urllib.request.Request(
+        body_text, _ = _post_json_with_retries(
             self.host + "/api/generate",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Ollama request failed with HTTP {exc.code}: {body}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
+            payload,
+            {"Content-Type": "application/json"},
+            self.timeout,
+            "Ollama request",
+            (
                 "Could not reach Ollama.\n"
                 "Make sure `ollama serve` is running and the model is available.\n"
                 f"Host: {self.host}\n"
                 f"Model: {self.model}"
-            ) from exc
+            ),
+        )
+        data = json.loads(body_text)
 
+        if data.get("error"):
+            raise RuntimeError(f"Ollama error: {data['error']}")
+        return data.get("response", "")
+
+    async def complete_async(self, prompt, max_new_tokens, **kwargs):
+        self.last_completion_metadata = {}
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "raw": False,
+            "think": False,
+            "options": {
+                "num_predict": max_new_tokens,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+            },
+        }
+        body_text, _ = await _post_json_with_retries_async(
+            self.host + "/api/generate",
+            payload,
+            {"Content-Type": "application/json"},
+            self.timeout,
+            "Ollama request",
+            (
+                "Could not reach Ollama.\n"
+                "Make sure `ollama serve` is running and the model is available.\n"
+                f"Host: {self.host}\n"
+                f"Model: {self.model}"
+            ),
+        )
+        data = json.loads(body_text)
         if data.get("error"):
             raise RuntimeError(f"Ollama error: {data['error']}")
         return data.get("response", "")
@@ -236,24 +317,7 @@ class OpenAICompatibleModelClient:
         self.supports_prompt_cache = any(host in self.base_url for host in PROMPT_CACHE_COMPATIBLE_HOSTS)
         self.last_completion_metadata = {}
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
-        """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
-
-        为什么存在：
-        runtime 不应该知道 HTTP 细节、SSE 细节、usage 字段长什么样，
-        更不应该自己去判断 prompt cache 参数要不要带。这个函数把这些后端
-        细节都包起来，对上层暴露统一的 `complete()` 行为。
-
-        输入 / 输出：
-        - 输入：完整 prompt、最大输出 token，以及可选的 prompt cache 参数
-        - 输出：模型最终文本；同时把 usage / cached_tokens 等元数据写进
-          `self.last_completion_metadata`
-
-        在 agent 链路里的位置：
-        它位于 `Pico.ask()` 的模型调用阶段，是稳定前缀缓存复用链路真正
-        落到 provider API 的地方。
-        """
-        self.last_completion_metadata = {}
+    def _build_payload(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
         payload = {
             "model": self.model,
             "input": [
@@ -278,7 +342,9 @@ class OpenAICompatibleModelClient:
             payload["prompt_cache_key"] = prompt_cache_key
         if self.supports_prompt_cache and prompt_cache_retention:
             payload["prompt_cache_retention"] = prompt_cache_retention
+        return payload
 
+    def _headers(self):
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -286,37 +352,16 @@ class OpenAICompatibleModelClient:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
-        request = urllib.request.Request(
-            self.base_url + "/responses",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
+    def _connection_error_message(self):
+        return (
+            "Could not reach the OpenAI-compatible backend.\n"
+            f"Base URL: {self.base_url}\n"
+            f"Model: {self.model}"
         )
-        attempts = 3
-        for attempt in range(attempts):
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    body_text = response.read().decode("utf-8")
-                    headers = getattr(response, "headers", {}) or {}
-                    content_type = headers.get("Content-Type", "")
-                break
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
-                if exc.code >= 500 and attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
-            except (urllib.error.URLError, RemoteDisconnected) as exc:
-                if attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                raise RuntimeError(
-                    "Could not reach the OpenAI-compatible backend.\n"
-                    f"Base URL: {self.base_url}\n"
-                    f"Model: {self.model}"
-                ) from exc
 
+    def _parse_response(self, body_text, content_type, prompt_cache_key=None, prompt_cache_retention=None):
         # 有些兼容后端返回普通 JSON，有些返回 SSE。
         # 这里两种都接住，并尽量统一抽取文本和 usage/cache 元数据。
         """
@@ -360,6 +405,7 @@ class OpenAICompatibleModelClient:
         """
         if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
             text, response_data = _extract_openai_response_from_sse(body_text)
+            metadata = {}
             if isinstance(response_data, dict) and response_data:
                 # 这些元数据会一路传回 runtime，进入 trace 和 report，
                 # 用来观察 prompt cache 是否真的命中。
@@ -373,7 +419,7 @@ class OpenAICompatibleModelClient:
                         "cache_hit": True,
                     }
                     """
-                self.last_completion_metadata = {
+                metadata = {
                     "prompt_cache_supported": self.supports_prompt_cache,
                     "prompt_cache_key": prompt_cache_key,
                     "prompt_cache_retention": prompt_cache_retention,
@@ -381,7 +427,7 @@ class OpenAICompatibleModelClient:
                     **_extract_usage_cache_details(response_data),
                 }
             if text:
-                return text
+                return text, metadata
             raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
 
         try:
@@ -392,13 +438,57 @@ class OpenAICompatibleModelClient:
             ) from exc
         if data.get("error"):
             raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
-        self.last_completion_metadata = {
+        metadata = {
             "prompt_cache_supported": self.supports_prompt_cache,
             "prompt_cache_key": prompt_cache_key,
             "prompt_cache_retention": prompt_cache_retention,
             **_extract_usage_cache_details(data),
         }
-        return _extract_openai_text(data)
+        return _extract_openai_text(data), metadata
+
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
+        """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
+
+        为什么存在：
+        runtime 不应该知道 HTTP 细节、SSE 细节、usage 字段长什么样，
+        更不应该自己去判断 prompt cache 参数要不要带。这个函数把这些后端
+        细节都包起来，对上层暴露统一的 `complete()` 行为。
+
+        输入 / 输出：
+        - 输入：完整 prompt、最大输出 token，以及可选的 prompt cache 参数
+        - 输出：模型最终文本；同时把 usage / cached_tokens 等元数据写进
+          `self.last_completion_metadata`
+
+        在 agent 链路里的位置：
+        它位于 `Pico.ask()` 的模型调用阶段，是稳定前缀缓存复用链路真正
+        落到 provider API 的地方。
+        """
+        self.last_completion_metadata = {}
+        body_text, content_type = _post_json_with_retries(
+            self.base_url + "/responses",
+            self._build_payload(prompt, max_new_tokens, prompt_cache_key, prompt_cache_retention),
+            self._headers(),
+            self.timeout,
+            "OpenAI-compatible request",
+            self._connection_error_message(),
+        )
+        text, metadata = self._parse_response(body_text, content_type, prompt_cache_key, prompt_cache_retention)
+        self.last_completion_metadata = metadata
+        return text
+
+    async def complete_async(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
+        self.last_completion_metadata = {}
+        body_text, content_type = await _post_json_with_retries_async(
+            self.base_url + "/responses",
+            self._build_payload(prompt, max_new_tokens, prompt_cache_key, prompt_cache_retention),
+            self._headers(),
+            self.timeout,
+            "OpenAI-compatible request",
+            self._connection_error_message(),
+        )
+        text, metadata = self._parse_response(body_text, content_type, prompt_cache_key, prompt_cache_retention)
+        self.last_completion_metadata = metadata
+        return text
 
 
 def _extract_anthropic_text(data):
@@ -420,11 +510,7 @@ class AnthropicCompatibleModelClient:
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
-        # 为了保持统一接口，runtime 仍然会传缓存参数进来；
-        # 这里只是显式丢弃，因为当前 Anthropic-compatible 路径没有接缓存复用。
-        del prompt_cache_key, prompt_cache_retention
-        self.last_completion_metadata = {}
+    def _build_payload(self, prompt, max_new_tokens):
         payload = {
             "model": self.model,
             "messages": [
@@ -443,41 +529,23 @@ class AnthropicCompatibleModelClient:
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
+        return payload
 
-        headers = {
+    def _headers(self):
+        return {
             "Content-Type": "application/json",
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
         }
 
-        request = urllib.request.Request(
-            self.base_url + "/messages",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
+    def _connection_error_message(self):
+        return (
+            "Could not reach the Anthropic-compatible backend.\n"
+            f"Base URL: {self.base_url}\n"
+            f"Model: {self.model}"
         )
-        attempts = 3
-        for attempt in range(attempts):
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    body_text = response.read().decode("utf-8")
-                break
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
-                if exc.code >= 500 and attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                raise RuntimeError(f"Anthropic-compatible request failed with HTTP {exc.code}: {body}") from exc
-            except (urllib.error.URLError, RemoteDisconnected) as exc:
-                if attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                raise RuntimeError(
-                    "Could not reach the Anthropic-compatible backend.\n"
-                    f"Base URL: {self.base_url}\n"
-                    f"Model: {self.model}"
-                ) from exc
 
+    def _parse_response(self, body_text):
         try:
             data = json.loads(body_text)
         except json.JSONDecodeError as exc:
@@ -490,3 +558,31 @@ class AnthropicCompatibleModelClient:
         if text:
             return text
         raise RuntimeError("Anthropic-compatible error: could not extract text from response")
+
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
+        # 为了保持统一接口，runtime 仍然会传缓存参数进来；
+        # 这里只是显式丢弃，因为当前 Anthropic-compatible 路径没有接缓存复用。
+        del prompt_cache_key, prompt_cache_retention
+        self.last_completion_metadata = {}
+        body_text, _ = _post_json_with_retries(
+            self.base_url + "/messages",
+            self._build_payload(prompt, max_new_tokens),
+            self._headers(),
+            self.timeout,
+            "Anthropic-compatible request",
+            self._connection_error_message(),
+        )
+        return self._parse_response(body_text)
+
+    async def complete_async(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
+        del prompt_cache_key, prompt_cache_retention
+        self.last_completion_metadata = {}
+        body_text, _ = await _post_json_with_retries_async(
+            self.base_url + "/messages",
+            self._build_payload(prompt, max_new_tokens),
+            self._headers(),
+            self.timeout,
+            "Anthropic-compatible request",
+            self._connection_error_message(),
+        )
+        return self._parse_response(body_text)

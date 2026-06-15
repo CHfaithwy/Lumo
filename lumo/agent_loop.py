@@ -1,5 +1,7 @@
 """Agent control loop extracted from the runtime facade."""
 
+import asyncio
+import threading
 import time
 
 from .checkpoint import CHECKPOINT_NONE_STATUS, CHECKPOINT_PARTIAL_STALE_STATUS, CHECKPOINT_WORKSPACE_MISMATCH_STATUS
@@ -12,6 +14,48 @@ class AgentLoop:
         self.agent = agent
 
     def run(self, user_message):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.run_async(user_message))
+
+        result = {}
+
+        def runner():
+            try:
+                result["value"] = asyncio.run(self.run_async(user_message))
+            except BaseException as exc:
+                result["error"] = exc
+
+        thread = threading.Thread(target=runner)
+        thread.start()
+        thread.join()
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    async def run_async(self, user_message):
+        return await self._run(user_message)
+
+    async def _complete_model_async(self, prompt, prompt_cache_key=None, prompt_cache_retention=None):
+        agent = self.agent
+        complete_async = getattr(agent.model_client, "complete_async", None)
+        if complete_async is not None:
+            return await complete_async(
+                prompt,
+                agent.max_new_tokens,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
+            )
+        return await asyncio.to_thread(
+            agent.model_client.complete,
+            prompt,
+            agent.max_new_tokens,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+        )
+
+    async def _run(self, user_message):
         agent = self.agent
         run_started_at = time.monotonic()
         # “把这次用户刚说的话，记成当前任务摘要，放进 agent 的工作记忆里。”
@@ -165,9 +209,8 @@ class AgentLoop:
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
             model_started_at = time.monotonic()
-            raw = agent.model_client.complete(
+            raw = await self._complete_model_async(
                 prompt,
-                agent.max_new_tokens,
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
             )
@@ -279,13 +322,10 @@ class AgentLoop:
             final = "Stopped after reaching the step limit without a final answer."
             task_state.stop_step_limit(final)
         agent.record({"role": "assistant", "content": final, "created_at": now()})
-        """
-        只有当用户请求里有这种意图时才会尝试写入,通常不会写 durable memory。：
-        英文：capture / remember / save / store / persist / note
-        中文：记住 / 保存 / 记录 / 沉淀 / 长期记忆 / 持久记忆
-        MEMORY.md
-        topics\*.md
-        """
+        # 只有当用户请求里有这种意图时才会尝试写入，通常不会写 durable memory：
+        # 英文：capture / remember / save / store / persist / note
+        # 中文：记住 / 保存 / 记录 / 沉淀 / 长期记忆 / 持久记忆
+        # 落盘位置：MEMORY.md 和 topics/*.md
         agent.promote_durable_memory(user_message, final)
         # task_state.json 关键状态变化后，都会调用一次 write_task_state(...)，把最新状态落盘。
         agent.run_store.write_task_state(task_state)
