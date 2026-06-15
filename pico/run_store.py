@@ -52,7 +52,7 @@ class RunStore:
         # trace 采用 jsonl 追加写入，原因是 agent 运行过程是流式事件序列，
         # 逐条落盘比“最后一次性写整份 trace”更稳，也更适合调试。
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True, ensure_ascii=True))
+            handle.write(json.dumps(event, sort_keys=True, ensure_ascii=False))
             handle.write("\n")
         return path
 
@@ -79,7 +79,7 @@ class RunStore:
             prefix=path.name + ".",
             suffix=".tmp",
         ) as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
+            json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False)
             handle.write("\n")
             temp_name = handle.name
         Path(temp_name).replace(path)

@@ -221,9 +221,13 @@ def build_agent(args):
     # 这里是 CLI 到 runtime 的装配点：
     # 先采集工作区快照和加载项目级环境，再整理 secret 名单、模型后端和 session。
     workspace = WorkspaceContext.build(args.cwd)
+    # 加载项目级环境变量，覆盖系统环境。这些环境变量可能会被后续的模型调用用到，
     load_project_env(workspace.repo_root)
+#   “整理出一份最终要被当成敏感信息处理的环境变量名列表。”
+# 也就是说，后面程序在写 trace、report、session 之类内容时，看到这些环境变量名，就会把它们脱敏，不直接暴露真实值。
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.pico/sessions")
+    # return OpenAICompatibleModelClient
     model = _build_model_client(args)
     session_id = args.resume
     if session_id == "latest":
@@ -286,8 +290,9 @@ def build_arg_parser():
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     agent = build_agent(args)
-
+    # 欢迎页里显示的 MODEL  gpt-5.4
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
+    # base_url 或 host 都行，优先级：model_client 里如果有就用它的，否则用 CLI 参数里的，再没有就用默认值。
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))
     print(build_welcome(agent, model=model, host=host))
 

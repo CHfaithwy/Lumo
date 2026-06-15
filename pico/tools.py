@@ -142,7 +142,8 @@ def validate_tool(context, name, args):
         if count != 1:
             raise ValueError(f"old_text must occur exactly once, found {count}")
         return
-
+    # delegate 工具的意思是：让一个受限制的子 agent 去调查一个子任务。
+    # <tool>{"name":"delegate","args":{"task":"检查 README 里启动说明是否完整","max_steps":3}}</tool>
     if name == "delegate":
         task = str(args.get("task", "")).strip()
         if not task:
@@ -153,6 +154,7 @@ def validate_tool(context, name, args):
 
 
 def tool_list_files(context, args):
+    # 读取目录内容，排序，并过滤掉 .git、.pico、__pycache__ 这类忽略目录。
     path = context.path(args.get("path", "."))
     if not path.is_dir():
         raise ValueError("path is not a directory")
@@ -166,7 +168,9 @@ def tool_list_files(context, args):
         lines.append(f"{kind} {entry.relative_to(context.root)}")
     return "\n".join(lines) or "(empty)"
 
-
+# 按行读取 UTF-8 文本文件。
+# 最后返回带行号的内容：
+# 默认读取第 1 到 200 行。
 def tool_read_file(context, args):
     path = context.path(args["path"])
     if not path.is_file():
@@ -179,7 +183,8 @@ def tool_read_file(context, args):
     body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
     return f"# {path.relative_to(context.root)}\n{body}"
 
-
+# rg 是一个非常快的代码搜索工具，如果系统里安装了 rg，就优先用它来搜索；否则就用纯 Python 的实现。
+# 搜索结果会被限制在前 200 行，避免返回过多内容导致后续处理困难。
 def tool_search(context, args):
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
@@ -209,7 +214,7 @@ def tool_search(context, args):
                     return "\n".join(matches)
     return "\n".join(matches) or "(no matches)"
 
-
+# 在 workspace 根目录运行 shell 命令。最多允许 120 秒。命令只能在 workspace 根目录跑
 def tool_run_shell(context, args):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -238,7 +243,7 @@ def tool_run_shell(context, args):
         """
     ).strip()
 
-
+# 覆盖写入文件。
 def tool_write_file(context, args):
     path = context.path(args["path"])
     content = str(args["content"])
@@ -246,7 +251,7 @@ def tool_write_file(context, args):
     path.write_text(content, encoding="utf-8")
     return f"wrote {path.relative_to(context.root)} ({len(content)} chars)"
 
-
+# 找到文件里唯一一段 old_text，替换成 new_text
 def tool_patch_file(context, args):
     path = context.path(args["path"])
     if not path.is_file():
@@ -263,7 +268,15 @@ def tool_patch_file(context, args):
     path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
     return f"patched {path.relative_to(context.root)}"
 
+# 把一个子任务交给子 agent 调查。
+"""
+它本质上是一个受限子任务。代码里对子agent的约束很明确:
+approval_policy="never"
+read_only=True
+max_steps更小
+深度超过上限时，连delegate 都不再暴露
 
+"""
 def tool_delegate(context, args):
     if context.depth >= context.max_depth:
         raise ValueError("delegate depth exceeded")

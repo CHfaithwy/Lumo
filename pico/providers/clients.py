@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 
 OPENAI_COMPATIBLE_USER_AGENT = "pico/0.1"
+PROMPT_CACHE_COMPATIBLE_HOSTS = ("openai.com", "right.codes", "codex2api.com")
 
 
 class FakeModelClient:
@@ -232,7 +233,7 @@ class OpenAICompatibleModelClient:
         self.timeout = timeout
         # 当前只在明确支持 prompt cache 语义的后端上启用这条链路，
         # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
-        self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
+        self.supports_prompt_cache = any(host in self.base_url for host in PROMPT_CACHE_COMPATIBLE_HOSTS)
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
@@ -318,15 +319,65 @@ class OpenAICompatibleModelClient:
 
         # 有些兼容后端返回普通 JSON，有些返回 SSE。
         # 这里两种都接住，并尽量统一抽取文本和 usage/cache 元数据。
+        """
+        JSON：一次性返回一个完整 JSON 对象
+        SSE：按很多行 data: {...} 流式返回事件  
+
+        {
+            "id": "resp_123",
+            "output": [
+                {
+                "type": "message",
+                "content": [
+                    {
+                    "type": "output_text",
+                    "text": "你好！有什么我可以帮你处理的？"
+                    }
+                ]
+                }
+            ],
+            "usage": {
+                "input_tokens": 1200,
+                "output_tokens": 20,
+                "total_tokens": 1220
+            }
+        }
+
+        SSE
+        data: {"type":"response.created","response":{"id":"resp_123"}}
+
+        data: {"type":"response.output_text.delta","delta":"你"}
+
+        data: {"type":"response.output_text.delta","delta":"好"}
+
+        data: {"type":"response.output_text.delta","delta":"！"}
+
+        data: {"type":"response.output_text.done","text":"你好！"}
+
+        data: {"type":"response.completed","response":{"id":"resp_123","output_text":"你好！","usage":{"input_tokens":1200,"output_tokens":20,"total_tokens":1220}}}
+
+        data: [DONE]
+        """
         if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
             text, response_data = _extract_openai_response_from_sse(body_text)
             if isinstance(response_data, dict) and response_data:
                 # 这些元数据会一路传回 runtime，进入 trace 和 report，
                 # 用来观察 prompt cache 是否真的命中。
+                """
+                    _extract_usage_cache_details
+                    {
+                        "input_tokens": 1200,
+                        "output_tokens": 80,
+                        "total_tokens": 1280,
+                        "cached_tokens": 900,
+                        "cache_hit": True,
+                    }
+                    """
                 self.last_completion_metadata = {
                     "prompt_cache_supported": self.supports_prompt_cache,
                     "prompt_cache_key": prompt_cache_key,
                     "prompt_cache_retention": prompt_cache_retention,
+
                     **_extract_usage_cache_details(response_data),
                 }
             if text:

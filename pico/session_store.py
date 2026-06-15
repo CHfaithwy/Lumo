@@ -14,7 +14,7 @@ class SessionStore:
 
     def save(self, session):
         path = self.path(session["id"])
-        path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(session, indent=2, ensure_ascii=False), encoding="utf-8")
         return path
 
     def load(self, session_id):

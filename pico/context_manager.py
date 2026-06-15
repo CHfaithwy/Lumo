@@ -97,6 +97,7 @@ class ContextManager:
         提供工作记忆，这个函数则把它们和当前请求合成一份可控大小的 prompt。
         """
         user_message = str(user_message)
+        # 给每个 prompt section 算一个“最小保留长度下限”。
         self.section_floors = self._compute_section_floors()
         memory_enabled = True
         relevant_memory_enabled = True

@@ -38,8 +38,28 @@ DURABLE_TOPIC_DEFAULTS = {
         "tags": ["preference"],
     },
 }
-
-
+"""
+- working: 当前工作记忆的主区域。它是个小字典，存“这一轮最重要的紧凑信息”。
+- working.task_summary: 当前任务摘要。通常就是“这轮用户要我干什么”的一句短话，比如“帮我排查启动失败”。
+- working.recent_files :最近接触过的文件列表。比如刚读过、改过、分析过的文件路径，数量有限，避免 memory 无限膨胀。
+- episodic_notes: 情节式笔记列表。
+记录这次或最近几次运行里临时但有价值的信息，每一项通常是一个 note 对象，不只是字符串。
+  episodic_notes[i].text 笔记正文。比如“README 说默认 provider 是 deepseek”。
+  episodic_notes[i].tags笔记标签。方便后面按关键词或主题召回，比如 config、test、bug。
+  episodic_notes[i].source 这条笔记来自哪里。比如某个文件名、某个工具调用结果。
+  episodic_notes[i].created_at 笔记创建时间。
+  episodic_notes[i].note_index 笔记编号。主要用于保持顺序、避免混乱。
+  episodic_notes[i].kind 笔记类型。现在常见的是 episodic，表示短期工作记忆里的笔记。
+- file_summaries: 文件摘要表。它是一个字典，key 是文件路径，value 是这个文件的简短摘要信息。
+  file_summaries[path].summary 某个文件的短摘要。比如“这个文件负责 CLI 参数解析和 agent 启动”。
+  file_summaries[path].created_at 这条文件摘要是什么时候写入的。
+  file_summaries[path].freshness 文件新鲜度指纹，通常是文件内容 hash。用来判断文件变了没有。如果文件改了，旧摘要可能就失效了。
+- task 旧兼容字段，含义和 working.task_summary 基本一样。现在主要是为了兼容老 session 或老代码。
+- files 旧兼容字段，含义和 working.recent_files 基本一样。
+- notes 旧兼容字段，含义和 episodic_notes 的简化版差不多。 这里只保留笔记文本，不带 tags/source 这些结构化信息。
+- next_note_index 下一条笔记该分配的编号。避免新加 note 时 index 重复。
+- durable_topics 长期记忆主题列表。这是从 .pico/memory/ 里读取出来的“持久记忆主题”，比如项目约定、关键决策、依赖事实等，不属于这次临时会话的短期记忆。
+"""
 def default_memory_state():
     # 用一个小而结构化的状态，而不是一大段自由文本摘要。
     return {

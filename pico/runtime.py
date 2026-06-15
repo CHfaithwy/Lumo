@@ -210,6 +210,21 @@ class Pico:
         self.prefix_state = prefix_state
         self.prefix = prefix_state.text
 
+    """
+    prefix 是 prompt 前面那段比较稳定的内容，主要包括：
+    系统规则 Rules
+    工具说明 Tools
+    示例 Valid response examples
+    工作区摘要 Workspace
+    """
+    """
+    refresh_prefix() 的职责就是：
+    看看上一次的 prefix 指纹是什么
+    重新读取当前工作区信息
+    判断工作区是否变了
+    如果变了，重建 prefix
+    记录这次刷新结果
+    """
     def refresh_prefix(self, force=False):
         previous_hash = getattr(getattr(self, "prefix_state", None), "hash", None)
         previous_workspace_fingerprint = getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", None)
@@ -306,7 +321,26 @@ class Pico:
         return metadata
 
     def _build_prompt_and_metadata(self, user_message):
+        """{
+            "workspace_changed": True/False,
+            "prefix_changed": True/False,
+        }"""
         refresh = self.refresh_prefix()
+        """
+        先让 memory 里过期的 file summaries 失效
+        取当前 checkpoint
+        如果有 checkpoint：
+            检查 schema version 是否匹配
+            检查 key files 的 freshness 是否还一致
+            检查 runtime identity 是否变化
+        最后给出一个 resume_state
+        {
+            "status": "partial-stale",
+            "stale_paths": ["pico/cli.py"],
+            "runtime_identity_mismatch_fields": [],
+            "stale_summary_invalidations": 1
+        }
+        """
         self.resume_state = self.evaluate_resume_state()
         prompt, metadata = self.context_manager.build(user_message)
         # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
