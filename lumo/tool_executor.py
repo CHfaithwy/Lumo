@@ -5,6 +5,8 @@ import re
 
 from .workspace import clip
 
+SUMMARY_FOR_HISTORY_PATTERN = re.compile(r"<summary-for-history>(.*?)</summary-for-history>", re.DOTALL)
+
 
 @dataclass(frozen=True)
 class ToolExecutionResult:
@@ -22,6 +24,8 @@ def _metadata(
     workspace_changed=False,
     workspace_fingerprint="",
     diff_summary=None,
+    archive_summary="",
+    read_window=None,
 ):
     result = {
         "tool_status": tool_status,
@@ -35,6 +39,41 @@ def _metadata(
     }
     if workspace_fingerprint:
         result["workspace_fingerprint"] = workspace_fingerprint
+    if archive_summary:
+        result["archive_summary"] = str(archive_summary)
+    if read_window:
+        result["read_window"] = dict(read_window)
+    return result
+
+
+def _extract_archive_summary(content):
+    match = SUMMARY_FOR_HISTORY_PATTERN.search(str(content))
+    if not match:
+        return ""
+    return clip(" ".join(match.group(1).split()), 500)
+
+
+def _extract_read_window(content):
+    text = str(content)
+    header = re.search(
+        r"# lines\s+(\d+)-(\d+)\s+of at least\s+(\d+)\s+\(returned\s+(\d+),\s+requested\s+(\d+)\)",
+        text,
+    )
+    next_offset = re.search(r'"offset":(\d+)', text)
+    result = {}
+    if header:
+        result.update(
+            {
+                "start_line": int(header.group(1)),
+                "end_line": int(header.group(2)),
+                "known_line_floor": int(header.group(3)),
+                "returned_lines": int(header.group(4)),
+                "requested_lines": int(header.group(5)),
+            }
+        )
+    if next_offset:
+        result["next_offset"] = int(next_offset.group(1))
+    result["has_more"] = "current read window" in text
     return result
 
 
@@ -131,7 +170,8 @@ class ToolExecutor:
         before_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
-            content = clip(tool["run"](args))
+            raw_content = tool["run"](args)
+            content = str(raw_content) if name == "read_file" else clip(raw_content)
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
@@ -146,7 +186,8 @@ class ToolExecutor:
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
-            agent.update_memory_after_tool(name, args, content)
+            archive_summary = _extract_archive_summary(content) if name == "read_file" else ""
+            read_window = _extract_read_window(content) if name == "read_file" else {}
             metadata = _metadata(
                 tool_status,
                 tool_error_code=tool_error_code,
@@ -156,7 +197,10 @@ class ToolExecutor:
                 workspace_changed=workspace_changed,
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
+                archive_summary=archive_summary,
+                read_window=read_window,
             )
+            agent.update_memory_after_tool(name, args, content, metadata=metadata)
             agent.record_process_note_for_tool(name, metadata)
             return ToolExecutionResult(content=content, metadata=metadata)
         except Exception as exc:

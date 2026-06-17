@@ -7,21 +7,22 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 
-DEFAULT_TOTAL_BUDGET = 12000
+DEFAULT_TOTAL_BUDGET = 300000
 DEFAULT_SECTION_BUDGETS = {
-    "prefix": 3600,
-    "memory": 1600,
-    "relevant_memory": 1200,
-    "history": 5200,
+    "prefix": 20000,
+    "memory": 30000,
+    "relevant_memory": 30000,
+    "history": 180000,
 }
 DEFAULT_SECTION_FLOORS = {
-    "prefix": 1200,
-    "memory": 400,
-    "relevant_memory": 300,
-    "history": 1500,
+    "prefix": 5000,
+    "memory": 7500,
+    "relevant_memory": 7500,
+    "history": 45000,
 }
 # 当 prompt 超预算时，会优先压缩这些 section。
 DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix")
@@ -30,15 +31,83 @@ CURRENT_REQUEST_SECTION = "current_request"
 RELEVANT_MEMORY_LIMIT = 3
 
 
-def _tail_clip(text, limit):
+_ASCII_WORD_PATTERN = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _is_cjk_char(char):
+    codepoint = ord(char)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x2A6DF
+        or 0x2A700 <= codepoint <= 0x2B73F
+        or 0x2B740 <= codepoint <= 0x2B81F
+        or 0x2B820 <= codepoint <= 0x2CEAF
+        or 0x2CEB0 <= codepoint <= 0x2EBEF
+        or 0x30000 <= codepoint <= 0x3134F
+    )
+
+
+def _context_units(text):
+    """Count prompt budget units: ASCII words, CJK characters, and punctuation."""
+    text = str(text)
+    units = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char.isspace():
+            index += 1
+            continue
+        if _is_cjk_char(char):
+            units += 1
+            index += 1
+            continue
+        match = _ASCII_WORD_PATTERN.match(text, index)
+        if match:
+            units += 1
+            index = match.end()
+            continue
+        units += 1
+        index += 1
+    return units
+
+
+def _clip_to_units(text, limit):
     text = str(text)
     if limit <= 0:
         return ""
-    if len(text) <= limit:
+    if _context_units(text) <= limit:
         return text
-    if limit <= 3:
-        return text[:limit]
-    return text[: limit - 3] + "..."
+    suffix = "..."
+    suffix_units = _context_units(suffix)
+    if limit <= suffix_units:
+        return "." * limit
+
+    units = 0
+    index = 0
+    target = limit - suffix_units
+    while index < len(text) and units < target:
+        char = text[index]
+        if char.isspace():
+            index += 1
+            continue
+        if _is_cjk_char(char):
+            units += 1
+            index += 1
+            continue
+        match = _ASCII_WORD_PATTERN.match(text, index)
+        if match:
+            units += 1
+            index = match.end()
+            continue
+        units += 1
+        index += 1
+    return text[:index].rstrip() + suffix
+
+
+def _tail_clip(text, limit):
+    return _clip_to_units(text, int(limit))
 
 
 @dataclass
@@ -55,6 +124,14 @@ class SectionRender:
     @property
     def rendered_chars(self):
         return len(self.rendered)
+
+    @property
+    def raw_units(self):
+        return _context_units(self.raw)
+
+    @property
+    def rendered_units(self):
+        return _context_units(self.rendered)
 
 
 class ContextManager:
@@ -112,11 +189,14 @@ class ContextManager:
             "history": "",
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
         }
-        checkpoint_text = ""
-        if hasattr(self.agent, "render_checkpoint_text"):
-            checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
-        if checkpoint_text:
-            section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
+        # Checkpoint state is still evaluated and recorded in metadata, but the
+        # rendered checkpoint block is temporarily omitted from the prompt to
+        # avoid repeating task state already present in memory/history.
+        # checkpoint_text = ""
+        # if hasattr(self.agent, "render_checkpoint_text"):
+        #     checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
+        # if checkpoint_text:
+        #     section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
@@ -144,8 +224,9 @@ class ContextManager:
         # 这里的顺序体现了平台偏好：
         # 先牺牲 relevant_memory，再牺牲 history，然后才动 memory 和 prefix。
         # 最新用户请求永远不裁剪，因为那是本轮最重要的输入。
-        while len(prompt) > self.total_budget:
-            overflow = len(prompt) - self.total_budget
+        prompt_units = _context_units(prompt)
+        while prompt_units > self.total_budget:
+            overflow = prompt_units - self.total_budget
             reduced = False
             for section in self.reduction_order:
                 floor = int(self.section_floors.get(section, 0))
@@ -158,14 +239,15 @@ class ContextManager:
                 reduction_log.append(
                     {
                         "section": section,
-                        "before_chars": current_budget,
-                        "after_chars": new_budget,
-                        "overflow_chars": overflow,
+                        "before_units": current_budget,
+                        "after_units": new_budget,
+                        "overflow_units": overflow,
                     }
                 )
                 budgets[section] = new_budget
                 rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
                 prompt = self._assemble_prompt(rendered)
+                prompt_units = _context_units(prompt)
                 reduced = True
                 break
             if not reduced:
@@ -193,11 +275,11 @@ class ContextManager:
         history = list(getattr(self.agent, "session", {}).get("history", []))
         history_raw = self._raw_history_text(history)
         return {
-            "prefix": SectionRender(raw=section_texts["prefix"], budget=len(section_texts["prefix"]), rendered=section_texts["prefix"], details={}),
-            "memory": SectionRender(raw=section_texts["memory"], budget=len(section_texts["memory"]), rendered=section_texts["memory"], details={}),
+            "prefix": SectionRender(raw=section_texts["prefix"], budget=_context_units(section_texts["prefix"]), rendered=section_texts["prefix"], details={}),
+            "memory": SectionRender(raw=section_texts["memory"], budget=_context_units(section_texts["memory"]), rendered=section_texts["memory"], details={}),
             "relevant_memory": SectionRender(
                 raw=relevant_raw,
-                budget=len(relevant_raw),
+                budget=_context_units(relevant_raw),
                 rendered=relevant_raw,
                 details={
                     "selected_notes": [note["text"] for note in selected_notes],
@@ -207,7 +289,7 @@ class ContextManager:
                     "note_budget": 0,
                 },
             ),
-            "history": SectionRender(raw=history_raw, budget=len(history_raw), rendered=history_raw, details={"rendered_entries": []}),
+            "history": SectionRender(raw=history_raw, budget=_context_units(history_raw), rendered=history_raw, details={"rendered_entries": []}),
             CURRENT_REQUEST_SECTION: SectionRender(
                 raw=section_texts[CURRENT_REQUEST_SECTION],
                 budget=0,
@@ -267,11 +349,11 @@ class ContextManager:
             # 让每条 note 平分这一段的预算，避免一条超长笔记把其他笔记都挤掉。
             rendered_notes = [_tail_clip(text, per_note_budget) for text in note_texts]
             rendered = "\n".join([header] + [f"- {text}" for text in rendered_notes])
-            if len(rendered) <= budget or per_note_budget <= 1:
+            if _context_units(rendered) <= budget or per_note_budget <= 1:
                 break
             per_note_budget -= 1
 
-        if len(rendered) > budget and budget > 0:
+        if _context_units(rendered) > budget and budget > 0:
             rendered = _tail_clip(raw, budget)
             rendered_notes = [rendered]
 
@@ -291,7 +373,7 @@ class ContextManager:
     def _per_note_budget(self, budget, note_count, header):
         if note_count <= 0:
             return 0
-        overhead = len(header) + 3 * note_count
+        overhead = _context_units(header) + 3 * note_count
         usable = max(0, budget - overhead)
         return max(1, usable // note_count)
 
@@ -323,28 +405,28 @@ class ContextManager:
             candidate_lines = list(entry.get("lines", []))
             candidate_entries = candidate_lines + rendered_entries
             candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-            if len(candidate_rendered) <= budget:
+            if _context_units(candidate_rendered) <= budget:
                 rendered_entries = candidate_entries
                 continue
             if recent:
-                available = budget - len("Transcript:")
+                available = budget - _context_units("Transcript:")
                 if rendered_entries:
-                    available -= sum(len(line) + 1 for line in rendered_entries)
+                    available -= sum(_context_units(line) + 1 for line in rendered_entries)
                 available = max(20, available - 1)
                 candidate_lines = [_tail_clip(line, available) for line in candidate_lines]
                 candidate_entries = candidate_lines + rendered_entries
                 candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-                if len(candidate_rendered) <= budget:
+                if _context_units(candidate_rendered) <= budget:
                     rendered_entries = candidate_entries
             else:
                 smaller_lines = [_tail_clip(line, 20) for line in candidate_lines]
                 smaller_entries = smaller_lines + rendered_entries
                 smaller_rendered = "\n".join(["Transcript:", *smaller_entries])
-                if len(smaller_rendered) <= budget:
+                if _context_units(smaller_rendered) <= budget:
                     rendered_entries = smaller_entries
         rendered = "\n".join(["Transcript:", *rendered_entries])
 
-        if len(rendered) > budget and budget > 0:
+        if _context_units(rendered) > budget and budget > 0:
             rendered = _tail_clip(raw, budget)
 
         return SectionRender(
@@ -359,6 +441,11 @@ class ContextManager:
             },
         )
 
+    def render_history_for_delegate(self):
+        """Render parent history with the same compression policy as prompts."""
+        budget = int(self.section_budgets.get("history", 0) or 0)
+        return self._render_history_section(budget).rendered
+
     def _compressed_history_entries(self, history, recent_start):
         entries = []
         seen_older_reads = set()
@@ -372,22 +459,22 @@ class ContextManager:
         for index, item in enumerate(history):
             recent = index >= recent_start
             if recent:
-                line_limit = 900
                 entries.append(
                     {
                         "recent": True,
-                        "lines": self._render_history_item(item, line_limit),
+                        "lines": self._render_history_item(item),
                     }
                 )
                 continue
 
             if item["role"] == "tool" and item["name"] == "read_file":
                 path = str(item["args"].get("path", "")).strip()
-                if path in seen_older_reads:
+                read_key = self._read_history_key(item)
+                if read_key in seen_older_reads:
                     details["collapsed_duplicate_reads"] += 1
                     continue
-                seen_older_reads.add(path)
-                summary = self._reusable_file_summary(path)
+                seen_older_reads.add(read_key)
+                summary = self._history_item_summary(item) or self._reusable_file_summary(path)
                 if summary:
                     entries.append({"recent": False, "lines": [f"{path} -> {summary}"]})
                     details["older_entries_count"] += 1
@@ -405,6 +492,22 @@ class ContextManager:
 
         return entries, details
 
+    def _read_history_key(self, item):
+        args = item.get("args", {})
+        path = str(args.get("path", "")).strip()
+        metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+        read_window = metadata.get("read_window", {}) if isinstance(metadata.get("read_window", {}), dict) else {}
+        offset = read_window.get("start_line", args.get("offset", args.get("start", "")))
+        limit = read_window.get("requested_lines", args.get("limit", args.get("end", "")))
+        return (path, str(offset), str(limit))
+
+    def _history_item_summary(self, item):
+        summary = str(item.get("summary", "")).strip()
+        if summary:
+            return summary
+        metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+        return str(metadata.get("archive_summary", "")).strip()
+
     def _reusable_file_summary(self, path):
         memory = getattr(self.agent, "memory", None)
         if memory is None or not hasattr(memory, "to_dict"):
@@ -416,6 +519,9 @@ class ContextManager:
         return str(summary.get("summary", "")).strip()
 
     def _summarize_old_tool_item(self, item):
+        summary = self._history_item_summary(item)
+        if summary:
+            return f"{item['name']} -> {summary}"
         if item["name"] == "run_shell":
             command = str(item["args"].get("command", "")).strip() or "shell"
             lines = [line.strip() for line in str(item.get("content", "")).splitlines() if line.strip()]
@@ -435,12 +541,13 @@ class ContextManager:
                 lines.append(f"[{item['role']}] {item['content']}")
         return "\n".join(["Transcript:", *lines])
 
-    def _render_history_item(self, item, line_limit):
+    def _render_history_item(self, item, line_limit=None):
         if item["role"] == "tool":
             prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
-            content = _tail_clip(item["content"], max(20, line_limit))
+            content = str(item["content"]) if line_limit is None else _tail_clip(item["content"], max(20, line_limit))
             return [prefix, content]
-        return [f"[{item['role']}] {_tail_clip(item['content'], line_limit)}"]
+        content = str(item["content"]) if line_limit is None else _tail_clip(item["content"], line_limit)
+        return [f"[{item['role']}] {content}"]
 
     def _assemble_prompt(self, rendered):
         # 顺序是刻意设计的：稳定规则放前面，最新请求放最后。
@@ -459,23 +566,34 @@ class ContextManager:
         for section in SECTION_ORDER[:-1]:
             section_metadata[section] = {
                 "raw_chars": rendered[section].raw_chars,
-                "budget_chars": int(budgets.get(section, 0)),
+                "budget_chars": None,
                 "rendered_chars": rendered[section].rendered_chars,
+                "raw_units": rendered[section].raw_units,
+                "budget_units": int(budgets.get(section, 0)),
+                "rendered_units": rendered[section].rendered_units,
             }
         section_metadata[CURRENT_REQUEST_SECTION] = {
             "raw_chars": len(section_texts[CURRENT_REQUEST_SECTION]),
             "budget_chars": None,
             "rendered_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
+            "raw_units": _context_units(section_texts[CURRENT_REQUEST_SECTION]),
+            "budget_units": None,
+            "rendered_units": rendered[CURRENT_REQUEST_SECTION].rendered_units,
         }
+        prompt_units = _context_units(prompt)
         return {
             "prompt_chars": len(prompt),
-            "prompt_budget_chars": self.total_budget,
-            "prompt_over_budget": len(prompt) > self.total_budget,
+            "prompt_units": prompt_units,
+            "prompt_budget_chars": None,
+            "prompt_budget_units": self.total_budget,
+            "prompt_budget_unit": "ascii_word_cjk_char_or_punctuation",
+            "prompt_over_budget": prompt_units > self.total_budget,
             "section_order": list(SECTION_ORDER),
             "section_budgets": {
                 section: (None if section == CURRENT_REQUEST_SECTION else int(budgets.get(section, 0)))
                 for section in SECTION_ORDER
             },
+            "section_budget_unit": "ascii_word_cjk_char_or_punctuation",
             "sections": section_metadata,
             "budget_reductions": reduction_log,
             "reduction_order": list(self.reduction_order),
@@ -490,12 +608,16 @@ class ContextManager:
                 ),
                 "raw_chars": rendered["relevant_memory"].raw_chars,
                 "rendered_chars": rendered["relevant_memory"].rendered_chars,
+                "raw_units": rendered["relevant_memory"].raw_units,
+                "rendered_units": rendered["relevant_memory"].rendered_units,
                 "rendered_notes": list(rendered["relevant_memory"].details.get("rendered_notes", [])),
                 "rendered_count": int(rendered["relevant_memory"].details.get("rendered_count", 0)),
             },
             "history": {
                 "raw_chars": rendered["history"].raw_chars,
                 "rendered_chars": rendered["history"].rendered_chars,
+                "raw_units": rendered["history"].raw_units,
+                "rendered_units": rendered["history"].rendered_units,
                 "older_entries_count": int(rendered["history"].details.get("older_entries_count", 0)),
                 "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
                 "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
@@ -506,5 +628,8 @@ class ContextManager:
                 "raw_chars": len(user_message),
                 "rendered_chars": len(user_message),
                 "section_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
+                "raw_units": _context_units(user_message),
+                "rendered_units": _context_units(user_message),
+                "section_units": rendered[CURRENT_REQUEST_SECTION].rendered_units,
             },
         }

@@ -32,6 +32,9 @@ class RunStore:
     def report_path(self, run_id):
         return self.run_dir(run_id) / "report.json"
 
+    def prompt_path(self, run_id, index):
+        return self.run_dir(run_id) / f"prompt{int(index)}.md"
+
     def start_run(self, task_state):
         # 每次 ask() 都会生成一个 run 目录。
         # 这样一次用户请求对应一组独立工件，后续排查更容易。
@@ -60,6 +63,12 @@ class RunStore:
         path = self.report_path(task_state)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._write_json_atomic(path, report)
+        return path
+
+    def write_prompt(self, task_state, index, prompt):
+        path = self.prompt_path(task_state, index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(prompt), encoding="utf-8")
         return path
 
     def load_task_state(self, task_id):

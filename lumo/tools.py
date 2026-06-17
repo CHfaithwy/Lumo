@@ -11,6 +11,10 @@ from functools import partial
 
 from .workspace import IGNORED_PATH_NAMES
 
+READ_FILE_DEFAULT_LIMIT = 200
+READ_FILE_MAX_LIMIT = 2000
+READ_FILE_ARCHIVE_SUMMARY_LINES = 12
+
 BASE_TOOL_SPECS = {
     "list_files": {
         "schema": {"path": "str='.'"},
@@ -18,9 +22,13 @@ BASE_TOOL_SPECS = {
         "description": "List files in the workspace.",
     },
     "read_file": {
-        "schema": {"path": "str", "start": "int=1", "end": "int=200"},
+        "schema": {"path": "str", "offset": "int=1", "limit": "int=200"},
         "risky": False,
-        "description": "Read a UTF-8 file by line range.",
+        "description": (
+            "Read a UTF-8 file by line window. Use offset/limit for long files; "
+            'if has_more is true, continue with next_offset or a targeted window like {"offset":8600,"limit":300}. '
+            "After each chunk, summarize the relevant facts before deciding whether to read more."
+        ),
     },
     "search": {
         "schema": {"pattern": "str", "path": "str='.'"},
@@ -45,9 +53,13 @@ BASE_TOOL_SPECS = {
 }
 
 DELEGATE_TOOL_SPEC = {
-    "schema": {"task": "str", "max_steps": "int=3"},
+    "schema": {"task": "str", "max_steps": "int=3", "inherit_context": "bool=True"},
     "risky": False,
-    "description": "Ask a bounded read-only child agent to investigate.",
+    "description": (
+        "Ask a bounded child agent to work on a subtask. With inherit_context=true, "
+        "the child receives the parent's compressed history; use this when the subtask depends on prior conversation, files, or decisions. "
+        "With inherit_context=false, the child starts without parent history; use this for independent subtasks unrelated to the main agent's context."
+    ),
 }
 
 
@@ -56,13 +68,91 @@ def legal_tool_names():
 
 TOOL_EXAMPLES = {
     "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-    "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
+    "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","offset":1,"limit":80}}</tool>',
     "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-    "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
+    "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3,"inherit_context":true}}</tool>',
 }
+
+
+def _read_window_args(args):
+    """Return one-based offset and line limit, accepting legacy start/end."""
+    args = args or {}
+    offset = int(args.get("offset", args.get("start", 1)))
+    if "limit" in args:
+        limit = int(args.get("limit", READ_FILE_DEFAULT_LIMIT))
+    elif "end" in args:
+        end = int(args.get("end", offset + READ_FILE_DEFAULT_LIMIT - 1))
+        if end < offset:
+            raise ValueError("invalid line range")
+        limit = end - offset + 1
+    else:
+        limit = READ_FILE_DEFAULT_LIMIT
+    if offset < 1:
+        raise ValueError("offset must be >= 1")
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    if limit > READ_FILE_MAX_LIMIT:
+        raise ValueError(f"limit must be <= {READ_FILE_MAX_LIMIT}")
+    return offset, limit
+
+
+def _summarize_read_window(relative_path, offset, selected_lines, has_more, next_offset):
+    facts = []
+    for line in selected_lines:
+        text = line.strip()
+        if not text:
+            continue
+        facts.append(text)
+        if len(facts) >= READ_FILE_ARCHIVE_SUMMARY_LINES:
+            break
+    if facts:
+        summary = " | ".join(facts)
+    else:
+        summary = "(empty window)"
+    suffix = f" If needed, continue from line {next_offset}." if has_more else ""
+    return f"Read {relative_path} from line {offset}: {summary}.{suffix}"
+
+
+def _read_file_window(path, offset, limit):
+    end_line = offset + limit - 1
+    selected_lines = []
+    returned_lines = 0
+    last_seen_line = 0
+    has_more = False
+
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for number, raw_line in enumerate(handle, start=1):
+            last_seen_line = number
+            if number < offset:
+                continue
+            if number > end_line:
+                has_more = True
+                break
+
+            line = raw_line.rstrip("\n").rstrip("\r")
+            rendered = f"{number:>4}: {line}"
+
+            selected_lines.append(rendered)
+            returned_lines += 1
+
+    if selected_lines:
+        next_offset = offset + returned_lines
+    else:
+        next_offset = offset
+    if not has_more and last_seen_line >= end_line:
+        next_offset = end_line + 1
+
+    return {
+        "lines": selected_lines,
+        "returned_lines": returned_lines,
+        "end_line": offset + max(returned_lines - 1, 0),
+        "has_more": has_more,
+        "next_offset": next_offset,
+        "last_seen_line": last_seen_line,
+    }
 
 
 def build_tool_registry(context):
@@ -96,10 +186,7 @@ def validate_tool(context, name, args):
         path = context.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
-        start = int(args.get("start", 1))
-        end = int(args.get("end", 200))
-        if start < 1 or end < start:
-            raise ValueError("invalid line range")
+        _read_window_args(args)
         return
 
     if name == "search":
@@ -150,6 +237,10 @@ def validate_tool(context, name, args):
             raise ValueError("task must not be empty")
         if context.depth >= context.max_depth:
             raise ValueError("delegate depth exceeded")
+        inherit_context = args.get("inherit_context", True)
+        if isinstance(inherit_context, str):
+            if inherit_context.strip().lower() not in {"true", "false", "1", "0", "yes", "no"}:
+                raise ValueError("inherit_context must be a boolean")
         return
 
 
@@ -175,13 +266,32 @@ def tool_read_file(context, args):
     path = context.path(args["path"])
     if not path.is_file():
         raise ValueError("path is not a file")
-    start = int(args.get("start", 1))
-    end = int(args.get("end", 200))
-    if start < 1 or end < start:
-        raise ValueError("invalid line range")
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
-    return f"# {path.relative_to(context.root)}\n{body}"
+    offset, limit = _read_window_args(args)
+    relative_path = path.relative_to(context.root).as_posix()
+    window = _read_file_window(path, offset, limit)
+    body = "\n".join(window["lines"]) or "(empty)"
+    header = (
+        f"# {relative_path}\n"
+        f"# lines {offset}-{window['end_line']} of at least {window['last_seen_line']} "
+        f"(returned {window['returned_lines']}, requested {limit})"
+    )
+    hints = []
+    if window["has_more"]:
+        hints.append(
+            f"<system-reminder>The lines above are the current read window. If they are not enough to answer "
+            f"the user's question or support your judgment, continue with "
+            f'read_file args {{"path":"{relative_path}","offset":{window["next_offset"]},"limit":{limit}}} '
+            f'or jump to a targeted window like {{"offset":8600,"limit":300}} if you know where to inspect.</system-reminder>'
+        )
+    summary = _summarize_read_window(
+        relative_path,
+        offset,
+        window["lines"],
+        window["has_more"],
+        window["next_offset"],
+    )
+    hints.append(f"<summary-for-history>{summary}</summary-for-history>")
+    return "\n".join([header, body, *hints])
 
 # rg 是一个非常快的代码搜索工具，如果系统里安装了 rg，就优先用它来搜索；否则就用纯 Python 的实现。
 # 搜索结果会被限制在前 200 行，避免返回过多内容导致后续处理困难。
@@ -268,15 +378,8 @@ def tool_patch_file(context, args):
     path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
     return f"patched {path.relative_to(context.root)}"
 
-# 把一个子任务交给子 agent 调查。
-"""
-它本质上是一个受限子任务。代码里对子agent的约束很明确:
-approval_policy="never"
-read_only=True
-max_steps更小
-深度超过上限时，连delegate 都不再暴露
-
-"""
+# Delegate a bounded subtask to a child agent. The child inherits the parent
+# agent's read/write and approval policy; max_steps and depth still bound it.
 def tool_delegate(context, args):
     if context.depth >= context.max_depth:
         raise ValueError("delegate depth exceeded")

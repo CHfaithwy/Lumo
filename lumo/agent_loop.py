@@ -138,11 +138,13 @@ class AgentLoop:
             prompt_started_at = time.monotonic()
 
             prompt, prompt_metadata = agent._build_prompt_and_metadata(user_message)
+            prompt_path = agent.run_store.write_prompt(task_state, attempts, agent.redact_text(prompt))
             agent.emit_trace(
                 task_state,
                 "prompt_built",
                 {
                     "prompt_metadata": prompt_metadata,
+                    "prompt_path": str(prompt_path),
                     "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
                 },
             )
@@ -250,15 +252,18 @@ class AgentLoop:
                 tool_started_at = time.monotonic()
                 tool_result = agent.execute_tool(name, args)
                 result = tool_result.content
-                agent.record(
-                    {
-                        "role": "tool",
-                        "name": name,
-                        "args": args,
-                        "content": result,
-                        "created_at": now(),
-                    }
-                )
+                tool_record = {
+                    "role": "tool",
+                    "name": name,
+                    "args": args,
+                    "content": result,
+                    "created_at": now(),
+                    "metadata": dict(tool_result.metadata or {}),
+                }
+                archive_summary = tool_record["metadata"].get("archive_summary", "")
+                if archive_summary:
+                    tool_record["summary"] = archive_summary
+                agent.record(tool_record)
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,

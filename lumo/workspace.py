@@ -12,12 +12,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_TOOL_OUTPUT = 4000
-MAX_HISTORY = 12000
 AGENT_STATE_DIR = ".lumo"
 # 这些文件最可能直接影响 agent 的行动方式。
 # 我们不会预加载整个仓库，只会先给模型一小份“导航包”。
-DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
-IGNORED_PATH_NAMES = {".git", AGENT_STATE_DIR, "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
+MAX_PROJECT_TREE_ENTRIES = 1000
+IGNORED_PATH_NAMES = {
+    ".git",
+    AGENT_STATE_DIR,
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".tox",
+    ".venv",
+    "venv",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+}
 
 
 def now():
@@ -40,6 +53,62 @@ def middle(text, limit):
     left = (limit - 3) // 2
     right = limit - 3 - left
     return text[:left] + "..." + text[-right:]
+
+
+def project_tree(root, max_entries=MAX_PROJECT_TREE_ENTRIES):
+    root = Path(root).resolve()
+    included = {root}
+    current_level_dirs = [root]
+    total_entries = 0
+    stopped_at_depth = None
+
+    def visible_children(path):
+        try:
+            entries = [
+                item
+                for item in path.iterdir()
+                if item.name not in IGNORED_PATH_NAMES and not item.name.startswith(".tmp")
+            ]
+        except (OSError, PermissionError):
+            return []
+        entries.sort(key=lambda item: (item.is_file(), item.name.lower()))
+        return entries
+
+    depth = 0
+    while current_level_dirs:
+        depth += 1
+        next_level = []
+        level_children = []
+        for directory in current_level_dirs:
+            children = visible_children(directory)
+            level_children.extend(children)
+            next_level.extend(item for item in children if item.is_dir() and not item.is_symlink())
+
+        if total_entries + len(level_children) > max_entries:
+            stopped_at_depth = depth
+            break
+
+        total_entries += len(level_children)
+        included.update(level_children)
+        current_level_dirs = next_level
+
+    def render(path, depth):
+        lines = []
+        for item in visible_children(path):
+            if item not in included:
+                continue
+            suffix = "/" if item.is_dir() and not item.is_symlink() else ""
+            lines.append(f"{'  ' * depth}- {item.name}{suffix}")
+            if item.is_dir() and not item.is_symlink():
+                lines.extend(render(item, depth + 1))
+        return lines
+
+    lines = [".", *render(root, 1)]
+    if stopped_at_depth is not None:
+        lines.append(
+            f"...[truncated before depth {stopped_at_depth}; next level would exceed {max_entries} entries]"
+        )
+    return "\n".join(lines)
 
 
 class WorkspaceContext:
@@ -75,19 +144,10 @@ class WorkspaceContext:
             if repo_root_override is not None
             else Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
         )
-        docs = {}
+        # Keep project_docs as a lightweight navigation map instead of loading file contents.
+        docs = {"directory_tree": project_tree(cwd)}
         # 同时扫描 repo_root 和 cwd，这样在子目录启动时也能看到本地文档；
         # 但用相对路径做 key，避免同一份文档被重复收集。
-        for base in (repo_root, cwd):
-            for name in DOC_NAMES:
-                path = base / name
-                if not path.exists():
-                    continue
-                key = str(path.relative_to(repo_root))
-                if key in docs:
-                    continue
-                docs[key] = clip(path.read_text(encoding="utf-8", errors="replace"), 1200)
-
         return cls(
             cwd=str(cwd),
             repo_root=str(repo_root),
@@ -103,7 +163,7 @@ class WorkspaceContext:
     def text(self):
         # 这段文本会被塞进 prompt prefix，作为相对稳定的基线上下文。
         commits = "\n".join(f"- {line}" for line in self.recent_commits) or "- none"
-        docs = "\n".join(f"- {path}\n{snippet}" for path, snippet in self.project_docs.items()) or "- none"
+        docs = "\n".join(f"- {path}:\n{snippet}" for path, snippet in self.project_docs.items()) or "- none"
         return textwrap.dedent(
             f"""\
             Workspace:

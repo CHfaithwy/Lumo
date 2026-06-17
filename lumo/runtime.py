@@ -24,7 +24,7 @@ from .session_store import SessionStore
 from .tool_context import ToolContext
 from .tool_executor import ToolExecutor
 from . import tools as toolkit
-from .workspace import AGENT_STATE_DIR, IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
+from .workspace import AGENT_STATE_DIR, IGNORED_PATH_NAMES, WorkspaceContext, clip, now
 
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
 DEFAULT_FEATURE_FLAGS = {
@@ -262,20 +262,36 @@ class Pico:
         for index, item in enumerate(history):
             recent = index >= recent_start
             if item["role"] == "tool" and item["name"] == "read_file" and not recent:
-                path = str(item["args"].get("path", ""))
-                if path in seen_reads:
+                read_key = self._history_read_key(item)
+                if read_key in seen_reads:
                     continue
-                seen_reads.add(path)
+                seen_reads.add(read_key)
 
             if item["role"] == "tool":
-                limit = 900 if recent else 180
                 lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
-                lines.append(clip(item["content"], limit))
+                summary = self._history_item_summary(item)
+                lines.append(summary or str(item["content"]))
             else:
-                limit = 900 if recent else 220
-                lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
+                lines.append(f"[{item['role']}] {item['content']}")
 
-        return clip("\n".join(lines), MAX_HISTORY)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _history_item_summary(item):
+        summary = str(item.get("summary", "")).strip()
+        if summary:
+            return summary
+        metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+        return str(metadata.get("archive_summary", "")).strip()
+
+    @staticmethod
+    def _history_read_key(item):
+        args = item.get("args", {})
+        metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+        read_window = metadata.get("read_window", {}) if isinstance(metadata.get("read_window", {}), dict) else {}
+        offset = read_window.get("start_line", args.get("offset", args.get("start", "")))
+        limit = read_window.get("requested_lines", args.get("limit", args.get("end", "")))
+        return (str(args.get("path", "")).strip(), str(offset), str(limit))
 
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name), False))
@@ -321,7 +337,8 @@ class Pico:
         return metadata
 
     def _build_prompt_and_metadata(self, user_message):
-        """{
+        """
+        {
             "workspace_changed": True/False,
             "prefix_changed": True/False,
         }"""
@@ -419,7 +436,7 @@ class Pico:
     def infer_next_step(self, task_state):
         return checkpointlib.infer_next_step(task_state)
 
-    def update_memory_after_tool(self, name, args, result):
+    def update_memory_after_tool(self, name, args, result, metadata=None):
         """把少量高价值工具结果沉淀到 working memory。
 
         为什么存在：
@@ -446,12 +463,16 @@ class Pico:
         # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
         if name in {"read_file", "write_file", "patch_file"}:
             self.memory.remember_file(canonical_path)
+        metadata = dict(metadata or {})
         if name == "read_file":
-            summary = memorylib.summarize_read_result(result)
+            summary = str(metadata.get("archive_summary") or "").strip()
+            if not summary:
+                summary = memorylib.summarize_read_result(result)
             self.memory.set_file_summary(canonical_path, summary)
             self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
         elif name in {"write_file", "patch_file"}:
             self.memory.invalidate_file_summary(canonical_path)
+        self.session["memory"] = self.memory.to_dict()
 
     def note_tool(self, name, args, result):
         self.update_memory_after_tool(name, args, result)
@@ -626,24 +647,30 @@ class Pico:
 
     def spawn_delegate(self, args):
         task = str(args.get("task", "")).strip()
+        inherit_context = args.get("inherit_context", True)
+        if isinstance(inherit_context, str):
+            inherit_context = inherit_context.strip().lower() in {"true", "1", "yes"}
         child = Pico(
             model_client=self.model_client,
             workspace=self.workspace,
             session_store=self.session_store,
             run_store=self.run_store,
-            approval_policy="never",
+            approval_policy=self.approval_policy,
             max_steps=int(args.get("max_steps", 3)),
             max_new_tokens=self.max_new_tokens,
             depth=self.depth + 1,
             max_depth=self.max_depth,
-            read_only=True,
+            read_only=self.read_only,
             secret_env_names=self.secret_env_names,
             shell_env_allowlist=self.shell_env_allowlist,
         )
         # 委派的目标是“调查”，不是“放权执行”。
         # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
-        child.session["memory"]["task"] = task
-        child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
+        child.memory.set_task_summary(task)
+        if inherit_context:
+            parent_history = self.context_manager.render_history_for_delegate()
+            child.memory.append_note(parent_history, tags=("parent-history",), source="delegate")
+        child.session["memory"] = child.memory.to_dict()
         return "delegate_result:\n" + child.ask(task)
 
     def tool_list_files(self, args):
