@@ -15,7 +15,7 @@ MAX_TOOL_OUTPUT = 4000
 AGENT_STATE_DIR = ".lumo"
 # 这些文件最可能直接影响 agent 的行动方式。
 # 我们不会预加载整个仓库，只会先给模型一小份“导航包”。
-MAX_PROJECT_TREE_ENTRIES = 1000
+MAX_PROJECT_TREE_ENTRIES = 100
 IGNORED_PATH_NAMES = {
     ".git",
     AGENT_STATE_DIR,
@@ -111,6 +111,11 @@ def project_tree(root, max_entries=MAX_PROJECT_TREE_ENTRIES):
     return "\n".join(lines)
 
 
+def indent_block(text, prefix):
+    lines = str(text).splitlines() or [""]
+    return "\n".join(f"{prefix}{line}" if line else prefix.rstrip() for line in lines)
+
+
 class WorkspaceContext:
     def __init__(self, cwd, repo_root, branch, default_branch, status, recent_commits, project_docs):
         self.cwd = cwd
@@ -163,21 +168,25 @@ class WorkspaceContext:
     def text(self):
         # 这段文本会被塞进 prompt prefix，作为相对稳定的基线上下文。
         commits = "\n".join(f"- {line}" for line in self.recent_commits) or "- none"
-        docs = "\n".join(f"- {path}:\n{snippet}" for path, snippet in self.project_docs.items()) or "- none"
-        return textwrap.dedent(
-            f"""\
-            Workspace:
-            - cwd: {self.cwd}
-            - repo_root: {self.repo_root}
-            - branch: {self.branch}
-            - default_branch: {self.default_branch}
-            - status:
-            {self.status}
-            - recent_commits:
-            {commits}
-            - project_docs:
-            {docs}
-            """
+        doc_lines = []
+        for path, snippet in self.project_docs.items():
+            doc_lines.append(f"  - {path}:")
+            doc_lines.append(indent_block(snippet, "    "))
+        docs = "\n".join(doc_lines) or "  - none"
+        return "\n".join(
+            [
+                "Workspace:",
+                f"- cwd: {self.cwd}",
+                f"- repo_root: {self.repo_root}",
+                f"- branch: {self.branch}",
+                f"- default_branch: {self.default_branch}",
+                "- status:",
+                indent_block(self.status, "  "),
+                "- recent_commits:",
+                indent_block(commits, "  "),
+                "- project_docs:",
+                docs,
+            ]
         ).strip()
 
     def fingerprint(self):

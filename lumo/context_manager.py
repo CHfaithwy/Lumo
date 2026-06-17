@@ -9,26 +9,31 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 
 DEFAULT_TOTAL_BUDGET = 300000
 DEFAULT_SECTION_BUDGETS = {
-    "prefix": 20000,
-    "memory": 30000,
-    "relevant_memory": 30000,
-    "history": 180000,
+    "prefix": 4000,
+    "memory": 1000,
+    "relevant_memory": 10000,
+    "history": 260000,
 }
 DEFAULT_SECTION_FLOORS = {
-    "prefix": 5000,
-    "memory": 7500,
+    "prefix": 2000,
+    "memory": 500,
     "relevant_memory": 7500,
-    "history": 45000,
+    "history": 1,
 }
 # 当 prompt 超预算时，会优先压缩这些 section。
 DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix")
 SECTION_ORDER = ("prefix", "memory", "relevant_memory", "history", "current_request")
 CURRENT_REQUEST_SECTION = "current_request"
 RELEVANT_MEMORY_LIMIT = 3
+STALE_READ_MESSAGE = (
+    "This earlier read_file output is stale because the file was modified later in the transcript. "
+    "Read the file again before relying on its contents."
+)
 
 
 _ASCII_WORD_PATTERN = re.compile(r"[A-Za-z0-9_]+")
@@ -398,7 +403,8 @@ class ContextManager:
         # 优先保留最近的历史，因为下一步决策通常最依赖刚刚发生的工具结果。
         recent_window = 6
         recent_start = max(0, len(history) - recent_window)
-        history_entries, history_details = self._compressed_history_entries(history, recent_start)
+        stale_read_indexes = self._stale_read_indexes(history)
+        history_entries, history_details = self._compressed_history_entries(history, recent_start, stale_read_indexes)
         rendered_entries = []
         for entry in reversed(history_entries):
             recent = bool(entry.get("recent", False))
@@ -446,23 +452,29 @@ class ContextManager:
         budget = int(self.section_budgets.get("history", 0) or 0)
         return self._render_history_section(budget).rendered
 
-    def _compressed_history_entries(self, history, recent_start):
+    def _compressed_history_entries(self, history, recent_start, stale_read_indexes=None):
         entries = []
         seen_older_reads = set()
+        stale_read_indexes = set(stale_read_indexes or set())
         details = {
             "older_entries_count": 0,
             "collapsed_duplicate_reads": 0,
             "reused_file_summary_count": 0,
             "summarized_tool_count": 0,
+            "stale_read_replacement_count": 0,
         }
 
         for index, item in enumerate(history):
             recent = index >= recent_start
+            is_stale_read = index in stale_read_indexes
             if recent:
+                lines = self._render_stale_read_history_item(item) if is_stale_read else self._render_history_item(item)
+                if is_stale_read:
+                    details["stale_read_replacement_count"] += 1
                 entries.append(
                     {
                         "recent": True,
-                        "lines": self._render_history_item(item),
+                        "lines": lines,
                     }
                 )
                 continue
@@ -474,6 +486,11 @@ class ContextManager:
                     details["collapsed_duplicate_reads"] += 1
                     continue
                 seen_older_reads.add(read_key)
+                if is_stale_read:
+                    entries.append({"recent": False, "lines": self._render_stale_read_history_item(item)})
+                    details["older_entries_count"] += 1
+                    details["stale_read_replacement_count"] += 1
+                    continue
                 summary = self._history_item_summary(item) or self._reusable_file_summary(path)
                 if summary:
                     entries.append({"recent": False, "lines": [f"{path} -> {summary}"]})
@@ -500,6 +517,48 @@ class ContextManager:
         offset = read_window.get("start_line", args.get("offset", args.get("start", "")))
         limit = read_window.get("requested_lines", args.get("limit", args.get("end", "")))
         return (path, str(offset), str(limit))
+
+    def _history_path_key(self, item):
+        args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
+        path = str(args.get("path", "")).strip()
+        if not path:
+            return ""
+        root = getattr(self.agent, "root", None)
+        try:
+            raw_path = Path(path)
+            if root is not None and not raw_path.is_absolute():
+                raw_path = Path(root) / raw_path
+            resolved = raw_path.resolve()
+            if root is not None:
+                root_path = Path(root).resolve()
+                try:
+                    return resolved.relative_to(root_path).as_posix()
+                except ValueError:
+                    pass
+            return resolved.as_posix()
+        except Exception:
+            return path.replace("\\", "/").lstrip("./")
+
+    def _stale_read_indexes(self, history):
+        stale_indexes = set()
+        latest_reads_by_path = {}
+        for index, item in enumerate(history):
+            if item.get("role") != "tool":
+                continue
+            name = item.get("name")
+            path_key = self._history_path_key(item)
+            if not path_key:
+                continue
+            if name == "read_file":
+                latest_reads_by_path.setdefault(path_key, []).append(index)
+            elif name in {"write_file", "patch_file"}:
+                stale_indexes.update(latest_reads_by_path.get(path_key, []))
+                latest_reads_by_path[path_key] = []
+        return stale_indexes
+
+    def _render_stale_read_history_item(self, item):
+        prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
+        return [prefix, STALE_READ_MESSAGE]
 
     def _history_item_summary(self, item):
         summary = str(item.get("summary", "")).strip()
@@ -622,6 +681,7 @@ class ContextManager:
                 "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
                 "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
                 "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
+                "stale_read_replacement_count": int(rendered["history"].details.get("stale_read_replacement_count", 0)),
             },
             "current_request": {
                 "text": user_message,

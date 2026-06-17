@@ -33,6 +33,10 @@ DEFAULT_FEATURE_FLAGS = {
     "context_reduction": True,
     "prompt_cache": True,
 }
+STALE_READ_MESSAGE = (
+    "This earlier read_file output is stale because the file was modified later in the transcript. "
+    "Read the file again before relying on its contents."
+)
 DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
 DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
 DURABLE_MEMORY_LINE_PATTERNS = (
@@ -258,6 +262,7 @@ class Pico:
 
         lines = []
         seen_reads = set()
+        stale_read_indexes = self._stale_read_indexes(history)
         recent_start = max(0, len(history) - 6)
         for index, item in enumerate(history):
             recent = index >= recent_start
@@ -269,8 +274,11 @@ class Pico:
 
             if item["role"] == "tool":
                 lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
-                summary = self._history_item_summary(item)
-                lines.append(summary or str(item["content"]))
+                if index in stale_read_indexes:
+                    lines.append(STALE_READ_MESSAGE)
+                else:
+                    summary = self._history_item_summary(item)
+                    lines.append(summary or str(item["content"]))
             else:
                 lines.append(f"[{item['role']}] {item['content']}")
 
@@ -292,6 +300,40 @@ class Pico:
         offset = read_window.get("start_line", args.get("offset", args.get("start", "")))
         limit = read_window.get("requested_lines", args.get("limit", args.get("end", "")))
         return (str(args.get("path", "")).strip(), str(offset), str(limit))
+
+    def _history_path_key(self, item):
+        args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
+        path = str(args.get("path", "")).strip()
+        if not path:
+            return ""
+        try:
+            raw_path = Path(path)
+            if not raw_path.is_absolute():
+                raw_path = Path(self.root) / raw_path
+            resolved = raw_path.resolve()
+            try:
+                return resolved.relative_to(Path(self.root).resolve()).as_posix()
+            except ValueError:
+                return resolved.as_posix()
+        except Exception:
+            return path.replace("\\", "/").lstrip("./")
+
+    def _stale_read_indexes(self, history):
+        stale_indexes = set()
+        latest_reads_by_path = {}
+        for index, item in enumerate(history):
+            if item.get("role") != "tool":
+                continue
+            name = item.get("name")
+            path_key = self._history_path_key(item)
+            if not path_key:
+                continue
+            if name == "read_file":
+                latest_reads_by_path.setdefault(path_key, []).append(index)
+            elif name in {"write_file", "patch_file"}:
+                stale_indexes.update(latest_reads_by_path.get(path_key, []))
+                latest_reads_by_path[path_key] = []
+        return stale_indexes
 
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name), False))
