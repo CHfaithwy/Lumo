@@ -96,10 +96,42 @@ SCRIPTED_MODEL_OUTPUTS = {
         "<final>Done.</final>",
     ],
     "durable_promotion_accept": [
-        "<final>Project convention: Preserve benchmark regression artifacts under artifacts/.\nDecision: Keep harness regression deterministic and reproducible.</final>",
+        "<final>Done.</final>",
+        json.dumps(
+            {
+                "updates": [
+                    {
+                        "topic": "project-conventions",
+                        "note": "Preserve benchmark regression artifacts under artifacts/.",
+                    },
+                    {
+                        "topic": "key-decisions",
+                        "note": "Keep harness regression deterministic and reproducible.",
+                    },
+                ],
+            }
+        ),
     ],
     "durable_promotion_reject": [
-        "<final>Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is sk-benchmark-secret.\nDecision: Current goal is debug the harness.</final>",
+        "<final>Done.</final>",
+        json.dumps(
+            {
+                "updates": [
+                    {
+                        "topic": "project-conventions",
+                        "note": "Keep verifier outcomes stable across reruns.",
+                    },
+                    {
+                        "topic": "dependency-facts",
+                        "note": "API key is sk-benchmark-secret.",
+                    },
+                    {
+                        "topic": "key-decisions",
+                        "note": "Current goal is debug the harness.",
+                    },
+                ],
+            }
+        ),
     ],
 }
 
@@ -478,6 +510,8 @@ class BenchmarkEvaluator:
         initial_episodic_notes_empty = not initial_memory_state["episodic_notes"]
 
         final_answer = agent.ask(task["prompt"])
+        if task.get("category") == "durable-contract":
+            agent.evolve_durable_memory(reason="benchmark_task_end")
         task_state = agent.current_task_state
         run_dir = Path(agent.current_run_dir)
         task_state_path = agent.run_store.task_state_path(task_state)

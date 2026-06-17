@@ -15,9 +15,9 @@ from pathlib import Path
 DEFAULT_TOTAL_BUDGET = 300000
 DEFAULT_SECTION_BUDGETS = {
     "prefix": 4000,
-    "memory": 1000,
+    "memory": 4000,
     "relevant_memory": 10000,
-    "history": 260000,
+    "history": 250000,
 }
 DEFAULT_SECTION_FLOORS = {
     "prefix": 2000,
@@ -192,7 +192,11 @@ class ContextManager:
             "prefix": str(getattr(self.agent, "prefix", "")),
             "memory": "Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
             "history": "",
-            CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
+            CURRENT_REQUEST_SECTION: (
+                "Current user request:\n"
+                "Before answering, check whether the accumulated durable memory helps you interpret the user's intent or project context.\n"
+                f"{user_message}"
+            ),
         }
         # Checkpoint state is still evaluated and recorded in metadata, but the
         # rendered checkpoint block is temporarily omitted from the prompt to

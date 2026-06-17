@@ -296,7 +296,6 @@ class AgentLoop:
             final = (payload or raw).strip()
             agent.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
-            agent.promote_durable_memory(user_message, final)
             checkpoint = agent.create_checkpoint(task_state, user_message, trigger="run_finished")
             agent.run_store.write_task_state(task_state)
             agent.emit_trace(
@@ -327,11 +326,6 @@ class AgentLoop:
             final = "Stopped after reaching the step limit without a final answer."
             task_state.stop_step_limit(final)
         agent.record({"role": "assistant", "content": final, "created_at": now()})
-        # 只有当用户请求里有这种意图时才会尝试写入，通常不会写 durable memory：
-        # 英文：capture / remember / save / store / persist / note
-        # 中文：记住 / 保存 / 记录 / 沉淀 / 长期记忆 / 持久记忆
-        # 落盘位置：MEMORY.md 和 topics/*.md
-        agent.promote_durable_memory(user_message, final)
         # task_state.json 关键状态变化后，都会调用一次 write_task_state(...)，把最新状态落盘。
         agent.run_store.write_task_state(task_state)
         checkpoint = agent.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")

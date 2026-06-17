@@ -582,6 +582,7 @@ def render_memory_text(state, workspace_root=None):
     state = normalize_memory_state(state, workspace_root)
     # 这里渲染的是给模型看的紧凑“仪表盘”，不是完整回放。
     # 笔记正文默认不展开，只有在相关召回时才按需拿出来。
+    durable_store = DurableMemoryStore(Path(workspace_root) / AGENT_STATE_DIR / "memory") if workspace_root is not None else None
     lines = [
         "Memory:",
         f"- task: {state['working']['task_summary'] or '-'}",
@@ -602,7 +603,19 @@ def render_memory_text(state, workspace_root=None):
 
     lines.append(f"- episodic_notes: {len(state['episodic_notes'])}")
     durable_topics = state.get("durable_topics", [])
-    lines.append(f"- durable_topics: {', '.join(durable_topics) or '-'}")
+    if durable_store is not None and durable_topics:
+        durable_lines = []
+        for topic in durable_topics:
+            notes = durable_store.load_topic_notes(topic)
+            rendered_notes = [str(note.get("text", "")).strip() for note in notes if str(note.get("text", "")).strip()]
+            if rendered_notes:
+                durable_lines.append(f"- {topic}: {' | '.join(rendered_notes)}")
+            else:
+                durable_lines.append(f"- {topic}: -")
+        lines.append("- durable_topics:")
+        lines.extend(f"  {line}" for line in durable_lines)
+    else:
+        lines.append("- durable_topics: -")
     return "\n".join(lines)
 
 

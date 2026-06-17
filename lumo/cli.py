@@ -350,6 +350,13 @@ def build_agent(args):
     )
 
 
+def _maybe_evolve_durable_memory(agent, reason):
+    result = agent.evolve_durable_memory(reason=reason)
+    if result.get("status") == "failed":
+        print(f"durable memory evolution failed: {result.get('error', '')}", file=sys.stderr)
+    return result
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -378,6 +385,7 @@ def build_arg_parser():
     )
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
     parser.add_argument("--max-new-tokens", type=int, default=8192, help="Maximum model output tokens per step.")
+    parser.add_argument("--no-memory-evolution", action="store_true", help="Disable session-end durable memory evolution.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     return parser
@@ -386,6 +394,8 @@ def build_arg_parser():
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     agent = build_agent(args)
+    if args.resume and not args.no_memory_evolution:
+        _maybe_evolve_durable_memory(agent, "resume_activation")
     # 欢迎页里显示的 MODEL  gpt-5.4
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
     # base_url 或 host 都行，优先级：model_client 里如果有就用它的，否则用 CLI 参数里的，再没有就用默认值。
@@ -402,6 +412,9 @@ def main(argv=None):
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
+            finally:
+                if not args.no_memory_evolution:
+                    _maybe_evolve_durable_memory(agent, "session_end")
         return 0
 
     while True:
@@ -411,11 +424,15 @@ def main(argv=None):
             user_input = input("\nLUMO> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("")
+            if not args.no_memory_evolution:
+                _maybe_evolve_durable_memory(agent, "session_end")
             return 0
 
         if not user_input:
             continue
         if user_input in {"/exit", "/quit"}:
+            if not args.no_memory_evolution:
+                _maybe_evolve_durable_memory(agent, "session_end")
             return 0
         if user_input == "/help":
             print(HELP_DETAILS)

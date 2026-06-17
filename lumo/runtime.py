@@ -15,7 +15,7 @@ from pathlib import Path
 from . import checkpoint as checkpointlib
 from .features import memory as memorylib
 from . import security as securitylib
-from .context_manager import ContextManager
+from .context_manager import ContextManager, _context_units
 from .checkpoint import CHECKPOINT_NONE_STATUS
 from .prompt_prefix import build_prompt_prefix, tool_signature
 from .run_store import RunStore
@@ -37,6 +37,9 @@ STALE_READ_MESSAGE = (
     "This earlier read_file output is stale because the file was modified later in the transcript. "
     "Read the file again before relying on its contents."
 )
+DURABLE_MEMORY_HISTORY_UNIT_LIMIT = 150000
+DURABLE_MEMORY_SCHEMA_VERSION = 1
+DURABLE_MEMORY_TOPICS = tuple(memorylib.DURABLE_TOPIC_DEFAULTS.keys())
 DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
 DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
 DURABLE_MEMORY_LINE_PATTERNS = (
@@ -115,7 +118,6 @@ class Pico:
         self.last_prompt_metadata = {}
         self.last_completion_metadata = {}
         self.last_durable_promotions = []
-        self.last_durable_rejections = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
         self._last_prefix_refresh = {
@@ -148,6 +150,9 @@ class Pico:
         resume_state = self.session.setdefault("resume_state", {})
         if not isinstance(resume_state, dict):
             self.session["resume_state"] = {}
+        durable_memory_evolution = self.session.setdefault("durable_memory_evolution", {})
+        if not isinstance(durable_memory_evolution, dict):
+            self.session["durable_memory_evolution"] = {}
 
     def current_runtime_identity(self):
         return checkpointlib.current_runtime_identity(self)
@@ -168,6 +173,303 @@ class Pico:
 
     def render_checkpoint_text(self):
         return checkpointlib.render_checkpoint_text(self)
+
+    def durable_memory_evolution_state(self):
+        state = self.session.setdefault("durable_memory_evolution", {})
+        if not isinstance(state, dict):
+            state = {}
+            self.session["durable_memory_evolution"] = state
+        state.setdefault("schema_version", DURABLE_MEMORY_SCHEMA_VERSION)
+        state.setdefault("history_hash", "")
+        state.setdefault("workspace_snapshot_hash", "")
+        state.setdefault("last_evolved_at", "")
+        state.setdefault("last_reason", "")
+        state.setdefault("last_promotions", [])
+        state.setdefault("last_superseded", [])
+        state.setdefault("last_history_units", 0)
+        state.setdefault("last_history_excerpt_units", 0)
+        state.setdefault("last_workspace_fingerprint", "")
+        return state
+
+    def durable_memory_index_path(self):
+        return Path(self.root) / AGENT_STATE_DIR / "memory" / "MEMORY.md"
+
+    def durable_memory_topics_dir(self):
+        return Path(self.root) / AGENT_STATE_DIR / "memory" / "topics"
+
+    def durable_memory_text(self):
+        durable_store = memorylib.DurableMemoryStore(Path(self.root) / AGENT_STATE_DIR / "memory")
+        lines = ["Durable memory index:"]
+        topics = durable_store.load_index()
+        if not topics:
+            lines.append("- none")
+            return "\n".join(lines)
+        for topic in topics:
+            lines.append(f"- {topic['topic']}: {topic['title']}")
+            if topic.get("summary"):
+                lines.append(f"  - summary: {topic['summary']}")
+            if topic.get("tags"):
+                lines.append(f"  - tags: {', '.join(topic['tags'])}")
+        return "\n".join(lines)
+
+    def _durable_memory_store(self):
+        return memorylib.DurableMemoryStore(Path(self.root) / AGENT_STATE_DIR / "memory")
+
+    def _durable_memory_topics_text(self):
+        durable_store = self._durable_memory_store()
+        topics = durable_store.load_index()
+        if not topics:
+            return "Existing durable memory:\n- none"
+        lines = ["Existing durable memory:"]
+        for topic in topics:
+            lines.append(f"- {topic['topic']}: {topic['title']}")
+            summary = str(topic.get("summary", "")).strip()
+            if summary:
+                lines.append(f"  - summary: {summary}")
+            tags = [str(tag).strip() for tag in topic.get("tags", []) if str(tag).strip()]
+            if tags:
+                lines.append(f"  - tags: {', '.join(tags)}")
+            notes = durable_store.load_topic_notes(topic["topic"])
+            if notes:
+                lines.append("  - notes:")
+                for note in notes:
+                    note_text = str(note.get("text", "")).strip()
+                    if note_text:
+                        lines.append(f"    - {note_text}")
+        return "\n".join(lines)
+
+    def _durable_memory_history_excerpt(self):
+        history = list(self.session.get("history", []))
+        if not history:
+            return "Transcript:\n- empty"
+        rendered = json.dumps(history, indent=2, ensure_ascii=False)
+        return self._tail_clip_units(rendered, DURABLE_MEMORY_HISTORY_UNIT_LIMIT).strip() or "[]"
+
+    @staticmethod
+    def _tail_clip_units(text, limit):
+        text = str(text)
+        if _context_units(text) <= limit:
+            return text
+        prefix = "...[truncated to recent durable-memory history window]\n"
+        target = max(1, int(limit) - _context_units(prefix))
+        low = 0
+        high = len(text)
+        while low < high:
+            mid = (low + high) // 2
+            if _context_units(text[mid:]) > target:
+                low = mid + 1
+            else:
+                high = mid
+        return prefix + text[low:].lstrip()
+
+    def _workspace_snapshot_hash(self):
+        snapshot = self.capture_workspace_snapshot()
+        payload = json.dumps(snapshot, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _text_hash(text):
+        return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+    def _durable_memory_evolution_prompt(self, reason, history_excerpt, durable_text):
+        return "\n\n".join(
+            [
+                "You are reviewing a coding agent session for durable memory evolution.",
+                "Only promote stable facts that should survive into future sessions.",
+                "Permanent memory should be short, ideally one sentence each.",
+                "Return JSON only in this shape:",
+                '{"updates":[{"topic":"project-conventions","note":"Use pytest for tests."}]}',
+                'If nothing should be added or changed, return {"updates":[]}.',
+                'If durable_text already contains the same or a clearly similar durable fact, return {"updates":[]}.',
+                "Allowed topics: project-conventions, key-decisions, dependency-facts, user-preferences.",
+                "Update rules:",
+                "- project-conventions: repo-wide or workflow rules that stay valid.",
+                "- key-decisions: design choices and rationale anchors.",
+                "- dependency-facts: stable dependency, backend, toolchain, or environment facts.",
+                "- user-preferences: stable preferences the user will likely want remembered.",
+                "Reject transient task state, temporary blockers, file positions, raw or noisy tool outputs, secrets, and long summaries, but keep stable facts learned from them.",
+                "Good examples:",
+                "- {\"topic\":\"project-conventions\",\"note\":\"Use pytest for tests.\"}",
+                "- {\"topic\":\"key-decisions\",\"note\":\"Keep durable memory topic-based and lightweight.\"}",
+                "- {\"topic\":\"user-preferences\",\"note\":\"The user prefers Chinese explanations with concrete examples.\"}",
+                "Bad examples:",
+                "- {\"topic\":\"key-decisions\",\"note\":\"Current blocker is a 401 when calling the API.\"}",
+                "- {\"topic\":\"dependency-facts\",\"note\":\"stdout: FAIL test_one FAIL test_two.\"}",
+                f"Trigger reason: {reason}",
+                durable_text,
+                "Session history excerpt:",
+                history_excerpt,
+            ]
+        )
+
+    @staticmethod
+    def _extract_json_object(text):
+        text = str(text).strip()
+        if not text:
+            return {}
+        if "<final>" in text:
+            text = Pico.extract(text, "final").strip()
+        fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S | re.I)
+        if fence:
+            text = fence.group(1).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start : end + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+
+    def _normalize_durable_updates(self, payload):
+        updates = []
+        allowed_topics = set(DURABLE_MEMORY_TOPICS)
+        for item in payload.get("updates", []) if isinstance(payload, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            topic = str(item.get("topic", "")).strip()
+            note_text = str(item.get("note", "")).strip()
+            if topic not in allowed_topics:
+                continue
+            if self.reject_durable_reason(note_text):
+                continue
+            if note_text:
+                updates.append((topic, note_text))
+        return updates
+
+    def should_evolve_durable_memory(self, reason=None):
+        state = self.durable_memory_evolution_state()
+        history_excerpt = self._durable_memory_history_excerpt()
+        history_hash = self._text_hash(history_excerpt)
+        workspace_snapshot_hash = self._workspace_snapshot_hash()
+        if not list(self.session.get("history", [])):
+            return False, {
+                "reason": reason or "",
+                "history_hash": history_hash,
+                "workspace_snapshot_hash": workspace_snapshot_hash,
+                "history_excerpt": history_excerpt,
+            }
+        changed = (
+            history_hash != str(state.get("history_hash", "")).strip()
+            or workspace_snapshot_hash != str(state.get("workspace_snapshot_hash", "")).strip()
+        )
+        return changed, {
+            "reason": reason or "",
+            "history_hash": history_hash,
+            "workspace_snapshot_hash": workspace_snapshot_hash,
+            "history_excerpt": history_excerpt,
+        }
+
+    def evolve_durable_memory(self, reason="session_end", force=False):
+        state = self.durable_memory_evolution_state()
+        changed, snapshot = self.should_evolve_durable_memory(reason)
+        if not force and not changed:
+            state["last_reason"] = reason
+            state["last_status"] = "skipped"
+            self.session["durable_memory_evolution"] = state
+            self.session_path = self.session_store.save(self.session)
+            return {
+                "status": "skipped",
+                "reason": reason,
+                "changed": False,
+                "promotions": [],
+                "superseded": [],
+            }
+
+        prompt = self._durable_memory_evolution_prompt(
+            reason=reason,
+            history_excerpt=snapshot["history_excerpt"],
+            durable_text=self._durable_memory_topics_text(),
+        )
+        try:
+            raw = self.model_client.complete(prompt, self.max_new_tokens)
+            payload = self._extract_json_object(raw)
+            updates = self._normalize_durable_updates(payload)
+            if not updates:
+                state.update(
+                    {
+                        "schema_version": DURABLE_MEMORY_SCHEMA_VERSION,
+                        "history_hash": snapshot["history_hash"],
+                        "workspace_snapshot_hash": snapshot["workspace_snapshot_hash"],
+                        "last_evolved_at": now(),
+                        "last_reason": reason,
+                        "last_status": "no_changes",
+                        "last_promotions": [],
+                        "last_superseded": [],
+                        "last_history_units": int(_context_units(json.dumps(self.session.get("history", []), ensure_ascii=False))),
+                        "last_history_excerpt_units": int(_context_units(snapshot["history_excerpt"])),
+                        "last_workspace_fingerprint": getattr(self.workspace, "fingerprint", lambda: "")(),
+                    }
+                )
+                self.session["durable_memory_evolution"] = state
+                self.session_path = self.session_store.save(self.session)
+                return {
+                    "status": "no_changes",
+                    "reason": reason,
+                    "changed": True,
+                    "promotions": [],
+                    "superseded": [],
+                    "prompt": prompt,
+                    "raw": raw,
+                }
+            promoted, superseded = self.memory.promote_durable(updates)
+        except Exception as exc:
+            state.update(
+                {
+                    "schema_version": DURABLE_MEMORY_SCHEMA_VERSION,
+                    "last_evolved_at": now(),
+                    "last_reason": reason,
+                    "last_status": "failed",
+                    "last_error": str(exc),
+                    "history_hash": snapshot["history_hash"],
+                    "workspace_snapshot_hash": snapshot["workspace_snapshot_hash"],
+                }
+            )
+            self.session["durable_memory_evolution"] = state
+            self.session_path = self.session_store.save(self.session)
+            return {
+                "status": "failed",
+                "reason": reason,
+                "changed": True,
+                "error": str(exc),
+                "promotions": [],
+                "superseded": [],
+            }
+        self.session["memory"] = self.memory.to_dict()
+        self.last_durable_promotions = promoted
+        self.last_durable_superseded = superseded
+        state.update(
+            {
+                "schema_version": DURABLE_MEMORY_SCHEMA_VERSION,
+                "history_hash": snapshot["history_hash"],
+                "workspace_snapshot_hash": snapshot["workspace_snapshot_hash"],
+                "last_evolved_at": now(),
+                "last_reason": reason,
+                "last_status": "updated",
+                "last_promotions": list(promoted),
+                "last_superseded": list(superseded),
+                "last_history_units": int(_context_units(json.dumps(self.session.get("history", []), ensure_ascii=False))),
+                "last_history_excerpt_units": int(_context_units(snapshot["history_excerpt"])),
+                "last_workspace_fingerprint": getattr(self.workspace, "fingerprint", lambda: "")(),
+            }
+        )
+        self.session["durable_memory_evolution"] = state
+        self.session_path = self.session_store.save(self.session)
+        if self.current_task_state is not None:
+            self.run_store.write_report(self.current_task_state, self.redact_artifact(self.build_report(self.current_task_state)))
+        return {
+            "status": "updated",
+            "reason": reason,
+            "changed": True,
+            "promotions": promoted,
+            "superseded": superseded,
+            "prompt": prompt,
+            "raw": raw,
+        }
 
     @staticmethod
     def remember(bucket, item, limit):
@@ -566,9 +868,8 @@ class Pico:
     def extract_durable_promotions(self, user_message, final_answer):
         user_text = str(user_message or "")
         if not (DURABLE_MEMORY_INTENT_PATTERN.search(user_text) or DURABLE_MEMORY_INTENT_ZH_PATTERN.search(user_text)):
-            return [], []
+            return []
         promotions = []
-        rejections = []
         for line in str(final_answer or "").splitlines():
             text = line.strip()
             if not text or REDACTED_VALUE in text:
@@ -581,20 +882,18 @@ class Pico:
                 if note_text:
                     reason = self.reject_durable_reason(note_text)
                     if reason:
-                        rejections.append(f"{topic}:{reason}")
                         break
                     promotions.append((topic, note_text))
                 break
-        return promotions, rejections
+        return promotions
 
     def promote_durable_memory(self, user_message, final_answer):
-        promotions, rejections = self.extract_durable_promotions(user_message, final_answer)
+        promotions = self.extract_durable_promotions(user_message, final_answer)
         promoted, superseded = self.memory.promote_durable(promotions)
         self.session["memory"] = self.memory.to_dict()
         self.last_durable_promotions = promoted
-        self.last_durable_rejections = rejections
         self.last_durable_superseded = superseded
-        return promoted, rejections, superseded
+        return promoted, superseded
 
     def ask(self, user_message):
         from .agent_loop import AgentLoop
@@ -665,7 +964,6 @@ class Pico:
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
             "durable_promotions": list(self.last_durable_promotions),
-            "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
             "redacted_env": self.detected_secret_env_summary(),
         }
