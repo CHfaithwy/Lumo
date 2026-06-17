@@ -36,6 +36,8 @@ tmp/
 artifacts/
 release/
 readme_intro_locked/
+claude-code-sourcemap/
+deep-dive-claude-code-main/
 
 # Local secrets and provider configuration
 .env
