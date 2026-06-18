@@ -1,247 +1,165 @@
-# Lumo
+<p align="center">
+  <img src="assets/image.png" alt="Lumo logo" width="360">
+</p>
+Lumo 是一个运行在本地代码仓库里的轻量级 Coding Agent。它可以在你的项目目录中读取文件、搜索代码、修改文件、运行命令，并通过多轮对话持续完成代码理解、问题排查、功能修改和项目整理等任务。
 
-![Lumo logo](assets/image.png)
+它不是单纯的聊天窗口，而是一个面向本地仓库的命令行助手：你指定一个工作目录，Lumo 会围绕这个目录进行分析和操作，并把会话数据保存在本地。
 
-`lumo` 是一个面向代码仓库的轻量本地 coding agent。它直接跑在终端里，先看当前工作区，再用一组受约束的工具去读文件、改文件、跑命令，并把会话状态保存在本地 `.lumo/` 目录里。
+## 主要能力
 
-它更像一个能在仓库里持续工作的命令行助手，不是纯聊天窗口。你可以拿它做代码排查、测试修复、仓库分析，或者让它在当前项目里执行一次性的工程任务。
-
-## 适合做什么
-
-- 在本地仓库里排查测试失败
-- 读取当前代码结构并给出修改建议
-- 基于现有文件做小步迭代，而不是脱离仓库空想
-- 在会话中保留上下文，支持继续上一次工作
-
-## 主要特性
-
-- 包名是 `lumo`
-- CLI 命令是 `lumo`
-- 模块入口是 `python -m lumo`
-- 会话保存在 `.lumo/sessions/`
-- 每次运行的工件保存在 `.lumo/runs/<run_id>/`
-- 支持四类模型后端：
-  - Ollama
-  - OpenAI 兼容 Responses API
-  - Anthropic 兼容 Messages API
-  - DeepSeek Anthropic 兼容 API
+- 支持本地代码仓库分析、代码修改、命令执行和多轮任务协作。
+- 支持 OpenAI-compatible、Anthropic-compatible、DeepSeek 和 Ollama 等模型后端。
+- 支持交互模式和一次性任务模式。
+- 支持继续上一次会话，使用 `--resume latest` 可以恢复最近的工作。
+- 支持通过 `lumo.md` 写入项目级指令，例如代码风格、测试习惯和注意事项。
+- 运行数据默认保存在 `.lumo/`，不会和业务代码混在一起。
 
 ## 安装
 
-需要 Python 3.10+。
+需要 Python 3.10 或更高版本。
 
-如果你用 `uv`，直接安装依赖：
-
-```bash
-uv sync
-```
-
-如果你已经在自己的 Python 环境里工作，也可以直接装成可编辑模式：
+进入项目根目录后安装：
 
 ```bash
 pip install -e .
 ```
 
-## 快速开始
-
-在当前仓库里启动交互模式。默认 provider 是 OpenAI-compatible：
+安装完成后可以使用：
 
 ```bash
-uv run lumo
+lumo --help
 ```
 
-指定另一个工作目录：
+如果你修改了项目源码，通常不需要重新安装；如果修改了 `pyproject.toml` 里的依赖或命令入口，再重新执行一次：
 
 ```bash
-uv run lumo --cwd /path/to/repo
+pip install -e .
 ```
 
-直接跑一次性任务：
+## 配置模型
 
-```bash
-uv run lumo "inspect the test failures and propose a fix"
-```
-
-如果当前环境已经安装过包，也可以直接这样启动：
-
-```bash
-python -m lumo
-```
-
-## 模型后端
-
-Lumo 启动时会读取项目根目录的 `.env`。本地真实 key 放在 `.env`，仓库只保留 `.env.example`。配置优先级是：
-
-```text
-显式 CLI 参数 > .env 里的 PICO_* 变量 > 旧环境变量 > 代码默认值
-```
-
-不传 `--provider` 时默认使用 `openai`。如果你配置的是 `PICO_OPENAI_API_BASE`、`PICO_OPENAI_API_KEY` 和 `PICO_OPENAI_MODEL`，直接运行 `lumo` 就会走 OpenAI-compatible `/responses` 接口。其他 provider 仍然保留，可以显式传 `--provider deepseek`、`--provider anthropic` 或 `--provider ollama`。
-
-`.env` 会在构建 provider client 前加载，并覆盖当前进程里的同名环境变量。模型名和 base URL 可以通过 `--model`、`--base-url` 临时覆盖；API key 只从环境变量读取。
-
-本地第一次配置：
+复制 `.env.example` 为 `.env`：
 
 ```bash
 cp .env.example .env
 ```
 
-然后把要使用的 provider key 填进去。`.env` 已经被 `.gitignore` 忽略，不要提交真实 key。
+Windows PowerShell 可以使用：
 
-### 推荐配置：DeepSeek
-
-最小配置只需要 key：
-
-```bash
-PICO_DEEPSEEK_API_KEY="your-api-key"
+```powershell
+Copy-Item .env.example .env
 ```
 
-默认模型和接口是：
+然后在 `.env` 中填写你要使用的模型服务。
 
-```bash
-PICO_DEEPSEEK_API_BASE="https://api.deepseek.com/anthropic"
-PICO_DEEPSEEK_MODEL="deepseek-v4-pro"
+OpenAI-compatible 示例：
+
+```env
+PICO_OPENAI_API_BASE=
+PICO_OPENAI_MODEL=
 ```
 
-如果使用 DeepSeek，`.env` 里只填 `PICO_DEEPSEEK_API_KEY` 后需要显式选择 provider：
+DeepSeek 示例：
 
-```bash
-uv run lumo --provider deepseek
+```env
+PICO_DEEPSEEK_API_BASE=
+PICO_DEEPSEEK_API_KEY=
+PICO_DEEPSEEK_MODEL=
 ```
 
-如果你需要临时切模型或代理地址，不必改 `.env`，可以直接覆盖：
+Anthropic-compatible 示例：
 
-```bash
-uv run lumo --model deepseek-v4-pro --base-url https://api.deepseek.com/anthropic
+```env
+PICO_ANTHROPIC_API_BASE=
+PICO_ANTHROPIC_API_KEY=
+PICO_ANTHROPIC_MODEL=
 ```
 
-DeepSeek 当前走 Anthropic-compatible Messages API，所以 runtime 里复用的是 Anthropic-compatible client；这只影响 HTTP 协议，不影响 CLI 用法。
-
-### 可选配置：right.codes
-
-right.codes 在 Pico 里有两条可选 provider 路径：
-
-- `--provider openai`：走 OpenAI-compatible `/responses`，默认 base URL 是 `https://www.right.codes/codex/v1`，默认模型是 `gpt-5.4`
-- `--provider anthropic`：走 Anthropic-compatible `/messages`，默认 base URL 是 `https://www.right.codes/claude/v1`，默认模型是 `claude-sonnet-4-6`
-
-如果 right.codes 给你的是一把共享 key，推荐只填这一项：
+如果你使用本地 Ollama，可以不配置 API key，直接指定 provider：
 
 ```bash
-PICO_RIGHT_CODES_API_KEY="your-right-codes-key"
+lumo --provider ollama --host http://127.0.0.1:11434 --model qwen3.5:4b
 ```
 
-然后按需要选择 provider：
+注意：不要把真实 `.env` 提交到 Git 仓库。
+
+## 使用方式
+
+在当前目录启动交互模式：
 
 ```bash
-uv run lumo --provider openai
-uv run lumo --provider anthropic
+lumo --provider openai --cwd .
 ```
 
-如果你想显式区分两条 provider 的 key，也可以分别配置：
+指定另一个项目目录：
 
 ```bash
-PICO_OPENAI_API_KEY="your-right-codes-key-for-codex"
-PICO_ANTHROPIC_API_KEY="your-right-codes-key-for-claude"
+lumo --provider openai --cwd E:\your\project
 ```
 
-不要在 `.env` 里写 `PICO_OPENAI_API_KEY=$PICO_RIGHT_CODES_API_KEY` 这种 shell 展开形式；Pico 的 `.env` 解析器只读取字面量，不展开变量引用。要么只写 `PICO_RIGHT_CODES_API_KEY`，要么把 key 字符串分别填到 provider-specific 变量里。
-
-如果请求 right.codes 返回 `API Key额度不足`，说明协议和 endpoint 已经打通，但当前 key 没有可用额度；换一把有额度的 key，或到 right.codes 后台处理额度。
-
-当前 provider 环境变量：
-
-| provider | base URL | API key | model |
-| --- | --- | --- | --- |
-| `deepseek` | `PICO_DEEPSEEK_API_BASE`，回退 `DEEPSEEK_API_BASE`，默认 `https://api.deepseek.com/anthropic` | `PICO_DEEPSEEK_API_KEY`，回退 `DEEPSEEK_API_KEY` | `PICO_DEEPSEEK_MODEL`，回退 `DEEPSEEK_MODEL`，默认 `deepseek-v4-pro` |
-| `openai` | `PICO_OPENAI_API_BASE`，回退 `OPENAI_API_BASE`，默认 `https://www.right.codes/codex/v1` | `PICO_OPENAI_API_KEY`，回退 `OPENAI_API_KEY`、`PICO_RIGHT_CODES_API_KEY`、`RIGHT_CODES_API_KEY`、`PICO_ANTHROPIC_API_KEY`、`ANTHROPIC_API_KEY` | `PICO_OPENAI_MODEL`，回退 `OPENAI_MODEL`，默认 `gpt-5.4` |
-| `anthropic` | `PICO_ANTHROPIC_API_BASE`，回退 `ANTHROPIC_API_BASE`，默认 `https://www.right.codes/claude/v1` | `PICO_ANTHROPIC_API_KEY`，回退 `ANTHROPIC_API_KEY`、`PICO_RIGHT_CODES_API_KEY`、`RIGHT_CODES_API_KEY`、`PICO_OPENAI_API_KEY`、`OPENAI_API_KEY` | `PICO_ANTHROPIC_MODEL`，回退 `ANTHROPIC_MODEL`，默认 `claude-sonnet-4-6` |
-| `ollama` | `--host`，默认 `http://127.0.0.1:11434` | 不需要 | `--model`，默认 `qwen3.5:4b` |
-
-如果有额外的敏感环境变量需要从 trace/report 里脱敏，可以用 `PICO_SECRET_ENV_NAMES` 配置逗号分隔的变量名，或启动时重复传 `--secret-env-name NAME`。
-
-### OpenAI 兼容接口
-
-如果要改用 OpenAI-compatible `/responses` 服务，显式传 `--provider openai`：
+执行一次性任务：
 
 ```bash
-uv run lumo --provider openai
+lumo --provider openai --cwd . "帮我总结这个项目的结构"
 ```
 
-默认 OpenAI 兼容接口使用 right.codes 的 Codex endpoint：
+恢复最近一次会话：
 
 ```bash
-PICO_OPENAI_API_BASE="https://www.right.codes/codex/v1"
-PICO_RIGHT_CODES_API_KEY="your-right-codes-key"
-PICO_OPENAI_MODEL="gpt-5.4"
+lumo --resume latest
 ```
 
-也可以改成其他 OpenAI-compatible 服务：
+常用参数：
 
 ```bash
-PICO_OPENAI_API_BASE="https://your-api.example/v1"
-PICO_OPENAI_API_KEY="your-api-key"
-PICO_OPENAI_MODEL="gpt-5.4"
+lumo --provider openai
+lumo --provider deepseek
+lumo --provider anthropic
+lumo --provider ollama
+lumo --model gpt-5.4
+lumo --base-url https://www.codex2api.com/v1
+lumo --approval ask
+lumo --max-steps 8
 ```
 
-### Anthropic 兼容接口
+## 交互命令
 
-如果要改用 Anthropic-compatible 服务，显式传 `--provider anthropic`：
+进入 Lumo 交互模式后，可以使用这些命令：
 
-```bash
-uv run lumo --provider anthropic
+```text
+/help      查看帮助
+/memory    查看当前记忆摘要
+/session   查看当前 session 文件路径
+/reset     清空当前会话状态
+/exit      退出
 ```
 
-默认 Anthropic 兼容接口使用 right.codes 的 Claude endpoint：
 
-```bash
-PICO_ANTHROPIC_API_BASE="https://www.right.codes/claude/v1"
-PICO_RIGHT_CODES_API_KEY="your-right-codes-key"
-PICO_ANTHROPIC_MODEL="claude-sonnet-4-6"
+## 项目指令 lumo.md
+
+你可以在项目根目录创建 `lumo.md`，用来告诉 Lumo 这个项目的固定规则。
+
+示例：
+
+```md
+# Lumo Instructions
+
+- 使用中文回答。
+- 修改代码前先阅读相关文件。
+- 写完代码后说明修改了哪些内容。
+- 如果运行了测试，请在最终回复中说明测试命令。
 ```
 
-如果你的服务端对多个兼容接口复用了同一套密钥，`lumo` 也支持从 `PICO_ANTHROPIC_API_KEY` 回退到 `ANTHROPIC_API_KEY`、`PICO_RIGHT_CODES_API_KEY`、`RIGHT_CODES_API_KEY`、`PICO_OPENAI_API_KEY` 或 `OPENAI_API_KEY`。
 
-### Ollama
+## 本地数据
 
-如果要改用本地 Ollama，显式传 `--provider ollama`：
+Lumo 会在当前工作区下创建 `.lumo/` 目录，用来保存本地运行数据：
 
-```bash
-ollama serve
-ollama pull qwen3.5:4b
-uv run lumo --provider ollama --model qwen3.5:4b
+```text
+.lumo/
+  sessions/    会话记录
+  runs/        每次运行的 trace、report 和 prompt 调试文件
+  memory/      跨会话长期记忆
 ```
 
-## 常用交互命令
 
-- `/help`：查看内置命令
-- `/memory`：查看提炼后的工作记忆
-- `/session`：查看当前会话文件路径
-- `/reset`：清空当前会话状态
-- `/exit` 或 `/quit`：退出 REPL
-
-## 安全与持久化
-
-`lumo` 不会默认把所有动作都放开。像 shell 执行、文件写入这类高风险操作，会受审批模式控制：
-
-- `--approval ask`
-- `--approval auto`
-- `--approval never`
-
-每次运行结束后，都会在 `.lumo/runs/<run_id>/` 下写出这些文件：
-
-- `task_state.json`
-- `trace.jsonl`
-- `report.json`
-
-这些内容默认只保存在本地，不需要跟仓库一起提交。
-
-## 开发
-
-常用本地检查：
-
-```bash
-uv run pytest tests -q
-uv run ruff check lumo tests scripts
-```
-
-内部代码现在按较轻的边界拆分：`lumo/evaluation/` 放 benchmark 和 metrics，`lumo/providers/` 放模型 provider client，`lumo/features/` 放可选运行时能力。新代码应直接使用这些包路径；旧的 `lumo.evaluator`、`lumo.metrics`、`lumo.models` 和 `lumo.memory` import 不再作为公共入口保留。

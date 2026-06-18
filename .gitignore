@@ -1,58 +1,52 @@
-# Python
+# Ignore everything by default.
+*
+
+# Keep repository control files.
+!.gitignore
+
+# Keep project metadata and docs.
+!README.md
+!pyproject.toml
+!.env.example
+!lumo.md
+
+# Keep source code.
+!lumo/
+!lumo/**
+
+# Keep project assets.
+!assets/
+!assets/**
+
+# Ignore generated Python artifacts even inside allowed directories.
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-
-# Virtual environments
-.venv/
-venv/
-uv.lock
-
-# Packaging
+*$py.class
+.pytest_cache/
 *.egg-info/
 build/
 dist/
 
-# Test and lint caches
-.pytest_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Temporary files
-*.tmp
-*.temp
-*.swp
-*.swo
-*~
-
-# Local scratch space
-tmp/
-.worktrees/
-.pico/
+# Ignore local runtime state and temporary workspaces.
 .lumo/
-.mini-pico/
-artifacts/
-release/
-readme_intro_locked/
-claude-code-sourcemap/
-deep-dive-claude-code-main/
+.pico/
+.tmp_prompt_sessions/
+.tmp_session_test/
+.tmp*/
+*.tmp
 
-# Local secrets and provider configuration
+# Ignore non-core project materials.
+benchmarks/
+docs/
+examples/
+scripts/
+tests/
+
+# Ignore local secrets and environment files.
 .env
 .env.*
 !.env.example
 
-# Local docs not intended for publication
-docs/*
-!docs/review-pack/
-!docs/review-pack/README.md
-!docs/architecture/
-!docs/architecture/agent-harness-v1-overview.md
-
-# OS files
-.DS_Store
-
-# Packaging metadata
+# Ignore local reference/source dumps.
 lumo.egg-info/
+readme_intro_locked/
