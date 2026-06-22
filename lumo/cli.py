@@ -53,7 +53,7 @@ HELP_DETAILS = textwrap.dedent(
     """\
     Commands:
     /help    Show this help message.
-    /memory  Show the agent's distilled working memory.
+    /memory  Show durable memory loaded from .lumo/memory.
     /session Show the path to the saved session file.
     /reset   Clear the current session history and memory.
     /exit    Exit the agent.

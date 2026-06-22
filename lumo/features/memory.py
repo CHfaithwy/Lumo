@@ -569,7 +569,7 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
 
 def retrieval_view(state, query, limit=3, workspace_root=None):
     candidates = retrieval_candidates(state, query, limit=limit, workspace_root=workspace_root)
-    lines = ["Relevant memory:"]
+    lines = ["Memory retrieval:"]
     if not candidates:
         lines.append("- none")
         return "\n".join(lines)
@@ -580,42 +580,32 @@ def retrieval_view(state, query, limit=3, workspace_root=None):
 
 def render_memory_text(state, workspace_root=None):
     state = normalize_memory_state(state, workspace_root)
-    # 这里渲染的是给模型看的紧凑“仪表盘”，不是完整回放。
-    # 笔记正文默认不展开，只有在相关召回时才按需拿出来。
     durable_store = DurableMemoryStore(Path(workspace_root) / AGENT_STATE_DIR / "memory") if workspace_root is not None else None
-    lines = [
-        "Memory:",
-        f"- task: {state['working']['task_summary'] or '-'}",
-        f"- recent_files: {', '.join(state['working']['recent_files']) or '-'}",
-    ]
-
-    summaries = []
-    for path in state["working"]["recent_files"][:FILE_SUMMARY_LIMIT]:
-        summary = state["file_summaries"].get(path, {})
-        current_freshness = file_freshness(path, workspace_root)
-        if summary.get("summary", "") and summary.get("freshness") == current_freshness:
-            summaries.append(f"- {path}: {summary['summary']}")
-    if summaries:
-        lines.append("- file_summaries:")
-        lines.extend(f"  {line}" for line in summaries)
-    else:
-        lines.append("- file_summaries: -")
-
-    lines.append(f"- episodic_notes: {len(state['episodic_notes'])}")
-    durable_topics = state.get("durable_topics", [])
-    if durable_store is not None and durable_topics:
-        durable_lines = []
-        for topic in durable_topics:
-            notes = durable_store.load_topic_notes(topic)
-            rendered_notes = [str(note.get("text", "")).strip() for note in notes if str(note.get("text", "")).strip()]
-            if rendered_notes:
-                durable_lines.append(f"- {topic}: {' | '.join(rendered_notes)}")
-            else:
-                durable_lines.append(f"- {topic}: -")
-        lines.append("- durable_topics:")
-        lines.extend(f"  {line}" for line in durable_lines)
-    else:
-        lines.append("- durable_topics: -")
+    lines = ["Durable memory:"]
+    if durable_store is None:
+        lines.append("- none")
+        return "\n".join(lines)
+    topics = durable_store.load_index()
+    if not topics:
+        lines.append("- none")
+        return "\n".join(lines)
+    for topic in topics:
+        topic_name = str(topic.get("topic", "")).strip()
+        title = str(topic.get("title", "")).strip() or topic_name
+        lines.append(f"- {topic_name}: {title}")
+        summary = str(topic.get("summary", "")).strip()
+        if summary:
+            lines.append(f"  - summary: {summary}")
+        tags = [str(tag).strip() for tag in topic.get("tags", []) if str(tag).strip()]
+        if tags:
+            lines.append(f"  - tags: {', '.join(tags)}")
+        notes = durable_store.load_topic_notes(topic_name)
+        if notes:
+            lines.append("  - notes:")
+            for note in notes:
+                text = str(note.get("text", "")).strip()
+                if text:
+                    lines.append(f"    - {text}")
     return "\n".join(lines)
 
 

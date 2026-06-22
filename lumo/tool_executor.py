@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import re
 
+from .features import memory as memorylib
 from .workspace import clip
 
 SUMMARY_FOR_HISTORY_PATTERN = re.compile(r"<summary-for-history>(.*?)</summary-for-history>", re.DOTALL)
@@ -26,6 +27,7 @@ def _metadata(
     diff_summary=None,
     archive_summary="",
     read_window=None,
+    freshness=None,
 ):
     result = {
         "tool_status": tool_status,
@@ -43,6 +45,8 @@ def _metadata(
         result["archive_summary"] = str(archive_summary)
     if read_window:
         result["read_window"] = dict(read_window)
+    if freshness:
+        result["freshness"] = str(freshness)
     return result
 
 
@@ -188,6 +192,7 @@ class ToolExecutor:
                     tool_error_code = "tool_failed"
             archive_summary = _extract_archive_summary(content) if name == "read_file" else ""
             read_window = _extract_read_window(content) if name == "read_file" else {}
+            freshness = memorylib.file_freshness(args.get("path", ""), agent.root) if name == "read_file" else None
             metadata = _metadata(
                 tool_status,
                 tool_error_code=tool_error_code,
@@ -199,6 +204,7 @@ class ToolExecutor:
                 diff_summary=diff_summary,
                 archive_summary=archive_summary,
                 read_window=read_window,
+                freshness=freshness,
             )
             agent.update_memory_after_tool(name, args, content, metadata=metadata)
             agent.record_process_note_for_tool(name, metadata)

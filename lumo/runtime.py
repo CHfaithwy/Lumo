@@ -29,12 +29,12 @@ from .workspace import AGENT_STATE_DIR, IGNORED_PATH_NAMES, WorkspaceContext, cl
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
-    "relevant_memory": True,
     "context_reduction": True,
     "prompt_cache": True,
 }
 STALE_READ_MESSAGE = (
-    "This earlier read_file output is stale because the file was modified later in the transcript. "
+    "This earlier read_file output is stale because the file freshness no longer matches "
+    "or the file was modified later in the transcript. "
     "Read the file again before relying on its contents."
 )
 DURABLE_MEMORY_HISTORY_UNIT_LIMIT = 150000
@@ -164,9 +164,10 @@ class Pico:
         return checkpointlib.current_checkpoint(self)
 
     def invalidate_stale_memory(self):
-        invalidated = self.memory.invalidate_stale_file_summaries()
-        self.session["memory"] = self.memory.to_dict()
-        return invalidated
+        # Short-term file summaries are no longer part of prompt construction.
+        # Freshness checks now rely on read_file history metadata and checkpoint
+        # key files, so old session memory can remain for compatibility only.
+        return []
 
     def evaluate_resume_state(self):
         return checkpointlib.evaluate_resume_state(self)
@@ -199,17 +200,28 @@ class Pico:
 
     def durable_memory_text(self):
         durable_store = memorylib.DurableMemoryStore(Path(self.root) / AGENT_STATE_DIR / "memory")
-        lines = ["Durable memory index:"]
+        lines = ["Durable memory:"]
         topics = durable_store.load_index()
         if not topics:
             lines.append("- none")
             return "\n".join(lines)
         for topic in topics:
-            lines.append(f"- {topic['topic']}: {topic['title']}")
-            if topic.get("summary"):
-                lines.append(f"  - summary: {topic['summary']}")
-            if topic.get("tags"):
-                lines.append(f"  - tags: {', '.join(topic['tags'])}")
+            topic_name = str(topic.get("topic", "")).strip()
+            title = str(topic.get("title", "")).strip() or topic_name
+            lines.append(f"- {topic_name}: {title}")
+            summary = str(topic.get("summary", "")).strip()
+            if summary:
+                lines.append(f"  - summary: {summary}")
+            tags = [str(tag).strip() for tag in topic.get("tags", []) if str(tag).strip()]
+            if tags:
+                lines.append(f"  - tags: {', '.join(tags)}")
+            notes = durable_store.load_topic_notes(topic_name)
+            if notes:
+                lines.append("  - notes:")
+                for note in notes:
+                    note_text = str(note.get("text", "")).strip()
+                    if note_text:
+                        lines.append(f"    - {note_text}")
         return "\n".join(lines)
 
     def _durable_memory_store(self):
@@ -555,7 +567,7 @@ class Pico:
         return dict(self._last_prefix_refresh)
 
     def memory_text(self):
-        return self.memory.render_memory_text()
+        return self.durable_memory_text()
 
     def history_text(self):
         history = self.session["history"]
@@ -631,11 +643,25 @@ class Pico:
             if not path_key:
                 continue
             if name == "read_file":
+                if self._read_freshness_stale(item, path_key):
+                    stale_indexes.add(index)
+                    continue
                 latest_reads_by_path.setdefault(path_key, []).append(index)
             elif name in {"write_file", "patch_file"}:
                 stale_indexes.update(latest_reads_by_path.get(path_key, []))
                 latest_reads_by_path[path_key] = []
         return stale_indexes
+
+    def _read_freshness_stale(self, item, path_key=None):
+        metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+        expected = metadata.get("freshness")
+        if not expected:
+            return False
+        path_key = path_key or self._history_path_key(item)
+        if not path_key:
+            return False
+        current = memorylib.file_freshness(path_key, self.root)
+        return expected != current
 
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name), False))
@@ -710,6 +736,7 @@ class Pico:
             {
                 "prefix_chars": len(self.prefix),
                 "workspace_chars": len(self.workspace.text()),
+                "durable_memory_chars": len(self.memory_text()),
                 "memory_chars": len(self.memory_text()),
                 "history_chars": len(self.history_text()),
                 "request_chars": len(user_message),
@@ -781,61 +808,22 @@ class Pico:
         return checkpointlib.infer_next_step(task_state)
 
     def update_memory_after_tool(self, name, args, result, metadata=None):
-        """把少量高价值工具结果沉淀到 working memory。
+        """Compatibility hook.
 
-        为什么存在：
-        并不是每个工具结果都值得长期带进下一轮 prompt。完整结果已经进了
-        `history`，这里只挑少量“下一轮大概率还会用到”的事实做提纯，
-        例如最近读写过哪些文件、某个文件读出来的短摘要。
-
-        输入 / 输出：
-        - 输入：工具名 `name`、参数 `args`、执行结果 `result`
-        - 输出：无显式返回值，副作用是更新 `self.memory`
-
-        在 agent 链路里的位置：
-        它发生在 `run_tool()` 真正执行完工具之后、下一轮 prompt 组装之前。
-        也就是说：工具结果先进入完整历史，再由这个函数择优沉淀成轻量记忆。
+        Short-term tool facts now live in session history. Durable cross-session
+        facts are promoted by the durable-memory evolution flow, so this method
+        intentionally no longer mirrors read_file summaries or process events
+        into session memory.
         """
-        if not self.feature_enabled("memory"):
-            return
-        path = args.get("path")
-        if not path:
-            return
-
-        canonical_path = self.memory.canonical_path(path)
-        # 不是所有工具结果都进入工作记忆。
-        # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
-        if name in {"read_file", "write_file", "patch_file"}:
-            self.memory.remember_file(canonical_path)
-        metadata = dict(metadata or {})
-        if name == "read_file":
-            summary = str(metadata.get("archive_summary") or "").strip()
-            if not summary:
-                summary = memorylib.summarize_read_result(result)
-            self.memory.set_file_summary(canonical_path, summary)
-            self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
-        elif name in {"write_file", "patch_file"}:
-            self.memory.invalidate_file_summary(canonical_path)
-        self.session["memory"] = self.memory.to_dict()
+        return None
 
     def note_tool(self, name, args, result):
         self.update_memory_after_tool(name, args, result)
 
     def record_process_note_for_tool(self, name, metadata):
-        status = str(metadata.get("tool_status", "")).strip()
-        if status not in {"partial_success", "error", "rejected"}:
-            return
-        affected_paths = [str(path).strip() for path in metadata.get("affected_paths", []) if str(path).strip()]
-        path_text = ", ".join(affected_paths) or "workspace"
-        if status == "partial_success":
-            text = f"{name} partial_success on {path_text}; inspect diff before retry"
-        elif status == "error":
-            text = f"{name} error on {path_text}; check the failure before retry"
-        else:
-            text = f"{name} rejected; choose a different action before retry"
-        tags = ["process", status, *affected_paths]
-        self.memory.append_note(text, tags=tuple(tags), source=name, kind="process")
-        self.session["memory"] = self.memory.to_dict()
+        # Tool status and process details are already recorded in history,
+        # trace, and report metadata.
+        return None
 
     def reject_durable_reason(self, note_text):
         text = str(note_text or "").strip()
@@ -1004,13 +992,16 @@ class Pico:
             secret_env_names=self.secret_env_names,
             shell_env_allowlist=self.shell_env_allowlist,
         )
-        # 委派的目标是“调查”，不是“放权执行”。
-        # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
-        child.memory.set_task_summary(task)
         if inherit_context:
             parent_history = self.context_manager.render_history_for_delegate()
-            child.memory.append_note(parent_history, tags=("parent-history",), source="delegate")
-        child.session["memory"] = child.memory.to_dict()
+            task = "\n\n".join(
+                [
+                    "Parent context:",
+                    parent_history,
+                    "Delegated task:",
+                    task,
+                ]
+            )
         return "delegate_result:\n" + child.ask(task)
 
     def tool_list_files(self, args):
@@ -1034,6 +1025,50 @@ class Pico:
     def tool_delegate(self, args):
         return toolkit.tool_delegate(self.tool_context(), args)
 
+    @staticmethod
+    def _approval_preview(value, limit=80):
+        text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+        text = " | ".join(line.strip() for line in text.splitlines() if line.strip())
+        if len(text) <= limit:
+            return text
+        return text[:limit] + f"... ({len(text) - limit} more chars)"
+
+    def approval_summary(self, name, args):
+        args = args if isinstance(args, dict) else {}
+        path = str(args.get("path", "")).strip()
+        if name == "patch_file":
+            old_text = str(args.get("old_text", ""))
+            new_text = str(args.get("new_text", ""))
+            anchor = self._approval_preview(old_text, 70) or "<empty old_text>"
+            if old_text and new_text.endswith(old_text):
+                inserted = new_text[: -len(old_text)]
+                action = f"insert before matched block: {self._approval_preview(inserted, 80)}"
+            elif old_text and new_text.startswith(old_text):
+                inserted = new_text[len(old_text) :]
+                action = f"insert after matched block: {self._approval_preview(inserted, 80)}"
+            elif old_text and old_text in new_text:
+                action = "replace matched block with surrounding edits"
+            else:
+                action = "replace one exact matched block"
+            return (
+                f"path={path or '-'}; {action}; "
+                f"anchor={json.dumps(anchor, ensure_ascii=False)}; "
+                f"old={len(old_text.splitlines())} lines/{len(old_text)} chars; "
+                f"new={len(new_text.splitlines())} lines/{len(new_text)} chars"
+            )
+        if name == "write_file":
+            content = str(args.get("content", ""))
+            action = "overwrite" if path and (self.root / path).is_file() else "create"
+            return f"path={path or '-'}; {action}; write {len(content.splitlines())} lines/{len(content)} chars"
+        if name == "run_shell":
+            command = self._approval_preview(args.get("command", ""), 120)
+            timeout = args.get("timeout", 20)
+            return f"command={json.dumps(command, ensure_ascii=False)}; timeout={timeout}"
+        if name == "delegate":
+            task = self._approval_preview(args.get("task", ""), 120)
+            return f"task={json.dumps(task, ensure_ascii=False)}; max_steps={args.get('max_steps', 3)}; inherit_context={args.get('inherit_context', True)}"
+        return json.dumps(args, ensure_ascii=False, sort_keys=True)
+
     def approve(self, name, args):
         if self.read_only:
             return False
@@ -1042,7 +1077,7 @@ class Pico:
         if self.approval_policy == "never":
             return False
         try:
-            answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
+            answer = input(f"approve {name} {self.approval_summary(name, args)}? [y/N] ")
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}

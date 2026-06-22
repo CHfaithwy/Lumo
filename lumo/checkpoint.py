@@ -142,16 +142,37 @@ def infer_next_step(task_state):
     return "Continue the task from the latest checkpoint."
 
 
+def checkpoint_key_files_from_history(agent, limit=8):
+    key_files_by_path = {}
+    history = list(agent.session.get("history", []))
+    for item in reversed(history):
+        if item.get("role") != "tool":
+            continue
+        if item.get("name") not in {"read_file", "write_file", "patch_file"}:
+            continue
+        path = ""
+        try:
+            path = agent._history_path_key(item)
+        except Exception:
+            args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
+            path = str(args.get("path", "")).strip()
+        if not path or path in key_files_by_path:
+            continue
+        key_files_by_path[path] = {
+            "path": path,
+            "freshness": memorylib.file_freshness(path, agent.root),
+        }
+        if len(key_files_by_path) >= int(limit):
+            break
+    return list(reversed(list(key_files_by_path.values())))
+
+
 def create_checkpoint(agent, task_state, user_message, trigger):
     state = checkpoint_state(agent)
     current = current_checkpoint(agent)
     checkpoint_id = "ckpt_" + uuid.uuid4().hex[:8]
-    key_files = []
-    freshness = {}
-    for path in agent.memory.to_dict()["working"]["recent_files"]:
-        file_freshness = memorylib.file_freshness(path, agent.root)
-        freshness[path] = file_freshness
-        key_files.append({"path": path, "freshness": file_freshness})
+    key_files = checkpoint_key_files_from_history(agent)
+    freshness = {item["path"]: item.get("freshness") for item in key_files}
     checkpoint = {
         "checkpoint_id": checkpoint_id,
         "parent_checkpoint_id": current.get("checkpoint_id", "") if current else "",
