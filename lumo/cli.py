@@ -48,7 +48,7 @@ WELCOME_ART = tuple(
 )
 WELCOME_NAME = "Lumo"
 WELCOME_SUBTITLE = "Code is cheap, Show me your talk"
-# WELCOME_STATUS = "calm shell, ready for work"
+
 HELP_DETAILS = textwrap.dedent(
     """\
     Commands:
@@ -151,10 +151,10 @@ def _terminal_middle(text, limit):
 
 
 def _effective_model(args, provider):
-    # 模型选择优先级：
-    # 1. 用户显式传入 --model
-    # 2. provider 对应的环境变量
-    # 3. 代码里的默认值
+
+
+
+
     explicit_model = getattr(args, "model", None)
     if explicit_model:
         return explicit_model
@@ -191,8 +191,8 @@ def _configured_secret_names(args):
 
 def _build_model_client(args):
     provider = getattr(args, "provider", "deepseek")
-    # CLI 只负责把 provider 选择翻译成具体 client。
-    # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
+
+
     if provider == "openai":
         model = _effective_model(args, provider)
         base_url = getattr(args, "base_url", None) or provider_env("PICO_OPENAI_API_BASE", ("OPENAI_API_BASE",), DEFAULT_OPENAI_BASE_URL)
@@ -286,7 +286,7 @@ def build_welcome(agent, model, host):
         [
             center(WELCOME_NAME),
             center(WELCOME_SUBTITLE),
-            # center(WELCOME_STATUS),
+
             divider(),
             row(""),
             row("WORKSPACE  " + _terminal_middle(agent.workspace.cwd, inner - 11)),
@@ -314,16 +314,16 @@ def build_agent(args):
     它是整个程序启动链路里最靠近 runtime 的装配点。`main()` 先调它，
     得到 agent 后，后面无论是 one-shot 还是 REPL 模式，都会落到 `ask()`。
     """
-    # 这里是 CLI 到 runtime 的装配点：
-    # 先采集工作区快照和加载项目级环境，再整理 secret 名单、模型后端和 session。
+
+
     workspace = WorkspaceContext.build(args.cwd)
-    # 加载项目级环境变量，覆盖系统环境。这些环境变量可能会被后续的模型调用用到，
+
     load_project_env(workspace.repo_root)
-#   “整理出一份最终要被当成敏感信息处理的环境变量名列表。”
-# 也就是说，后面程序在写 trace、report、session 之类内容时，看到这些环境变量名，就会把它们脱敏，不直接暴露真实值。
+
+
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(Path(workspace.repo_root) / AGENT_STATE_DIR / "sessions")
-    # return OpenAICompatibleModelClient
+
     model = _build_model_client(args)
     session_id = args.resume
     if session_id == "latest":
@@ -396,14 +396,14 @@ def main(argv=None):
     agent = build_agent(args)
     if args.resume and not args.no_memory_evolution:
         _maybe_evolve_durable_memory(agent, "resume_activation")
-    # 欢迎页里显示的 MODEL  gpt-5.4
+
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
-    # base_url 或 host 都行，优先级：model_client 里如果有就用它的，否则用 CLI 参数里的，再没有就用默认值。
+
     host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))
     print(build_welcome(agent, model=model, host=host))
 
     if args.prompt:
-        # one-shot 模式：只跑一次 ask，不进入 REPL 循环。
+
         prompt = " ".join(args.prompt).strip()
         if prompt:
             print()
@@ -418,8 +418,8 @@ def main(argv=None):
         return 0
 
     while True:
-        # 交互模式：每次读取一条用户输入，交给同一个 agent，
-        # 因此 session history 和 working memory 会跨轮延续。
+
+
         try:
             user_input = input("\nLUMO> ").strip()
         except (EOFError, KeyboardInterrupt):

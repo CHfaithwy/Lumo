@@ -61,7 +61,7 @@ DURABLE_TOPIC_DEFAULTS = {
 - durable_topics 长期记忆主题列表。这是从 .lumo/memory/ 里读取出来的“持久记忆主题”，比如项目约定、关键决策、依赖事实等，不属于这次临时会话的短期记忆。
 """
 def default_memory_state():
-    # 用一个小而结构化的状态，而不是一大段自由文本摘要。
+
     return {
         "working": {
             "task_summary": "",
@@ -357,8 +357,8 @@ def normalize_memory_state(state, workspace_root=None):
     elif not isinstance(state, dict):
         raise TypeError("memory state must be a mapping")
 
-    # 规范化层的作用，是把“磁盘里可能长得不太一样的旧状态”
-    # 统一整理成当前 runtime 可直接使用的紧凑结构。
+
+
     working = state.get("working")
     if not isinstance(working, dict):
         working = {}
@@ -523,8 +523,8 @@ def invalidate_stale_file_summaries(state, workspace_root=None):
 
 
 def summarize_read_result(result, limit=180):
-    # 我们不会把完整文件内容塞进记忆层，
-    # 这里只保留足够提醒下一轮“刚刚读到了什么”的短摘要。
+
+
     lines = [line.strip() for line in str(result).splitlines() if line.strip()]
     if not lines:
         return "(empty)"
@@ -541,8 +541,8 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
     query_tokens = _tokenize(query)
     ranked = []
     for note in state["episodic_notes"]:
-        # 召回逻辑故意保持简单透明：先看 tag 精确命中，
-        # 再看关键词重叠，最后看新旧程度。这里不引入 embedding。
+
+
         note_tags = {tag.lower() for tag in note.get("tags", [])}
         note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
         exact_tag_match = int(bool(query_tokens & note_tags))

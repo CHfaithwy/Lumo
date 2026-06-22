@@ -13,8 +13,8 @@ from pathlib import Path
 
 MAX_TOOL_OUTPUT = 4000
 AGENT_STATE_DIR = ".lumo"
-# 这些文件最可能直接影响 agent 的行动方式。
-# 我们不会预加载整个仓库，只会先给模型一小份“导航包”。
+
+
 MAX_PROJECT_TREE_ENTRIES = 100
 IGNORED_PATH_NAMES = {
     ".git",
@@ -149,10 +149,10 @@ class WorkspaceContext:
             if repo_root_override is not None
             else Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
         )
-        # Keep project_docs as a lightweight navigation map instead of loading file contents.
+
         docs = {"directory_tree": project_tree(cwd)}
-        # 同时扫描 repo_root 和 cwd，这样在子目录启动时也能看到本地文档；
-        # 但用相对路径做 key，避免同一份文档被重复收集。
+
+
         return cls(
             cwd=str(cwd),
             repo_root=str(repo_root),
@@ -166,7 +166,7 @@ class WorkspaceContext:
         )
 
     def text(self):
-        # 这段文本会被塞进 prompt prefix，作为相对稳定的基线上下文。
+
         commits = "\n".join(f"- {line}" for line in self.recent_commits) or "- none"
         doc_lines = []
         for path, snippet in self.project_docs.items():
@@ -190,8 +190,8 @@ class WorkspaceContext:
         ).strip()
 
     def fingerprint(self):
-        # 这个指纹用来判断仓库状态是否发生了足够大的变化，
-        # 从而决定是否需要重建缓存中的 prompt prefix。
+
+
         payload = {
             "cwd": self.cwd,
             "repo_root": self.repo_root,

@@ -102,7 +102,7 @@ class ToolExecutor:
     |-- 11. 返回 ToolExecutionResult
 
     最近两次工具事件如果和当前调用完全一样，直接拒绝:
-    
+
     """
     def execute(self, name, args):
         agent = self.agent

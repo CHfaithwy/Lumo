@@ -1,34 +1,24 @@
-"""Prompt 组装与上下文预算控制。
-
-这个模块负责决定：每一轮到底把多少 prefix、durable memory、历史
-以及当前用户请求送进模型。
-"""
-
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from .features import memory as memorylib
+from .workspace import AGENT_STATE_DIR, now
 
 
-DEFAULT_TOTAL_BUDGET = 300000
-DEFAULT_SECTION_BUDGETS = {
-    "prefix": 4000,
-    "durable_memory": 14000,
-    "history": 250000,
-}
-DEFAULT_SECTION_FLOORS = {
-    "prefix": 2000,
-    "durable_memory": 500,
-    "history": 1,
-}
-# 当 prompt 超预算时，会优先压缩这些 section。
-DEFAULT_REDUCTION_ORDER = ("history", "durable_memory", "prefix")
-SECTION_ORDER = ("prefix", "durable_memory", "history", "current_request")
+DEFAULT_TOTAL_BUDGET = 260000
 CURRENT_REQUEST_SECTION = "current_request"
+CURRENT_REQUEST_BUDGET = 30000
+CURRENT_REQUEST_OVERFLOW_FILE = "prompt.txt"
+CONTEXT_COMPRESSION_TEMPLATE = "contex_compress.md"
+CONTEXT_SUMMARY_KIND = "context_summary"
+CONTEXT_SUMMARY_MAX_TOKENS = 10000
+CONTEXT_COMPRESSION_RETRY_DROP_CHARS = 10000
+SECTION_ORDER = ("prefix", "durable_memory", "history", CURRENT_REQUEST_SECTION)
 STALE_READ_MESSAGE = (
     "This earlier read_file output is stale because the file freshness no longer matches "
     "or the file was modified later in the transcript. "
@@ -55,7 +45,6 @@ def _is_cjk_char(char):
 
 
 def _context_units(text):
-    """Count prompt budget units: ASCII words, CJK characters, and punctuation."""
     text = str(text)
     units = 0
     index = 0
@@ -78,47 +67,10 @@ def _context_units(text):
     return units
 
 
-def _clip_to_units(text, limit):
-    text = str(text)
-    if limit <= 0:
-        return ""
-    if _context_units(text) <= limit:
-        return text
-    suffix = "..."
-    suffix_units = _context_units(suffix)
-    if limit <= suffix_units:
-        return "." * limit
-
-    units = 0
-    index = 0
-    target = limit - suffix_units
-    while index < len(text) and units < target:
-        char = text[index]
-        if char.isspace():
-            index += 1
-            continue
-        if _is_cjk_char(char):
-            units += 1
-            index += 1
-            continue
-        match = _ASCII_WORD_PATTERN.match(text, index)
-        if match:
-            units += 1
-            index = match.end()
-            continue
-        units += 1
-        index += 1
-    return text[:index].rstrip() + suffix
-
-
-def _tail_clip(text, limit):
-    return _clip_to_units(text, int(limit))
-
-
 @dataclass
 class SectionRender:
     raw: str
-    budget: int
+    budget: int | None
     rendered: str
     details: dict | None = None
 
@@ -150,310 +102,335 @@ class ContextManager:
     ):
         self.agent = agent
         self.total_budget = int(total_budget)
-        self.section_budgets = dict(DEFAULT_SECTION_BUDGETS)
-        if section_budgets:
-            # Accept old config keys, but the prompt no longer renders a relevant_memory section.
-            for key, value in section_budgets.items():
-                key = str(key)
-                if key == "memory":
-                    key = "durable_memory"
-                if key == "relevant_memory":
-                    continue
-                self.section_budgets[key] = int(value)
-        self._section_floor_overrides = {}
-        for key, value in (section_floors or {}).items():
-            key = str(key)
-            if key == "memory":
-                key = "durable_memory"
-            if key == "relevant_memory":
-                continue
-            self._section_floor_overrides[key] = int(value)
-        self.section_floors = self._compute_section_floors()
-        normalized_reduction_order = []
-        for section in reduction_order or DEFAULT_REDUCTION_ORDER:
-            section = str(section)
-            if section == "memory":
-                section = "durable_memory"
-            if section == "relevant_memory" or section == CURRENT_REQUEST_SECTION:
-                continue
-            if section in SECTION_ORDER and section not in normalized_reduction_order:
-                normalized_reduction_order.append(section)
-        self.reduction_order = tuple(normalized_reduction_order or DEFAULT_REDUCTION_ORDER)
+        self.section_budgets = {}
+        self.section_floors = {}
+        self.reduction_order = ("history",)
+        self._current_request_details = {}
+        self._current_user_message = ""
+        self._last_context_compression = self._empty_compression_metadata()
 
     def build(self, user_message):
-        """按预算组装一轮完整 prompt。
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.build_async(user_message))
 
-        为什么存在：
-        仅靠用户这一轮输入，模型并不知道当前仓库状态、会话里已经读过什么、
-        哪些旧信息还值得继续参考。这个函数负责把“稳定基线 + 持久记忆 +
-        历史 + 当前请求”拼成真正发给模型的 prompt。
+        result = {}
 
-        输入 / 输出：
-        - 输入：`user_message`，也就是用户当前这一轮的新请求。
-        - 输出：`(prompt, metadata)`。
-          `prompt` 是最终发送给模型的文本；
-          `metadata` 记录了每个 section 的原始长度、裁剪后的长度、是否触发了
-          预算收缩等信息，后续会进入 trace/report，便于解释这轮 prompt
-          是怎么被拼出来的。
+        def runner():
+            try:
+                result["value"] = asyncio.run(self.build_async(user_message))
+            except BaseException as exc:
+                result["error"] = exc
 
-        在 agent 链路里的位置：
-        它位于 `Pico.ask()` 的每轮模型调用之前，是“真正发请求给模型”
-        的最后一道组装工序。`WorkspaceContext` 提供稳定前缀，durable
-        memory 提供跨会话事实，history 提供本会话事实。
-        """
+        import threading
+
+        thread = threading.Thread(target=runner)
+        thread.start()
+        thread.join()
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    async def build_async(self, user_message):
         user_message = str(user_message)
-        # 给每个 prompt section 算一个“最小保留长度下限”。
-        self.section_floors = self._compute_section_floors()
         durable_memory_enabled = True
         context_reduction_enabled = True
         if hasattr(self.agent, "feature_enabled"):
             durable_memory_enabled = self.agent.feature_enabled("memory")
             context_reduction_enabled = self.agent.feature_enabled("context_reduction")
+        current_request_text, current_request_details = self._prepare_current_request(user_message)
+        self._current_request_details = current_request_details
+        self._current_user_message = user_message
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
             "durable_memory": "Durable memory:\n- disabled" if not durable_memory_enabled else str(self.agent.memory_text()),
             "history": "",
-            CURRENT_REQUEST_SECTION: (
-                "Current user request:\n"
-                "Before answering, check whether the accumulated durable memory helps you interpret the user's intent or project context.\n"
-                f"{user_message}"
-            ),
+            CURRENT_REQUEST_SECTION: current_request_text,
         }
-        # Checkpoint state is still evaluated and recorded in metadata, but the
-        # rendered checkpoint block is temporarily omitted from the prompt to
-        # avoid repeating task state already present in memory/history.
-        # checkpoint_text = ""
-        # if hasattr(self.agent, "render_checkpoint_text"):
-        #     checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
-        # if checkpoint_text:
-        #     section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
-
-        if not context_reduction_enabled:
-            rendered = self._render_sections_without_reduction(section_texts)
-            prompt = self._assemble_prompt(rendered)
-            metadata = self._metadata(
-                prompt=prompt,
-                rendered=rendered,
-                budgets={section: render.budget for section, render in rendered.items() if section != CURRENT_REQUEST_SECTION},
-                reduction_log=[],
-                user_message=user_message,
-                section_texts=section_texts,
-            )
-            return prompt, metadata
-
-        budgets = dict(self.section_budgets)
-        rendered = self._render_sections(section_texts, budgets)
+        rendered = self._render_sections(section_texts)
         prompt = self._assemble_prompt(rendered)
-        reduction_log = []
-
-        # 如果 prompt 超预算，就按固定顺序不断压缩。
-        # 这里的顺序体现了平台偏好：
-        # 先压缩 history，再压缩 durable memory，最后才动 prefix。
-        # 最新用户请求永远不裁剪，因为那是本轮最重要的输入。
-        prompt_units = _context_units(prompt)
-        while prompt_units > self.total_budget:
-            overflow = prompt_units - self.total_budget
-            reduced = False
-            for section in self.reduction_order:
-                floor = int(self.section_floors.get(section, 0))
-                current_budget = int(budgets.get(section, 0))
-                if current_budget <= floor:
-                    continue
-                new_budget = max(floor, current_budget - overflow)
-                if new_budget >= current_budget:
-                    continue
-                reduction_log.append(
-                    {
-                        "section": section,
-                        "before_units": current_budget,
-                        "after_units": new_budget,
-                        "overflow_units": overflow,
-                    }
-                )
-                budgets[section] = new_budget
-                rendered = self._render_sections(section_texts, budgets)
-                prompt = self._assemble_prompt(rendered)
-                prompt_units = _context_units(prompt)
-                reduced = True
-                break
-            if not reduced:
-                break
-
+        compression_metadata = self._empty_compression_metadata()
+        if context_reduction_enabled and _context_units(prompt) > self.total_budget:
+            rendered, prompt, compression_metadata = await self._compress_history_until_fit(section_texts, rendered, prompt)
+        self._last_context_compression = compression_metadata
         metadata = self._metadata(
             prompt=prompt,
             rendered=rendered,
-            budgets=budgets,
-            reduction_log=reduction_log,
             user_message=user_message,
             section_texts=section_texts,
+            compression_metadata=compression_metadata,
         )
         return prompt, metadata
 
-    def _render_sections_without_reduction(self, section_texts):
+    def _current_request_prefix(self):
+        return (
+            "Current user request:\n"
+            "Before answering, check whether the accumulated durable memory helps you interpret the user's intent or project context.\n"
+        )
+
+    def _prepare_current_request(self, user_message):
+        prefix = self._current_request_prefix()
+        inline_text = prefix + str(user_message)
+        user_units = _context_units(user_message)
+        inline_units = _context_units(inline_text)
+        details = {
+            "externalized": False,
+            "externalized_path": "",
+            "raw_user_chars": len(str(user_message)),
+            "raw_user_units": user_units,
+            "budget_units": CURRENT_REQUEST_BUDGET,
+        }
+        if user_units <= CURRENT_REQUEST_BUDGET and inline_units <= CURRENT_REQUEST_BUDGET:
+            return inline_text, details
+
+        root = Path(getattr(self.agent, "root", "."))
+        relative_path = Path(AGENT_STATE_DIR) / CURRENT_REQUEST_OVERFLOW_FILE
+        target = root / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(user_message), encoding="utf-8")
+        display_path = "./" + relative_path.as_posix()
+        details.update(
+            {
+                "externalized": True,
+                "externalized_path": display_path,
+            }
+        )
+        rendered = (
+            "Current user request:\n"
+            f"用户的指令长度超限，完整内容已经保存到 {display_path}。\n"
+            f"原始用户指令约 {user_units} 个上下文单位，超过 current_request 上限 {CURRENT_REQUEST_BUDGET}。\n"
+            f"请先使用 read_file 从头到尾完整读取 {relative_path.as_posix()}；如果 read_file 返回 has_more 或 system-reminder，"
+            "请继续按 next_offset 读取，直到完整读完整个文件后，再回答用户的问题。\n"
+            "Do not answer before reading the full file."
+        )
+        return rendered, details
+
+    def _history_without_externalized_current_request(self, history):
+        details = getattr(self, "_current_request_details", {}) or {}
+        if not details.get("externalized") or not history:
+            return history
+        current_user_message = getattr(self, "_current_user_message", None)
+        last_item = history[-1]
+        if last_item.get("role") == "user" and str(last_item.get("content", "")) == str(current_user_message):
+            return history[:-1]
+        return history
+
+    def _prompt_history(self):
         history = list(getattr(self.agent, "session", {}).get("history", []))
+        history = self._history_without_externalized_current_request(history)
+        summary_index = self._latest_context_summary_index(history)
+        if summary_index is None:
+            return history
+        return history[summary_index:]
+
+    def _latest_context_summary_index(self, history):
+        for index in range(len(history) - 1, -1, -1):
+            if self._is_context_summary(history[index]):
+                return index
+        return None
+
+    def _is_context_summary(self, item):
+        return (
+            isinstance(item, dict)
+            and item.get("role") == "system"
+            and item.get("kind") == CONTEXT_SUMMARY_KIND
+        )
+
+    def _render_sections(self, section_texts):
+        history = self._prompt_history()
         history_raw = self._raw_history_text(history)
         return {
-            "prefix": SectionRender(raw=section_texts["prefix"], budget=_context_units(section_texts["prefix"]), rendered=section_texts["prefix"], details={}),
-            "durable_memory": SectionRender(raw=section_texts["durable_memory"], budget=_context_units(section_texts["durable_memory"]), rendered=section_texts["durable_memory"], details={}),
-            "history": SectionRender(raw=history_raw, budget=_context_units(history_raw), rendered=history_raw, details={"rendered_entries": []}),
+            "prefix": SectionRender(raw=section_texts["prefix"], budget=None, rendered=section_texts["prefix"], details={}),
+            "durable_memory": SectionRender(raw=section_texts["durable_memory"], budget=None, rendered=section_texts["durable_memory"], details={}),
+            "history": SectionRender(
+                raw=history_raw,
+                budget=None,
+                rendered=history_raw,
+                details=self._history_details(history),
+            ),
             CURRENT_REQUEST_SECTION: SectionRender(
                 raw=section_texts[CURRENT_REQUEST_SECTION],
-                budget=0,
+                budget=CURRENT_REQUEST_BUDGET,
                 rendered=section_texts[CURRENT_REQUEST_SECTION],
                 details={},
             ),
         }
 
-    def _compute_section_floors(self):
-        floors = {
-            section: max(20, int(budget) // 4)
-            for section, budget in self.section_budgets.items()
-        }
-        floors.update(self._section_floor_overrides)
-        return floors
-
-    def _render_sections(self, section_texts, budgets):
-        rendered = {}
-        for section in SECTION_ORDER:
-            budget = budgets.get(section)
-            if section == CURRENT_REQUEST_SECTION:
-                raw = section_texts[section]
-                rendered[section] = SectionRender(raw=raw, budget=0, rendered=raw, details={})
-            elif section == "history":
-                rendered[section] = self._render_history_section(int(budget or 0))
-            else:
-                raw = section_texts[section]
-                rendered_text = _tail_clip(raw, int(budget)) if budget is not None else raw
-                rendered[section] = SectionRender(raw=raw, budget=int(budget) if budget is not None else 0, rendered=rendered_text, details={})
-        return rendered
-
-    def _render_history_section(self, budget):
-        history = list(getattr(self.agent, "session", {}).get("history", []))
-        raw = self._raw_history_text(history)
-        if not history:
-            rendered = "Transcript:\n- empty"
-            return SectionRender(
-                raw=raw,
-                budget=budget,
-                rendered=rendered,
-                details={
-                    "rendered_entries": [],
-                    "older_entries_count": 0,
-                    "collapsed_duplicate_reads": 0,
-                    "reused_read_summary_count": 0,
-                    "summarized_tool_count": 0,
-                    "stale_read_replacement_count": 0,
-                },
-            )
-
-        # 优先保留最近的历史，因为下一步决策通常最依赖刚刚发生的工具结果。
-        recent_window = 6
-        recent_start = max(0, len(history) - recent_window)
+    def _history_details(self, history):
         stale_read_indexes = self._stale_read_indexes(history)
-        history_entries, history_details = self._compressed_history_entries(history, recent_start, stale_read_indexes)
-        rendered_entries = []
-        for entry in reversed(history_entries):
-            recent = bool(entry.get("recent", False))
-            candidate_lines = list(entry.get("lines", []))
-            candidate_entries = candidate_lines + rendered_entries
-            candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-            if _context_units(candidate_rendered) <= budget:
-                rendered_entries = candidate_entries
-                continue
-            if recent:
-                available = budget - _context_units("Transcript:")
-                if rendered_entries:
-                    available -= sum(_context_units(line) + 1 for line in rendered_entries)
-                available = max(20, available - 1)
-                candidate_lines = [_tail_clip(line, available) for line in candidate_lines]
-                candidate_entries = candidate_lines + rendered_entries
-                candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-                if _context_units(candidate_rendered) <= budget:
-                    rendered_entries = candidate_entries
-            else:
-                smaller_lines = [_tail_clip(line, 20) for line in candidate_lines]
-                smaller_entries = smaller_lines + rendered_entries
-                smaller_rendered = "\n".join(["Transcript:", *smaller_entries])
-                if _context_units(smaller_rendered) <= budget:
-                    rendered_entries = smaller_entries
-        rendered = "\n".join(["Transcript:", *rendered_entries])
+        return {
+            "summary_index": self._latest_context_summary_index(history),
+            "history_entries": len(history),
+            "stale_read_replacement_count": len(stale_read_indexes),
+        }
 
-        if _context_units(rendered) > budget and budget > 0:
-            rendered = _tail_clip(raw, budget)
+    async def _compress_history_until_fit(self, section_texts, rendered, prompt):
+        metadata = self._empty_compression_metadata()
+        metadata.update(
+            {
+                "triggered": True,
+                "status": "running",
+                "before_prompt_chars": len(prompt),
+                "before_prompt_units": _context_units(prompt),
+                "before_history_chars": rendered["history"].rendered_chars,
+                "before_history_units": rendered["history"].rendered_units,
+                "template_path": CONTEXT_COMPRESSION_TEMPLATE,
+                "max_summary_tokens": CONTEXT_SUMMARY_MAX_TOKENS,
+                "retry_drop_chars": CONTEXT_COMPRESSION_RETRY_DROP_CHARS,
+            }
+        )
+        rounds = []
+        total_retry_count = 0
+        total_discarded_chars = 0
+        failures = []
+        while _context_units(prompt) > self.total_budget:
+            history_text = rendered["history"].rendered
+            if not history_text.strip() or history_text.strip() == "Transcript:\n- empty":
+                raise RuntimeError("Prompt exceeds context budget, but there is no history to compress.")
+            before_prompt_units = _context_units(prompt)
+            before_history_units = rendered["history"].rendered_units
+            summary, attempt_metadata = await self._compress_history_with_retries(history_text)
+            total_retry_count += int(attempt_metadata.get("retry_count", 0))
+            total_discarded_chars += int(attempt_metadata.get("discarded_chars", 0))
+            failures.extend(list(attempt_metadata.get("failures", [])))
+            round_metadata = dict(metadata)
+            round_metadata.update(attempt_metadata)
+            round_metadata.update(
+                {
+                    "before_prompt_units": before_prompt_units,
+                    "before_history_units": before_history_units,
+                }
+            )
+            summary_record = self._append_context_summary(summary, round_metadata)
+            rendered = self._render_sections(section_texts)
+            prompt = self._assemble_prompt(rendered)
+            rounds.append(
+                {
+                    "round": len(rounds) + 1,
+                    "summary_history_index": len(getattr(self.agent, "session", {}).get("history", [])) - 1,
+                    "summary_created_at": summary_record.get("created_at", ""),
+                    "summary_chars": len(summary),
+                    "summary_units": _context_units(summary),
+                    "retry_count": int(attempt_metadata.get("retry_count", 0)),
+                    "discarded_chars": int(attempt_metadata.get("discarded_chars", 0)),
+                    "compression_input_chars": int(attempt_metadata.get("compression_input_chars", 0)),
+                    "compression_input_units": int(attempt_metadata.get("compression_input_units", 0)),
+                    "before_prompt_units": before_prompt_units,
+                    "after_prompt_units": _context_units(prompt),
+                    "before_history_units": before_history_units,
+                    "after_history_units": rendered["history"].rendered_units,
+                }
+            )
+            if len(rounds) > 50:
+                raise RuntimeError("Context compression did not converge after 50 rounds.")
+        metadata.update(
+            {
+                "status": "ok",
+                "round_count": len(rounds),
+                "rounds": rounds,
+                "retry_count": total_retry_count,
+                "discarded_chars": total_discarded_chars,
+                "failures": failures,
+                "summary_history_index": rounds[-1]["summary_history_index"] if rounds else None,
+                "summary_created_at": rounds[-1]["summary_created_at"] if rounds else "",
+                "after_prompt_chars": len(prompt),
+                "after_prompt_units": _context_units(prompt),
+                "after_history_chars": rendered["history"].rendered_chars,
+                "after_history_units": rendered["history"].rendered_units,
+                "over_budget_after_compression": _context_units(prompt) > self.total_budget,
+            }
+        )
+        return rendered, prompt, metadata
 
-        return SectionRender(
-            raw=raw,
-            budget=budget,
-            rendered=rendered,
-            details={
-                "recent_window": recent_window,
-                "recent_start": recent_start,
-                "rendered_entries": rendered_entries,
-                **history_details,
-            },
+    async def _compress_history_with_retries(self, history_text):
+        template = self._load_compression_template()
+        remaining = str(history_text)
+        discarded_chars = 0
+        retry_count = 0
+        failures = []
+        while remaining:
+            compression_prompt = self._render_compression_prompt(template, remaining)
+            try:
+                summary = await self._complete_compression_prompt(compression_prompt)
+                summary = str(summary).strip()
+                if not summary:
+                    raise RuntimeError("context compression returned empty summary")
+                return summary, {
+                    "status": "ok",
+                    "retry_count": retry_count,
+                    "discarded_chars": discarded_chars,
+                    "compression_input_chars": len(remaining),
+                    "compression_input_units": _context_units(remaining),
+                    "compression_prompt_chars": len(compression_prompt),
+                    "compression_prompt_units": _context_units(compression_prompt),
+                    "failures": failures,
+                }
+            except Exception as exc:
+                failures.append(str(exc))
+                drop_chars = min(CONTEXT_COMPRESSION_RETRY_DROP_CHARS, len(remaining))
+                remaining = remaining[drop_chars:]
+                discarded_chars += drop_chars
+                retry_count += 1
+        raise RuntimeError(
+            "Context compression failed after discarding all retry input: "
+            + (failures[-1] if failures else "unknown compression error")
         )
 
-    def render_history_for_delegate(self):
-        """Render parent history with the same compression policy as prompts."""
-        budget = int(self.section_budgets.get("history", 0) or 0)
-        return self._render_history_section(budget).rendered
+    def _load_compression_template(self):
+        path = Path(getattr(self.agent, "root", ".")) / CONTEXT_COMPRESSION_TEMPLATE
+        if not path.is_file():
+            raise RuntimeError(f"Context compression template not found: {CONTEXT_COMPRESSION_TEMPLATE}")
+        return path.read_text(encoding="utf-8")
 
-    def _compressed_history_entries(self, history, recent_start, stale_read_indexes=None):
-        entries = []
-        seen_older_reads = set()
-        stale_read_indexes = set(stale_read_indexes or set())
-        details = {
-            "older_entries_count": 0,
-            "collapsed_duplicate_reads": 0,
-            "reused_read_summary_count": 0,
-            "summarized_tool_count": 0,
-            "stale_read_replacement_count": 0,
+    def _render_compression_prompt(self, template, history_text):
+        return (
+            str(template)
+            .replace("{{MAX_SUMMARY_TOKENS}}", str(CONTEXT_SUMMARY_MAX_TOKENS))
+            .replace("{{CONTEXT}}", str(history_text))
+        )
+
+    async def _complete_compression_prompt(self, prompt):
+        complete_async = getattr(self.agent.model_client, "complete_async", None)
+        if complete_async is not None:
+            return await complete_async(prompt, CONTEXT_SUMMARY_MAX_TOKENS)
+        return await asyncio.to_thread(self.agent.model_client.complete, prompt, CONTEXT_SUMMARY_MAX_TOKENS)
+
+    def _append_context_summary(self, summary, compression_metadata):
+        history = self.agent.session.setdefault("history", [])
+        record = {
+            "role": "system",
+            "kind": CONTEXT_SUMMARY_KIND,
+            "content": str(summary).strip(),
+            "created_at": now(),
+            "metadata": {
+                "source": "context_compression",
+                "template_path": CONTEXT_COMPRESSION_TEMPLATE,
+                "max_summary_tokens": CONTEXT_SUMMARY_MAX_TOKENS,
+                "retry_count": int(compression_metadata.get("retry_count", 0)),
+                "discarded_chars": int(compression_metadata.get("discarded_chars", 0)),
+                "before_prompt_units": int(compression_metadata.get("before_prompt_units", 0)),
+                "before_history_units": int(compression_metadata.get("before_history_units", 0)),
+            },
+        }
+        history.append(record)
+        self.agent.session_path = self.agent.session_store.save(self.agent.session)
+        return record
+
+    def _empty_compression_metadata(self):
+        return {
+            "triggered": False,
+            "status": "skipped",
+            "template_path": CONTEXT_COMPRESSION_TEMPLATE,
+            "max_summary_tokens": CONTEXT_SUMMARY_MAX_TOKENS,
+            "retry_drop_chars": CONTEXT_COMPRESSION_RETRY_DROP_CHARS,
+            "retry_count": 0,
+            "discarded_chars": 0,
+            "failures": [],
         }
 
-        for index, item in enumerate(history):
-            recent = index >= recent_start
-            is_stale_read = index in stale_read_indexes
-            if recent:
-                lines = self._render_stale_read_history_item(item) if is_stale_read else self._render_history_item(item)
-                if is_stale_read:
-                    details["stale_read_replacement_count"] += 1
-                entries.append(
-                    {
-                        "recent": True,
-                        "lines": lines,
-                    }
-                )
-                continue
-
-            if item["role"] == "tool" and item["name"] == "read_file":
-                read_key = self._read_history_key(item)
-                if read_key in seen_older_reads:
-                    details["collapsed_duplicate_reads"] += 1
-                    continue
-                seen_older_reads.add(read_key)
-                if is_stale_read:
-                    entries.append({"recent": False, "lines": self._render_stale_read_history_item(item)})
-                    details["older_entries_count"] += 1
-                    details["stale_read_replacement_count"] += 1
-                    continue
-                path = str(item["args"].get("path", "")).strip()
-                summary = self._history_item_summary(item)
-                if summary:
-                    entries.append({"recent": False, "lines": [f"{path} -> {summary}"]})
-                    details["older_entries_count"] += 1
-                    details["reused_read_summary_count"] += 1
-                    continue
-
-            if item["role"] == "tool":
-                summary_line = self._summarize_old_tool_item(item)
-                entries.append({"recent": False, "lines": [summary_line]})
-                details["older_entries_count"] += 1
-                details["summarized_tool_count"] += 1
-                continue
-
-            entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
-
-        return entries, details
+    def render_history_for_delegate(self):
+        return self._raw_history_text(self._prompt_history())
 
     def _read_history_key(self, item):
         args = item.get("args", {})
@@ -517,49 +494,30 @@ class ContextManager:
         return expected != current
 
     def _render_stale_read_history_item(self, item):
-        prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
+        prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True, ensure_ascii=False)}"
         return [prefix, STALE_READ_MESSAGE]
-
-    def _history_item_summary(self, item):
-        summary = str(item.get("summary", "")).strip()
-        if summary:
-            return summary
-        metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
-        return str(metadata.get("archive_summary", "")).strip()
-
-    def _summarize_old_tool_item(self, item):
-        summary = self._history_item_summary(item)
-        if summary:
-            return f"{item['name']} -> {summary}"
-        if item["name"] == "run_shell":
-            command = str(item["args"].get("command", "")).strip() or "shell"
-            lines = [line.strip() for line in str(item.get("content", "")).splitlines() if line.strip()]
-            summary = " | ".join(lines[:3]) if lines else "(empty)"
-            return f"{command} -> {summary}"
-        return self._render_history_item(item, 60)[0]
 
     def _raw_history_text(self, history):
         if not history:
             return "Transcript:\n- empty"
+        stale_read_indexes = self._stale_read_indexes(history)
         lines = []
-        for item in history:
-            if item["role"] == "tool":
-                lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
-                lines.append(str(item["content"]))
+        for index, item in enumerate(history):
+            if self._is_context_summary(item):
+                lines.append("[context_summary]")
+                lines.append(str(item.get("content", "")))
+                continue
+            if item.get("role") == "tool":
+                if index in stale_read_indexes:
+                    lines.extend(self._render_stale_read_history_item(item))
+                    continue
+                lines.append(f"[tool:{item.get('name', '')}] {json.dumps(item.get('args', {}), sort_keys=True, ensure_ascii=False)}")
+                lines.append(str(item.get("content", "")))
             else:
-                lines.append(f"[{item['role']}] {item['content']}")
+                lines.append(f"[{item.get('role', 'unknown')}] {item.get('content', '')}")
         return "\n".join(["Transcript:", *lines])
 
-    def _render_history_item(self, item, line_limit=None):
-        if item["role"] == "tool":
-            prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
-            content = str(item["content"]) if line_limit is None else _tail_clip(item["content"], max(20, line_limit))
-            return [prefix, content]
-        content = str(item["content"]) if line_limit is None else _tail_clip(item["content"], line_limit)
-        return [f"[{item['role']}] {content}"]
-
     def _assemble_prompt(self, rendered):
-        # 顺序是刻意设计的：稳定规则放前面，最新请求放最后。
         return "\n\n".join(
             [
                 rendered["prefix"].rendered,
@@ -569,7 +527,7 @@ class ContextManager:
             ]
         ).strip()
 
-    def _metadata(self, prompt, rendered, budgets, reduction_log, user_message, section_texts):
+    def _metadata(self, prompt, rendered, user_message, section_texts, compression_metadata):
         section_metadata = {}
         for section in SECTION_ORDER[:-1]:
             section_metadata[section] = {
@@ -577,7 +535,7 @@ class ContextManager:
                 "budget_chars": None,
                 "rendered_chars": rendered[section].rendered_chars,
                 "raw_units": rendered[section].raw_units,
-                "budget_units": int(budgets.get(section, 0)),
+                "budget_units": None,
                 "rendered_units": rendered[section].rendered_units,
             }
         section_metadata[CURRENT_REQUEST_SECTION] = {
@@ -585,10 +543,18 @@ class ContextManager:
             "budget_chars": None,
             "rendered_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
             "raw_units": _context_units(section_texts[CURRENT_REQUEST_SECTION]),
-            "budget_units": None,
+            "budget_units": CURRENT_REQUEST_BUDGET,
             "rendered_units": rendered[CURRENT_REQUEST_SECTION].rendered_units,
         }
         prompt_units = _context_units(prompt)
+        current_request_details = dict(getattr(self, "_current_request_details", {}) or {})
+        current_request_externalized = bool(current_request_details.get("externalized"))
+        current_request_text = (
+            f"<externalized to {current_request_details.get('externalized_path', '')}>"
+            if current_request_externalized
+            else user_message
+        )
+        compression_metadata = dict(compression_metadata or self._empty_compression_metadata())
         return {
             "prompt_chars": len(prompt),
             "prompt_units": prompt_units,
@@ -598,31 +564,35 @@ class ContextManager:
             "prompt_over_budget": prompt_units > self.total_budget,
             "section_order": list(SECTION_ORDER),
             "section_budgets": {
-                section: (None if section == CURRENT_REQUEST_SECTION else int(budgets.get(section, 0)))
-                for section in SECTION_ORDER
+                "prefix": None,
+                "durable_memory": None,
+                "history": None,
+                CURRENT_REQUEST_SECTION: CURRENT_REQUEST_BUDGET,
             },
             "section_budget_unit": "ascii_word_cjk_char_or_punctuation",
             "sections": section_metadata,
-            "budget_reductions": reduction_log,
-            "reduction_order": list(self.reduction_order),
+            "budget_reductions": [compression_metadata] if compression_metadata.get("triggered") else [],
+            "context_compression": compression_metadata,
+            "reduction_order": ["history"],
             "history": {
                 "raw_chars": rendered["history"].raw_chars,
                 "rendered_chars": rendered["history"].rendered_chars,
                 "raw_units": rendered["history"].raw_units,
                 "rendered_units": rendered["history"].rendered_units,
-                "older_entries_count": int(rendered["history"].details.get("older_entries_count", 0)),
-                "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
-                "reused_read_summary_count": int(rendered["history"].details.get("reused_read_summary_count", 0)),
-                "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
+                "history_entries": int(rendered["history"].details.get("history_entries", 0)),
+                "summary_index": rendered["history"].details.get("summary_index"),
                 "stale_read_replacement_count": int(rendered["history"].details.get("stale_read_replacement_count", 0)),
             },
             "current_request": {
-                "text": user_message,
-                "raw_chars": len(user_message),
-                "rendered_chars": len(user_message),
+                "text": current_request_text,
+                "externalized": current_request_externalized,
+                "externalized_path": str(current_request_details.get("externalized_path", "")),
+                "budget_units": CURRENT_REQUEST_BUDGET,
+                "raw_chars": int(current_request_details.get("raw_user_chars", len(user_message))),
+                "rendered_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
                 "section_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
-                "raw_units": _context_units(user_message),
-                "rendered_units": _context_units(user_message),
+                "raw_units": int(current_request_details.get("raw_user_units", _context_units(user_message))),
+                "rendered_units": _context_units(user_message) if not current_request_externalized else rendered[CURRENT_REQUEST_SECTION].rendered_units,
                 "section_units": rendered[CURRENT_REQUEST_SECTION].rendered_units,
             },
         }

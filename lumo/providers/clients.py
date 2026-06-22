@@ -96,8 +96,8 @@ class OllamaModelClient:
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
-        # Ollama 当前不支持我们这里接入的 prompt cache 语义，
-        # 所以 runtime 传下来的缓存参数会被忽略。
+
+
         self.last_completion_metadata = {}
         payload = {
             "model": self.model,
@@ -289,8 +289,8 @@ def _extract_openai_response_from_sse(body_text):
 
 
 def _extract_usage_cache_details(data):
-    # 把不同 OpenAI-compatible 返回里的 usage 字段整理成统一结构，
-    # 让 runtime/trace/report 不需要关心 provider 细节。
+
+
     usage = data.get("usage") or {}
     input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
     output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
@@ -312,8 +312,8 @@ class OpenAICompatibleModelClient:
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
-        # 当前只在明确支持 prompt cache 语义的后端上启用这条链路，
-        # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
+
+
         self.supports_prompt_cache = any(host in self.base_url for host in PROMPT_CACHE_COMPATIBLE_HOSTS)
         self.last_completion_metadata = {}
 
@@ -336,8 +336,8 @@ class OpenAICompatibleModelClient:
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
-        # runtime 传入的是“稳定前缀”的签名，而不是整段 prompt 的签名。
-        # 这样缓存复用针对的是稳定段，不会因为动态 history 每轮变化而失效。
+
+
         if self.supports_prompt_cache and prompt_cache_key:
             payload["prompt_cache_key"] = prompt_cache_key
         if self.supports_prompt_cache and prompt_cache_retention:
@@ -362,11 +362,11 @@ class OpenAICompatibleModelClient:
         )
 
     def _parse_response(self, body_text, content_type, prompt_cache_key=None, prompt_cache_retention=None):
-        # 有些兼容后端返回普通 JSON，有些返回 SSE。
-        # 这里两种都接住，并尽量统一抽取文本和 usage/cache 元数据。
+
+
         """
         JSON：一次性返回一个完整 JSON 对象
-        SSE：按很多行 data: {...} 流式返回事件  
+        SSE：按很多行 data: {...} 流式返回事件
 
         {
             "id": "resp_123",
@@ -407,8 +407,8 @@ class OpenAICompatibleModelClient:
             text, response_data = _extract_openai_response_from_sse(body_text)
             metadata = {}
             if isinstance(response_data, dict) and response_data:
-                # 这些元数据会一路传回 runtime，进入 trace 和 report，
-                # 用来观察 prompt cache 是否真的命中。
+
+
                 """
                     _extract_usage_cache_details
                     {
@@ -560,8 +560,8 @@ class AnthropicCompatibleModelClient:
         raise RuntimeError("Anthropic-compatible error: could not extract text from response")
 
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
-        # 为了保持统一接口，runtime 仍然会传缓存参数进来；
-        # 这里只是显式丢弃，因为当前 Anthropic-compatible 路径没有接缓存复用。
+
+
         del prompt_cache_key, prompt_cache_retention
         self.last_completion_metadata = {}
         body_text, _ = _post_json_with_retries(

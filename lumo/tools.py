@@ -156,14 +156,14 @@ def _read_file_window(path, offset, limit):
 
 
 def build_tool_registry(context):
-    # 工具不是动态发现的，而是显式注册的。
-    # 这样模型看到的是一个有边界、可审计的动作集合。
+
+
     tools = {
         name: {**spec, "run": partial(_TOOL_RUNNERS[name], context)}
         for name, spec in BASE_TOOL_SPECS.items()
     }
-    # 子 agent 是刻意做成受限能力的：一旦深度耗尽，
-    # 就连 delegate 这个工具都不再暴露给模型。
+
+
     if context.depth < context.max_depth:
         tools["delegate"] = {**DELEGATE_TOOL_SPEC, "run": partial(tool_delegate, context)}
     return tools
@@ -214,8 +214,8 @@ def validate_tool(context, name, args):
         return
 
     if name == "patch_file":
-        # patch_file 故意做得很严格：old_text 必须精确命中且只能出现一次，
-        # 这样修改行为才是确定的，失败原因也更容易解释。
+
+
         path = context.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
@@ -229,8 +229,8 @@ def validate_tool(context, name, args):
         if count != 1:
             raise ValueError(f"old_text must occur exactly once, found {count}")
         return
-    # delegate 工具的意思是：让一个受限制的子 agent 去调查一个子任务。
-    # <tool>{"name":"delegate","args":{"task":"检查 README 里启动说明是否完整","max_steps":3}}</tool>
+
+
     if name == "delegate":
         task = str(args.get("task", "")).strip()
         if not task:
@@ -245,7 +245,7 @@ def validate_tool(context, name, args):
 
 
 def tool_list_files(context, args):
-    # 读取目录内容，排序，并过滤掉 .git、.lumo、__pycache__ 这类忽略目录。
+
     path = context.path(args.get("path", "."))
     if not path.is_dir():
         raise ValueError("path is not a directory")
@@ -259,9 +259,9 @@ def tool_list_files(context, args):
         lines.append(f"{kind} {entry.relative_to(context.root)}")
     return "\n".join(lines) or "(empty)"
 
-# 按行读取 UTF-8 文本文件。
-# 最后返回带行号的内容：
-# 默认读取第 1 到 200 行。
+
+
+
 def tool_read_file(context, args):
     path = context.path(args["path"])
     if not path.is_file():
@@ -293,8 +293,8 @@ def tool_read_file(context, args):
     hints.append(f"<summary-for-history>{summary}</summary-for-history>")
     return "\n".join([header, body, *hints])
 
-# rg 是一个非常快的代码搜索工具，如果系统里安装了 rg，就优先用它来搜索；否则就用纯 Python 的实现。
-# 搜索结果会被限制在前 200 行，避免返回过多内容导致后续处理困难。
+
+
 def tool_search(context, args):
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
@@ -302,7 +302,7 @@ def tool_search(context, args):
     path = context.path(args.get("path", "."))
 
     if shutil.which("rg"):
-        # 优先用 rg，因为搜索会非常频繁，搜索延迟会直接影响 agent 控制循环。
+
         result = subprocess.run(
             ["rg", "-n", "--smart-case", "--max-count", "200", pattern, str(path)],
             cwd=context.root,
@@ -324,7 +324,7 @@ def tool_search(context, args):
                     return "\n".join(matches)
     return "\n".join(matches) or "(no matches)"
 
-# 在 workspace 根目录运行 shell 命令。最多允许 120 秒。命令只能在 workspace 根目录跑
+
 def tool_run_shell(context, args):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -339,8 +339,8 @@ def tool_run_shell(context, args):
         capture_output=True,
         text=True,
         timeout=timeout,
-        # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
-        # 目的是减少敏感信息被意外带进命令执行环境的风险。
+
+
         env=context.shell_env(),
     )
     return textwrap.dedent(
@@ -353,7 +353,7 @@ def tool_run_shell(context, args):
         """
     ).strip()
 
-# 覆盖写入文件。
+
 def tool_write_file(context, args):
     path = context.path(args["path"])
     content = str(args["content"])
@@ -361,7 +361,7 @@ def tool_write_file(context, args):
     path.write_text(content, encoding="utf-8")
     return f"wrote {path.relative_to(context.root)} ({len(content)} chars)"
 
-# 找到文件里唯一一段 old_text，替换成 new_text
+
 def tool_patch_file(context, args):
     path = context.path(args["path"])
     if not path.is_file():
@@ -378,8 +378,8 @@ def tool_patch_file(context, args):
     path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
     return f"patched {path.relative_to(context.root)}"
 
-# Delegate a bounded subtask to a child agent. The child inherits the parent
-# agent's read/write and approval policy; max_steps and depth still bound it.
+
+
 def tool_delegate(context, args):
     if context.depth >= context.max_depth:
         raise ValueError("delegate depth exceeded")

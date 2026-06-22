@@ -36,8 +36,8 @@ class RunStore:
         return self.run_dir(run_id) / f"prompt{int(index)}.md"
 
     def start_run(self, task_state):
-        # 每次 ask() 都会生成一个 run 目录。
-        # 这样一次用户请求对应一组独立工件，后续排查更容易。
+
+
         run_dir = self.run_dir(task_state)
         run_dir.mkdir(parents=True, exist_ok=True)
         self.write_task_state(task_state)
@@ -52,8 +52,8 @@ class RunStore:
     def append_trace(self, task_state, event):
         path = self.trace_path(task_state)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # trace 采用 jsonl 追加写入，原因是 agent 运行过程是流式事件序列，
-        # 逐条落盘比“最后一次性写整份 trace”更稳，也更适合调试。
+
+
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, sort_keys=True, ensure_ascii=False))
             handle.write("\n")
@@ -78,8 +78,8 @@ class RunStore:
         return json.loads(self.report_path(task_id).read_text(encoding="utf-8"))
 
     def _write_json_atomic(self, path, payload):
-        # 原子写：先写临时文件，再 replace。
-        # 这样即使中途异常，也不容易留下半截 JSON。
+
+
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",

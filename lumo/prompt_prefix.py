@@ -21,8 +21,8 @@ _WORD_PATTERN = re.compile(r"[A-Za-z0-9_]+(?:[-'][A-Za-z0-9_]+)?")
 
 @dataclass
 class PromptPrefix:
-    # prefix 除了文本本身，还带一小份元数据，
-    # 这样 runtime 才能明确判断 prefix 是否可以复用。
+
+
     text: str
     hash: str
     workspace_fingerprint: str
@@ -112,8 +112,8 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         ]
     )
     lumo_instructions = _load_lumo_instructions(workspace)
-    # prefix 可以理解成 agent 的“工作手册”：
-    # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
+
+
     text = textwrap.dedent(
         f"""\
         You are LUMO, a small coding agent working inside a local repository.

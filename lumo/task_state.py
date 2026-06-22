@@ -61,18 +61,18 @@ class TaskState:
         )
 
     def record_attempt(self):
-        # attempt 统计的是“模型被调用了几轮”，不等于 tool_steps。
+
         self.attempts += 1
         return self
 
     def record_tool(self, name):
-        # tool_steps 只统计真正进入执行阶段的工具调用次数。
+
         self.tool_steps += 1
         self.last_tool = str(name or "")
         return self
 
     def stop(self, stop_reason, status=STATUS_STOPPED, final_answer=""):
-        # stop_reason 和 status 分开存，是为了区分“怎么停的”和“停下时是什么状态”。
+
         self.status = status
         self.stop_reason = stop_reason
         if final_answer != "":
