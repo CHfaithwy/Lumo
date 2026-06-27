@@ -190,7 +190,7 @@ class ToolExecutor:
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
-            archive_summary = _extract_archive_summary(content) if name == "read_file" else ""
+            archive_summary = _extract_archive_summary(content)
             read_window = _extract_read_window(content) if name == "read_file" else {}
             freshness = memorylib.file_freshness(args.get("path", ""), agent.root) if name == "read_file" else None
             metadata = _metadata(

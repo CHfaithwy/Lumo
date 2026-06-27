@@ -76,6 +76,7 @@ class Pico:
         secret_env_names=None,
         feature_flags=None,
         allowed_tools=None,
+        tool_call_reporter=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -89,6 +90,7 @@ class Pico:
         self.read_only = read_only
         self.shell_env_allowlist = tuple(shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST)
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
+        self.tool_call_reporter = tool_call_reporter
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
@@ -700,6 +702,19 @@ class Pico:
     def redact_artifact(self, value, key=None):
         return securitylib.redact_artifact(value, key=key, secret_env_names=self.secret_env_names)
 
+    def tool_call_summary(self, name, args):
+        args = args if isinstance(args, dict) else {}
+        redacted_args = self.redact_artifact(args)
+        if name in {"write_file", "patch_file", "run_shell", "delegate"}:
+            return self.redact_text(self.approval_summary(name, redacted_args))
+        return json.dumps(redacted_args, ensure_ascii=False, sort_keys=True)
+
+    def report_tool_call(self, name, args):
+        reporter = getattr(self, "tool_call_reporter", None)
+        if reporter is None:
+            return
+        reporter(name, self.tool_call_summary(name, args))
+
     def shell_env(self):
         return securitylib.shell_env(allowlist=self.shell_env_allowlist, root=self.root)
 
@@ -1015,6 +1030,7 @@ class Pico:
             read_only=self.read_only,
             secret_env_names=self.secret_env_names,
             shell_env_allowlist=self.shell_env_allowlist,
+            tool_call_reporter=self.tool_call_reporter,
         )
         if inherit_context:
             parent_history = self.context_manager.render_history_for_delegate()
@@ -1031,11 +1047,14 @@ class Pico:
     def tool_list_files(self, args):
         return toolkit.tool_list_files(self.tool_context(), args)
 
+    def tool_glob(self, args):
+        return toolkit.tool_glob(self.tool_context(), args)
+
     def tool_read_file(self, args):
         return toolkit.tool_read_file(self.tool_context(), args)
 
-    def tool_search(self, args):
-        return toolkit.tool_search(self.tool_context(), args)
+    def tool_grep(self, args):
+        return toolkit.tool_grep(self.tool_context(), args)
 
     def tool_run_shell(self, args):
         return toolkit.tool_run_shell(self.tool_context(), args)

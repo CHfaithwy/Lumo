@@ -46,6 +46,15 @@ WELCOME_ART = tuple(
         ("███████", "███████", "██   ██", "███████"),
     )
 )
+WELCOME_ART = (
+    "██          ██   ██   ███   ███   ███████",
+    "██          ██   ██   ████ ████   ██   ██",
+    "██          ██   ██   ██ ███ ██   ██   ██",
+    "██          ██   ██   ██  █  ██   ██   ██",
+    "██          ██   ██   ██     ██   ██   ██",
+    "██          ██   ██   ██     ██   ██   ██",
+    "████████    ███████   ██     ██   ███████",
+)
 WELCOME_NAME = "Lumo"
 WELCOME_SUBTITLE = "Code is cheap, Show me your talk"
 
@@ -87,6 +96,10 @@ def _ansi_rgb(red, green, blue):
 
 def _color(text, ansi_color):
     return f"{ansi_color}{text}{ANSI_RESET}"
+
+
+def _stderr_tool_call_reporter(name, summary):
+    print(f"[tool] {name} {summary}", file=sys.stderr)
 
 
 def _gradient_text(text, start_rgb=WELCOME_GRADIENT_START, end_rgb=WELCOME_GRADIENT_END):
@@ -248,8 +261,6 @@ def build_welcome(agent, model, host):
     width = max(68, min(shutil.get_terminal_size((80, 20)).columns, 84))
     inner = width - 4
     gap = 3
-    left_width = (inner - gap) // 2
-    right_width = inner - gap - left_width
 
     def row(text):
         body = _terminal_middle(text, width - 4)
@@ -271,28 +282,45 @@ def build_welcome(agent, model, host):
         body = _terminal_middle(text, inner)
         return _border_row(_terminal_center(body, inner))
 
-    def cell(label, value, size):
-        body = _terminal_middle(f"{label:<9} {value}", size)
-        return _terminal_ljust(body, size)
+    def split_row(left_text, right_text, left_size, right_size):
+        left_body = _terminal_ljust(str(left_text), left_size)
+        right_body = _terminal_ljust(str(right_text), right_size)
+        return _border_row(f"{left_body}{' ' * gap}{right_body}")
 
-    def pair(left_label, left_value, right_label, right_value):
-        left = cell(left_label, left_value, left_width)
-        right = cell(right_label, right_value, right_width)
-        return _border_row(f"{left}{' ' * gap}{right}")
+    top_gap = gap
+    art_width = max(_terminal_width(_gradient_text(text)) for text in WELCOME_ART)
+    top_left_width = min(max(art_width, 24), max(24, inner - 34))
+    top_right_width = max(28, inner - top_gap - top_left_width)
+    label_width = 11
+    value_width = max(12, top_right_width - label_width)
+    right_block = [
+        f"{'WORKSPACE':<{label_width}}{_terminal_ljust(_terminal_middle(agent.workspace.cwd, value_width), value_width).lstrip()}",
+        f"{'MODEL':<{label_width}}{_terminal_ljust(_terminal_middle(model, value_width), value_width).lstrip()}",
+        f"{'APPROVAL':<{label_width}}{_terminal_ljust(_terminal_middle(agent.approval_policy, value_width), value_width).lstrip()}",
+        f"{'BRANCH':<{label_width}}{_terminal_ljust(_terminal_middle(agent.workspace.branch, value_width), value_width).lstrip()}",
+        f"{'SESSION':<{label_width}}{_terminal_ljust(_terminal_middle(agent.session['id'], value_width), value_width).lstrip()}",
+    ]
+    top_height = max(len(WELCOME_ART), len(right_block))
+    left_block = list(WELCOME_ART) + [""] * max(0, top_height - len(WELCOME_ART))
+    right_padding_top = max(0, (top_height - len(right_block)) // 2)
+    right_block = [""] * right_padding_top + right_block
+    right_block.extend([""] * max(0, top_height - len(right_block)))
 
     line = divider("strong")
-    rows = [center(_gradient_text(text)) for text in WELCOME_ART]
+    rows = [
+        split_row(
+            _terminal_ljust(_gradient_text(left_block[index]) if left_block[index] else "", top_left_width),
+            _terminal_ljust(right_block[index], top_right_width) if right_block[index] else " " * top_right_width,
+            top_left_width,
+            top_right_width,
+        )
+        for index in range(top_height)
+    ]
     rows.extend(
         [
+            divider(),
             center(WELCOME_NAME),
             center(WELCOME_SUBTITLE),
-
-            divider(),
-            row(""),
-            row("WORKSPACE  " + _terminal_middle(agent.workspace.cwd, inner - 11)),
-            pair("MODEL", model, "BRANCH", agent.workspace.branch),
-            pair("APPROVAL", agent.approval_policy, "SESSION", agent.session["id"]),
-            row(""),
         ]
     )
     return "\n".join([line, *rows, bottom_divider()])
@@ -338,6 +366,7 @@ def build_agent(args):
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
+            tool_call_reporter=_stderr_tool_call_reporter,
         )
     return Pico(
         model_client=model,
@@ -347,6 +376,7 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
+        tool_call_reporter=_stderr_tool_call_reporter,
     )
 
 

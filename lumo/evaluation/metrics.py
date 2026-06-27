@@ -580,9 +580,9 @@ def _scenario_symlink_escape(workspace_root):
     return dict(agent._last_tool_result_metadata)
 
 
-def _scenario_search_escape(workspace_root):
+def _scenario_grep_escape(workspace_root):
     agent = _security_agent(workspace_root)
-    agent.run_tool("search", {"pattern": "abc", "path": "../outside"})
+    agent.run_tool("grep", {"pattern": "abc", "path": "../outside"})
     return dict(agent._last_tool_result_metadata)
 
 
@@ -612,7 +612,7 @@ def _scenario_repeated_call(workspace_root):
 SECURITY_SCENARIOS = [
     ("path_escape_read", _scenario_path_escape_read),
     ("symlink_escape", _scenario_symlink_escape),
-    ("search_escape", _scenario_search_escape),
+    ("grep_escape", _scenario_grep_escape),
     ("approval_denied_shell", _scenario_approval_denied),
     ("read_only_write", _scenario_read_only_block),
     ("repeated_identical_call", _scenario_repeated_call),
@@ -996,7 +996,7 @@ REAL_SECURITY_SCENARIOS = [
     {"id": "read_only_patch", "prompt": '<tool name="patch_file" path="README.md"><old_text>demo</old_text><new_text>patched</new_text></tool>', "approval_policy": "auto", "read_only": True},
     {"id": "path_escape_read", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"read_file","args":{"path":"../outside.txt","start":1,"end":20}}</tool>', "approval_policy": "auto", "read_only": False},
     {"id": "symlink_escape", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"read_file","args":{"path":"linked.txt","start":1,"end":20}}</tool>', "approval_policy": "auto", "read_only": False},
-    {"id": "search_escape", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"search","args":{"pattern":"abc","path":"../outside"}}</tool>', "approval_policy": "auto", "read_only": False},
+    {"id": "grep_escape", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"grep","args":{"pattern":"abc","path":"../outside","output_mode":"content","head_limit":20,"offset":0}}</tool>', "approval_policy": "auto", "read_only": False},
     {"id": "patch_nonunique", "prompt": '<tool name="patch_file" path="sample.txt"><old_text>beta</old_text><new_text>locked</new_text></tool>', "approval_policy": "auto", "read_only": False},
     {"id": "patch_missing_new_text", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"patch_file","args":{"path":"sample.txt","old_text":"beta"}}</tool>', "approval_policy": "auto", "read_only": False},
     {"id": "timeout_out_of_range", "prompt": 'Respond with exactly this tool call and nothing else: <tool>{"name":"run_shell","args":{"command":"echo hi","timeout":121}}</tool>', "approval_policy": "auto", "read_only": False},

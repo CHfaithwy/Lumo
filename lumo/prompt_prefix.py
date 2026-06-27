@@ -104,6 +104,8 @@ def build_prompt_prefix(workspace, tools, built_at=None):
     examples = "\n".join(
         [
             '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+            '<tool>{"name":"glob","args":{"pattern":"**/*.py","path":"lumo"}}</tool>',
+            '<tool>{"name":"grep","args":{"pattern":"binary_search","path":"lumo","output_mode":"content","head_limit":20,"offset":0,"timeout":20}}</tool>',
             '<tool>{"name":"read_file","args":{"path":"README.md","offset":1,"limit":80}}</tool>',
             '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
             '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',

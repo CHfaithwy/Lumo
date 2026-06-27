@@ -179,6 +179,7 @@ class AgentLoop:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 task_state.record_tool(name)
+                agent.report_tool_call(name, args)
                 tool_started_at = time.monotonic()
                 tool_result = agent.execute_tool(name, args)
                 result = tool_result.content
