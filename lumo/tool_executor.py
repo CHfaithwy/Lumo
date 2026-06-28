@@ -7,6 +7,11 @@ from .features import memory as memorylib
 from .workspace import clip
 
 SUMMARY_FOR_HISTORY_PATTERN = re.compile(r"<summary-for-history>(.*?)</summary-for-history>", re.DOTALL)
+TOOL_REMINDER_PATTERN = re.compile(r"<tool_reminder>(.*?)</tool_reminder>", re.DOTALL)
+READ_FILE_HEADER_PATTERN = re.compile(
+    r"# lines\s+(\d+)-(\d+)\s+of at least\s+(\d+)\s+\(returned\s+(\d+),\s+requested\s+(\d+)\)"
+)
+TOOL_HINT_LINE_PATTERNS = (SUMMARY_FOR_HISTORY_PATTERN, TOOL_REMINDER_PATTERN)
 
 
 @dataclass(frozen=True)
@@ -26,6 +31,7 @@ def _metadata(
     workspace_fingerprint="",
     diff_summary=None,
     archive_summary="",
+    tool_reminder="",
     read_window=None,
     freshness=None,
 ):
@@ -43,6 +49,8 @@ def _metadata(
         result["workspace_fingerprint"] = workspace_fingerprint
     if archive_summary:
         result["archive_summary"] = str(archive_summary)
+    if tool_reminder:
+        result["tool_reminder"] = str(tool_reminder)
     if read_window:
         result["read_window"] = dict(read_window)
     if freshness:
@@ -51,19 +59,44 @@ def _metadata(
 
 
 def _extract_archive_summary(content):
-    match = SUMMARY_FOR_HISTORY_PATTERN.search(str(content))
+    match = SUMMARY_FOR_HISTORY_PATTERN.search(_extract_tool_hint_region(content))
     if not match:
         return ""
     return clip(" ".join(match.group(1).split()), 500)
 
 
+def _extract_tool_reminder(content):
+    match = TOOL_REMINDER_PATTERN.search(_extract_tool_hint_region(content))
+    if not match:
+        return ""
+    return clip(" ".join(match.group(1).split()), 500)
+
+
+def _extract_tool_hint_region(content):
+    text = str(content)
+    lines = text.splitlines()
+    suffix = []
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped:
+            if suffix:
+                continue
+            continue
+        if any(pattern.fullmatch(stripped) for pattern in TOOL_HINT_LINE_PATTERNS):
+            suffix.append(stripped)
+            continue
+        break
+    if not suffix:
+        return ""
+    suffix.reverse()
+    return "\n".join(suffix)
+
+
 def _extract_read_window(content):
     text = str(content)
-    header = re.search(
-        r"# lines\s+(\d+)-(\d+)\s+of at least\s+(\d+)\s+\(returned\s+(\d+),\s+requested\s+(\d+)\)",
-        text,
-    )
-    next_offset = re.search(r'"offset":(\d+)', text)
+    header = READ_FILE_HEADER_PATTERN.search(text)
+    hint_region = _extract_tool_hint_region(text)
+    next_offset = re.search(r'"offset":(\d+)', hint_region)
     result = {}
     if header:
         result.update(
@@ -77,7 +110,15 @@ def _extract_read_window(content):
         )
     if next_offset:
         result["next_offset"] = int(next_offset.group(1))
-    result["has_more"] = "current read window" in text
+    has_more = bool(TOOL_REMINDER_PATTERN.search(text))
+    if not has_more and header:
+        end_line = int(header.group(2))
+        known_line_floor = int(header.group(3))
+        has_more = end_line < known_line_floor
+    if not has_more and next_offset and header:
+        requested_lines = int(header.group(5))
+        has_more = int(next_offset.group(1)) > int(header.group(1)) and int(header.group(4)) >= requested_lines
+    result["has_more"] = has_more
     return result
 
 
@@ -191,6 +232,7 @@ class ToolExecutor:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
             archive_summary = _extract_archive_summary(content)
+            tool_reminder = _extract_tool_reminder(content)
             read_window = _extract_read_window(content) if name == "read_file" else {}
             freshness = memorylib.file_freshness(args.get("path", ""), agent.root) if name == "read_file" else None
             metadata = _metadata(
@@ -203,6 +245,7 @@ class ToolExecutor:
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
                 archive_summary=archive_summary,
+                tool_reminder=tool_reminder,
                 read_window=read_window,
                 freshness=freshness,
             )

@@ -219,15 +219,18 @@ class AgentLoop:
                 tool_started_at = time.monotonic()
                 tool_result = agent.execute_tool(name, args)
                 result = tool_result.content
+                archive_summary = str((tool_result.metadata or {}).get("archive_summary", "")).strip()
+                stored_content = result
+                if name == "read_file" and archive_summary:
+                    stored_content = archive_summary
                 tool_record = {
                     "role": "tool",
                     "name": name,
                     "args": args,
-                    "content": result,
+                    "content": stored_content,
                     "created_at": now(),
                     "metadata": dict(tool_result.metadata or {}),
                 }
-                archive_summary = tool_record["metadata"].get("archive_summary", "")
                 if archive_summary:
                     tool_record["summary"] = archive_summary
                 agent.record(tool_record)
@@ -257,6 +260,8 @@ class AgentLoop:
 
             if kind == "retry":
                 consecutive_retry_without_progress += 1
+                retry_payload = payload if isinstance(payload, dict) else {"notice": str(payload or ""), "problem": "", "raw_text": ""}
+                retry_raw_text = str(retry_payload.get("raw_text", "")).strip()
                 if consecutive_retry_without_progress >= 2 and not forced_summary_used:
                     forced_summary_used = True
                     agent.emit_trace(
@@ -303,7 +308,9 @@ class AgentLoop:
                     )
                     agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
                     return fallback_final
-                agent.record_history_item({"role": "assistant", "content": payload, "created_at": now()})
+                if retry_raw_text:
+                    agent.report_assistant_message(retry_raw_text)
+                    agent.record_history_item({"role": "assistant", "content": retry_raw_text, "created_at": now()})
                 agent.run_store.write_task_state(task_state)
                 continue
 

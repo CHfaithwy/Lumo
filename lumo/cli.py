@@ -102,6 +102,10 @@ def _stderr_tool_call_reporter(name, summary):
     print(f"[tool] {name} {summary}", file=sys.stderr)
 
 
+def _stderr_assistant_message_reporter(message):
+    print(f"[assistant] {message}", file=sys.stderr)
+
+
 def _gradient_text(text, start_rgb=WELCOME_GRADIENT_START, end_rgb=WELCOME_GRADIENT_END):
     text = str(text)
     span = max(1, len(text) - 1)
@@ -368,6 +372,7 @@ def build_agent(args):
             secret_env_names=configured_secret_names,
             feature_flags={"request_rewrite": True},
             tool_call_reporter=_stderr_tool_call_reporter,
+            assistant_message_reporter=_stderr_assistant_message_reporter,
         )
     return Pico(
         model_client=model,
@@ -379,6 +384,7 @@ def build_agent(args):
         secret_env_names=configured_secret_names,
         feature_flags={"request_rewrite": True},
         tool_call_reporter=_stderr_tool_call_reporter,
+        assistant_message_reporter=_stderr_assistant_message_reporter,
     )
 
 
@@ -415,7 +421,7 @@ def build_arg_parser():
         default=[],
         help="Extra environment variable names to treat as secrets for trace/report redaction.",
     )
-    parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
+    parser.add_argument("--max-steps", type=int, default=12, help="Maximum tool/model iterations per request.")
     parser.add_argument("--max-new-tokens", type=int, default=8192, help="Maximum model output tokens per step.")
     parser.add_argument("--no-memory-evolution", action="store_true", help="Disable session-end durable memory evolution.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")

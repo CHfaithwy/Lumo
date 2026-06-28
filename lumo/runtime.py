@@ -82,7 +82,7 @@ REPO_LOCAL_INTENT_PHRASES = (
 REPO_LOCAL_EVIDENCE_TOOL_NAMES = {"read_file", "grep", "glob", "list_files"}
 REQUEST_REWRITE_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompt" / "request_rewrite.md"
 REQUEST_REWRITE_MAX_NEW_TOKENS = 600
-REQUEST_REWRITE_MAX_CHAR_MULTIPLIER = 2
+REQUEST_REWRITE_MAX_CHAR_MULTIPLIER = 4
 
 __all__ = ["Pico", "SessionStore"]
 
@@ -96,7 +96,7 @@ class Pico:
         session=None,
         run_store=None,
         approval_policy="ask",
-        max_steps=6,
+        max_steps=12,
         max_new_tokens=512,
         depth=0,
         max_depth=1,
@@ -106,6 +106,7 @@ class Pico:
         feature_flags=None,
         allowed_tools=None,
         tool_call_reporter=None,
+        assistant_message_reporter=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -125,6 +126,7 @@ class Pico:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / AGENT_STATE_DIR / "runs")
+        self.assistant_message_reporter = assistant_message_reporter
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -611,6 +613,7 @@ class Pico:
         lines = []
         seen_reads = set()
         stale_read_indexes = self._stale_read_indexes(history)
+        latest_tool_reminders = self._latest_tool_reminder_indexes(history)
         recent_start = max(0, len(history) - 6)
         for index, item in enumerate(history):
             recent = index >= recent_start
@@ -627,6 +630,10 @@ class Pico:
                 else:
                     summary = self._history_item_summary(item)
                     lines.append(summary or str(item["content"]))
+                    if latest_tool_reminders.get(item["name"]) == index:
+                        reminder = self._history_item_tool_reminder(item)
+                        if reminder:
+                            lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
             else:
                 lines.append(f"[{item['role']}] {item['content']}")
 
@@ -639,6 +646,25 @@ class Pico:
             return summary
         metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
         return str(metadata.get("archive_summary", "")).strip()
+
+    @staticmethod
+    def _history_item_tool_reminder(item):
+        metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+        return str(metadata.get("tool_reminder", "")).strip()
+
+    @staticmethod
+    def _latest_tool_reminder_indexes(history):
+        latest = {}
+        for index, item in enumerate(history):
+            if item.get("role") != "tool":
+                continue
+            name = str(item.get("name", "")).strip()
+            if name not in {"read_file", "grep"}:
+                continue
+            metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+            if str(metadata.get("tool_reminder", "")).strip():
+                latest[name] = index
+        return latest
 
     @staticmethod
     def _history_read_key(item):
@@ -791,6 +817,13 @@ class Pico:
         if reporter is None:
             return
         reporter(name, self.tool_call_summary(name, args))
+
+    def report_assistant_message(self, text):
+        reporter = getattr(self, "assistant_message_reporter", None)
+        message = self.redact_text(str(text or "").strip())
+        if reporter is None or not message:
+            return
+        reporter(message)
 
     @staticmethod
     def _ordered_unique(items, limit=None):
@@ -1281,6 +1314,7 @@ class Pico:
             secret_env_names=self.secret_env_names,
             shell_env_allowlist=self.shell_env_allowlist,
             tool_call_reporter=self.tool_call_reporter,
+            assistant_message_reporter=self.assistant_message_reporter,
         )
         if inherit_context:
             parent_history = self.context_manager.render_history_for_delegate()
@@ -1401,31 +1435,39 @@ class Pico:
             try:
                 payload = json.loads(body)
             except Exception:
-                return "retry", Pico.retry_notice("model returned malformed tool JSON")
+                return "retry", Pico.retry_payload("model returned malformed tool JSON", raw)
             if not isinstance(payload, dict):
-                return "retry", Pico.retry_notice("tool payload must be a JSON object")
+                return "retry", Pico.retry_payload("tool payload must be a JSON object", raw)
             if not str(payload.get("name", "")).strip():
-                return "retry", Pico.retry_notice("tool payload is missing a tool name")
+                return "retry", Pico.retry_payload("tool payload is missing a tool name", raw)
             args = payload.get("args", {})
             if args is None:
                 payload["args"] = {}
             elif not isinstance(args, dict):
-                return "retry", Pico.retry_notice()
+                return "retry", Pico.retry_payload(raw_text=raw)
             return "tool", payload
         if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
             payload = Pico.parse_xml_tool(raw)
             if payload is not None:
                 return "tool", payload
-            return "retry", Pico.retry_notice()
+            return "retry", Pico.retry_payload(raw_text=raw)
         if "<final>" in raw:
             final = Pico.extract(raw, "final").strip()
             if final:
                 return "final", final
-            return "retry", Pico.retry_notice("model returned an empty <final> answer")
+            return "retry", Pico.retry_payload("model returned an empty <final> answer", raw)
         raw = raw.strip()
         if raw:
-            return "retry", Pico.retry_notice("model returned text without a <final> tag")
-        return "retry", Pico.retry_notice("model returned an empty response")
+            return "retry", Pico.retry_payload("model returned text without a <final> tag", raw)
+        return "retry", Pico.retry_payload("model returned an empty response", "")
+
+    @staticmethod
+    def retry_payload(problem=None, raw_text=""):
+        return {
+            "notice": Pico.retry_notice(problem),
+            "problem": str(problem or "").strip(),
+            "raw_text": str(raw_text or "").strip(),
+        }
 
     @staticmethod
     def retry_notice(problem=None):

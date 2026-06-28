@@ -395,7 +395,10 @@ def _grep_result_text(pattern, display_path, output_mode, body_lines, shown_coun
     hints = []
     if truncated:
         hints.append(
-            "<system-reminder>Results were paginated. Increase offset or narrow the pattern, path, or glob before retrying.</system-reminder>"
+            f"<tool_reminder>This grep result is only a partial page, not the full search result. "
+            f"Showing {shown_count} visible entries from offset {offset}. "
+            f"If you need more matches, continue with grep using a larger offset such as {offset + shown_count}, "
+            f"or narrow the pattern, path, or glob before retrying.</tool_reminder>"
         )
     summary = _build_grep_summary(display_path, pattern, output_mode, shown_count, offset, total_matches, file_count, glob_pattern=glob_pattern)
     hints.append(f"<summary-for-history>{summary}</summary-for-history>")
@@ -898,11 +901,13 @@ def tool_read_file(context, args):
     )
     hints = []
     if window["has_more"]:
+        remaining_lines = max(0, int(window["last_seen_line"]) - int(window["end_line"]))
         hints.append(
-            f"<system-reminder>The lines above are the current read window. If they are not enough to answer "
-            f"the user's question or support your judgment, continue with "
-            f'read_file args {{"path":"{relative_path}","offset":{window["next_offset"]},"limit":{limit}}} '
-            f'or jump to a targeted window like {{"offset":8600,"limit":300}} if you know where to inspect.</system-reminder>'
+            f"<tool_reminder>You already read {relative_path} lines {offset}-{window['end_line']}. "
+            f"There are at least {remaining_lines} unread lines left based on the current file snapshot. "
+            f"Do not reread the same window. If you need to continue, call "
+            f'read_file with {{"path":"{relative_path}","offset":{window["next_offset"]},"limit":{limit}}} '
+            f"to continue from the next unread line, or jump to a later targeted window only if you know where to inspect.</tool_reminder>"
         )
     summary = _summarize_read_window(
         relative_path,

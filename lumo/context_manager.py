@@ -497,11 +497,31 @@ class ContextManager:
         prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True, ensure_ascii=False)}"
         return [prefix, STALE_READ_MESSAGE]
 
+    @staticmethod
+    def _history_item_tool_reminder(item):
+        metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+        return str(metadata.get("tool_reminder", "")).strip()
+
+    @staticmethod
+    def _latest_tool_reminder_indexes(history):
+        latest = {}
+        for index, item in enumerate(history):
+            if item.get("role") != "tool":
+                continue
+            name = str(item.get("name", "")).strip()
+            if name not in {"read_file", "grep"}:
+                continue
+            metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+            if str(metadata.get("tool_reminder", "")).strip():
+                latest[name] = index
+        return latest
+
     def _raw_history_text(self, history):
         if not history:
             return "Transcript:\n- empty"
         filtered_history = list(self.agent._iter_history_items_for_prompt(history))
         stale_read_indexes = self._stale_read_indexes(filtered_history)
+        latest_tool_reminders = self._latest_tool_reminder_indexes(filtered_history)
         lines = []
         for index, item in enumerate(filtered_history):
             if self._is_context_summary(item):
@@ -513,7 +533,29 @@ class ContextManager:
                     lines.extend(self._render_stale_read_history_item(item))
                     continue
                 lines.append(f"[tool:{item.get('name', '')}] {json.dumps(item.get('args', {}), sort_keys=True, ensure_ascii=False)}")
-                lines.append(str(item.get("content", "")))
+                if item.get("name") == "read_file":
+                    summary = str(item.get("summary", "")).strip()
+                    if not summary:
+                        metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+                        summary = str(metadata.get("archive_summary", "")).strip()
+                    lines.append(summary or str(item.get("content", "")))
+                    if latest_tool_reminders.get("read_file") == index:
+                        reminder = self._history_item_tool_reminder(item)
+                        if reminder:
+                            lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
+                else:
+                    if item.get("name") == "grep":
+                        summary = str(item.get("summary", "")).strip()
+                        if not summary:
+                            metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+                            summary = str(metadata.get("archive_summary", "")).strip()
+                        lines.append(summary or str(item.get("content", "")))
+                        if latest_tool_reminders.get("grep") == index:
+                            reminder = self._history_item_tool_reminder(item)
+                            if reminder:
+                                lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
+                    else:
+                        lines.append(str(item.get("content", "")))
             else:
                 lines.append(f"[{item.get('role', 'unknown')}] {item.get('content', '')}")
         return "\n".join(["Transcript:", *lines])
