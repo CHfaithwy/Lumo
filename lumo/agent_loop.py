@@ -13,6 +13,31 @@ class AgentLoop:
     def __init__(self, agent):
         self.agent = agent
 
+    async def _force_summary_reply_async(self, prompt):
+        fallback_prompt = "\n\n".join(
+            [
+                prompt,
+                "Runtime fallback:",
+                "You have already produced two consecutive responses that were neither a valid <tool> call nor a valid <final> answer.",
+                "Stop using tools and write the best direct reply to the user now using only the evidence already available in this prompt.",
+                "Respond in the user's language. Be concise and concrete.",
+                "If the evidence is sufficient, answer directly.",
+                "If the evidence is insufficient, clearly state what can already be concluded and what remains uncertain.",
+                "Return plain answer text only. Do not use <tool> tags. Do not use <final> tags.",
+            ]
+        )
+        return await self._complete_model_async(prompt=fallback_prompt)
+
+    def _coerce_fallback_final(self, raw):
+        raw = str(raw or "").strip()
+        if not raw:
+            return "I could not produce a properly formatted final answer, and the fallback summary was empty."
+        if "<final>" in raw:
+            final = self.agent.extract(raw, "final").strip()
+            if final:
+                return final
+        return raw
+
     def run(self, user_message):
         try:
             asyncio.get_running_loop()
@@ -39,18 +64,9 @@ class AgentLoop:
 
     async def _complete_model_async(self, prompt, prompt_cache_key=None, prompt_cache_retention=None):
         agent = self.agent
-        complete_async = getattr(agent.model_client, "complete_async", None)
-        if complete_async is not None:
-            return await complete_async(
-                prompt,
-                agent.max_new_tokens,
-                prompt_cache_key=prompt_cache_key,
-                prompt_cache_retention=prompt_cache_retention,
-            )
-        return await asyncio.to_thread(
-            agent.model_client.complete,
+        return await agent.complete_text_async(
             prompt,
-            agent.max_new_tokens,
+            max_new_tokens=agent.max_new_tokens,
             prompt_cache_key=prompt_cache_key,
             prompt_cache_retention=prompt_cache_retention,
         )
@@ -58,10 +74,15 @@ class AgentLoop:
     async def _run(self, user_message):
         agent = self.agent
         run_started_at = time.monotonic()
-        agent.memory.set_task_summary(user_message)
-        agent.record({"role": "user", "content": user_message, "created_at": now()})
+        original_user_message = str(user_message)
+        agent.memory.set_task_summary(original_user_message)
+        agent.record({"role": "user", "content": original_user_message, "created_at": now()})
 
-        task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=user_message)
+        task_state = TaskState.create(
+            run_id=agent.new_run_id(),
+            task_id=agent.new_task_id(),
+            user_request=original_user_message,
+        )
 
         task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)
 
@@ -73,13 +94,27 @@ class AgentLoop:
             "run_started",
             {
                 "task_id": task_state.task_id,
-                "user_request": clip(user_message, 300),
+                "user_request": clip(original_user_message, 300),
             },
         )
+        effective_user_message = await agent.rewrite_user_message_async(original_user_message)
+        rewrite_metadata = dict(getattr(agent, "last_user_request_rewrite", {}) or {})
+        if rewrite_metadata.get("enabled"):
+            agent.emit_trace(
+                task_state,
+                "user_request_rewritten",
+                {
+                    **rewrite_metadata,
+                    "rewritten_request": clip(effective_user_message, 300),
+                },
+            )
 
         tool_steps = 0
         attempts = 0
         max_attempts = max(agent.max_steps * 3, agent.max_steps + 4)
+        early_final_guard_used = False
+        consecutive_retry_without_progress = 0
+        forced_summary_used = False
 
         while tool_steps < agent.max_steps and attempts < max_attempts:
             attempts += 1
@@ -87,7 +122,7 @@ class AgentLoop:
             agent.run_store.write_task_state(task_state)
             prompt_started_at = time.monotonic()
 
-            prompt, prompt_metadata = await agent._build_prompt_and_metadata_async(user_message)
+            prompt, prompt_metadata = await agent._build_prompt_and_metadata_async(effective_user_message)
             prompt_path = agent.run_store.write_prompt(task_state, attempts, agent.redact_text(prompt))
             agent.emit_trace(
                 task_state,
@@ -99,7 +134,7 @@ class AgentLoop:
                 },
             )
             if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
+                checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="freshness_mismatch")
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,
@@ -117,7 +152,7 @@ class AgentLoop:
                         "fields": list(prompt_metadata.get("runtime_identity_mismatch_fields", [])),
                     },
                 )
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="workspace_mismatch")
+                checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="workspace_mismatch")
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,
@@ -128,7 +163,7 @@ class AgentLoop:
                     },
                 )
             if prompt_metadata.get("budget_reductions"):
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="context_reduction")
+                checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="context_reduction")
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,
@@ -175,6 +210,7 @@ class AgentLoop:
             )
 
             if kind == "tool":
+                consecutive_retry_without_progress = 0
                 tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
@@ -207,7 +243,7 @@ class AgentLoop:
                         **dict(tool_result.metadata or {}),
                     },
                 )
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="tool_executed")
+                checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="tool_executed")
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,
@@ -220,14 +256,87 @@ class AgentLoop:
                 continue
 
             if kind == "retry":
-                agent.record({"role": "assistant", "content": payload, "created_at": now()})
+                consecutive_retry_without_progress += 1
+                if consecutive_retry_without_progress >= 2 and not forced_summary_used:
+                    forced_summary_used = True
+                    agent.emit_trace(
+                        task_state,
+                        "forced_summary_requested",
+                        {
+                            "attempts": attempts,
+                            "tool_steps": tool_steps,
+                            "reason": "two_consecutive_non_tool_non_final_responses",
+                        },
+                    )
+                    fallback_started_at = time.monotonic()
+                    fallback_raw = await self._force_summary_reply_async(prompt)
+                    fallback_final = self._coerce_fallback_final(fallback_raw)
+                    agent.record({"role": "assistant", "content": fallback_final, "created_at": now()})
+                    task_state.finish_success(fallback_final)
+                    checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="forced_summary")
+                    agent.run_store.write_task_state(task_state)
+                    agent.emit_trace(
+                        task_state,
+                        "checkpoint_created",
+                        {
+                            "checkpoint_id": checkpoint["checkpoint_id"],
+                            "trigger": "forced_summary",
+                        },
+                    )
+                    agent.emit_trace(
+                        task_state,
+                        "forced_summary_finished",
+                        {
+                            "duration_ms": int((time.monotonic() - fallback_started_at) * 1000),
+                            "final_answer": fallback_final,
+                        },
+                    )
+                    agent.emit_trace(
+                        task_state,
+                        "run_finished",
+                        {
+                            "status": task_state.status,
+                            "stop_reason": task_state.stop_reason,
+                            "final_answer": fallback_final,
+                            "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
+                        },
+                    )
+                    agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
+                    return fallback_final
+                agent.record_history_item({"role": "assistant", "content": payload, "created_at": now()})
                 agent.run_store.write_task_state(task_state)
                 continue
 
             final = (payload or raw).strip()
+            consecutive_retry_without_progress = 0
+            looks_repo_local, repo_targets = agent._looks_like_repo_local_question(original_user_message)
+            has_repo_evidence, repo_evidence_details = agent.has_repo_evidence(original_user_message)
+            if (
+                kind == "final"
+                and tool_steps == 0
+                and not early_final_guard_used
+                and looks_repo_local
+                and not has_repo_evidence
+            ):
+                retry_notice = agent.repo_evidence_retry_notice(repo_targets or repo_evidence_details.get("targets", []))
+                early_final_guard_used = True
+                agent.record_history_item({"role": "assistant", "content": retry_notice, "created_at": now()})
+                agent.run_store.write_task_state(task_state)
+                agent.emit_trace(
+                    task_state,
+                    "early_final_soft_retry",
+                    {
+                        "candidate_final": clip(final, 300),
+                        "targets": list(repo_targets or repo_evidence_details.get("targets", [])),
+                        "repo_evidence_source": repo_evidence_details.get("source", ""),
+                        "tool_steps": tool_steps,
+                        "attempts": attempts,
+                    },
+                )
+                continue
             agent.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
-            checkpoint = agent.create_checkpoint(task_state, user_message, trigger="run_finished")
+            checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="run_finished")
             agent.run_store.write_task_state(task_state)
             agent.emit_trace(
                 task_state,
@@ -258,7 +367,7 @@ class AgentLoop:
             task_state.stop_step_limit(final)
         agent.record({"role": "assistant", "content": final, "created_at": now()})
         agent.run_store.write_task_state(task_state)
-        checkpoint = agent.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
+        checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger=task_state.stop_reason or "run_stopped")
         agent.emit_trace(
             task_state,
             "checkpoint_created",

@@ -150,7 +150,12 @@ class WorkspaceContext:
             else Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
         )
 
-        docs = {"directory_tree": project_tree(cwd)}
+        docs = {
+            "directory_tree": project_tree(cwd),
+            "directory_tree_note": (
+                f"This directory tree is a truncated navigation snapshot capped at {MAX_PROJECT_TREE_ENTRIES} visible entries, so use glob or list_files for exact current file sets or pattern-based file discovery."
+            ),
+        }
 
 
         return cls(

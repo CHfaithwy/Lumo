@@ -63,6 +63,8 @@ BASE_TOOL_SPECS = {
             "Search file contents with rg or a simple fallback. Use output_mode='files' to list matching files, "
             "output_mode='count' for per-file match counts, glob to narrow file candidates, head_limit+offset to page "
             "results, -A/-B/-C for surrounding lines in content mode, and timeout to bound slow searches. "
+            "When you need code or config context around a match, prefer content mode with a small -C window first, "
+            "then follow up with read_file on the best candidate if needed. "
             "If grep times out, treat it as incomplete search rather than proof of no matches."
         ),
     },
@@ -101,7 +103,7 @@ TOOL_EXAMPLES = {
     "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
     "glob": '<tool>{"name":"glob","args":{"pattern":"**/*.py","path":"lumo"}}</tool>',
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","offset":1,"limit":80}}</tool>',
-    "grep": '<tool>{"name":"grep","args":{"pattern":"binary_search","path":"lumo","output_mode":"content","head_limit":20,"offset":0,"timeout":20}}</tool>',
+    "grep": '<tool>{"name":"grep","args":{"pattern":"binary_search","path":"lumo","output_mode":"content","head_limit":20,"offset":0,"-C":3,"timeout":20}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
@@ -558,6 +560,13 @@ def _grep_fallback_content_lines(relative_path, lines, matched_indexes, before, 
     return rendered
 
 
+def _compile_grep_fallback_pattern(pattern):
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        raise RuntimeError(f"invalid grep pattern for fallback search: {exc}") from exc
+
+
 def _run_grep_fallback(context, args):
     search_path = _grep_search_target(context, args)
     pattern = str(args.get("pattern", "")).strip()
@@ -576,7 +585,7 @@ def _run_grep_fallback(context, args):
     display_path = _display_search_path(search_path, context.root)
     deadline = _grep_deadline(timeout_seconds)
     files = _iter_grep_candidate_files(context.root, search_path, glob_pattern=glob_pattern)
-    lowered_pattern = pattern.lower()
+    compiled_pattern = _compile_grep_fallback_pattern(pattern)
     file_matches = []
     total_matches = 0
     content_entries = []
@@ -591,7 +600,7 @@ def _run_grep_fallback(context, args):
                 _check_grep_deadline(deadline, pattern, display_path, timeout_seconds)
                 line = raw_line.rstrip("\n").rstrip("\r")
                 lines.append(line)
-                if lowered_pattern in line.lower():
+                if compiled_pattern.search(line):
                     matched_indexes.append(index)
         if not matched_indexes:
             continue

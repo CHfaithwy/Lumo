@@ -32,6 +32,7 @@ DEFAULT_FEATURE_FLAGS = {
     "memory": True,
     "context_reduction": True,
     "prompt_cache": True,
+    "request_rewrite": False,
 }
 STALE_READ_MESSAGE = (
     "This earlier read_file output is stale because the file freshness no longer matches "
@@ -54,6 +55,34 @@ DURABLE_MEMORY_LINE_PATTERNS = (
     ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
 )
 SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
+REPO_LOCAL_PATH_PATTERN = re.compile(r"(?:(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+)")
+REPO_LOCAL_IDENTIFIER_PATTERN = re.compile(r"\b(?:[A-Z][A-Za-z0-9]+|[a-z]+(?:_[a-z0-9]+)+|[a-z]+(?:[A-Z][a-z0-9]+)+|[A-Z][A-Z0-9_]{2,})\b")
+REPO_LOCAL_FENCED_CODE_PATTERN = re.compile(r"```.+?```", re.S)
+REPO_LOCAL_CODE_LINE_PATTERN = re.compile(
+    r"(?m)^\s*(?:def |class |from |import |\w+\s*=\s*|if __name__ == ['\"]__main__['\"]:|function\s+\w+|\w+\([^)]*\)\s*\{)"
+)
+REPO_LOCAL_INTENT_PHRASES = (
+    "function",
+    "class",
+    "file",
+    "config",
+    "implementation",
+    "what does",
+    "where is",
+    "defined",
+    "函数",
+    "类",
+    "文件",
+    "配置",
+    "实现",
+    "作用",
+    "调用点",
+    "在哪定义",
+)
+REPO_LOCAL_EVIDENCE_TOOL_NAMES = {"read_file", "grep", "glob", "list_files"}
+REQUEST_REWRITE_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompt" / "request_rewrite.md"
+REQUEST_REWRITE_MAX_NEW_TOKENS = 600
+REQUEST_REWRITE_MAX_CHAR_MULTIPLIER = 2
 
 __all__ = ["Pico", "SessionStore"]
 
@@ -123,6 +152,7 @@ class Pico:
         self.last_durable_promotions = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
+        self.last_user_request_rewrite = {}
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -577,6 +607,7 @@ class Pico:
         if not history:
             return "- empty"
 
+        history = list(self._iter_history_items_for_prompt(history))
         lines = []
         seen_reads = set()
         stale_read_indexes = self._stale_read_indexes(history)
@@ -678,6 +709,52 @@ class Pico:
         self.session_path = self.session_store.save(self.session)
 
     @staticmethod
+    def is_runtime_notice_text(text):
+        return str(text or "").startswith("Runtime notice:")
+
+    def should_record_history_item(self, item):
+        if not isinstance(item, dict):
+            return True
+        if item.get("role") != "assistant":
+            return True
+        content = str(item.get("content", ""))
+        if not self.is_runtime_notice_text(content):
+            return True
+        history = self.session.get("history", [])
+        if not history:
+            return True
+        last_item = history[-1]
+        if not isinstance(last_item, dict):
+            return True
+        if last_item.get("role") != "assistant":
+            return True
+        return str(last_item.get("content", "")) != content
+
+    def record_history_item(self, item):
+        if not self.should_record_history_item(item):
+            return False
+        self.record(item)
+        return True
+
+    def _iter_history_items_for_prompt(self, history):
+        previous_runtime_notice = None
+        for item in history:
+            if not isinstance(item, dict):
+                previous_runtime_notice = None
+                yield item
+                continue
+            if item.get("role") == "assistant":
+                content = str(item.get("content", ""))
+                if self.is_runtime_notice_text(content):
+                    if content == previous_runtime_notice:
+                        continue
+                    previous_runtime_notice = content
+                    yield item
+                    continue
+            previous_runtime_notice = None
+            yield item
+
+    @staticmethod
     def looks_sensitive_env_name(name):
         return securitylib.looks_sensitive_env_name(name)
 
@@ -715,8 +792,180 @@ class Pico:
             return
         reporter(name, self.tool_call_summary(name, args))
 
+    @staticmethod
+    def _ordered_unique(items, limit=None):
+        ordered = []
+        seen = set()
+        for item in items:
+            value = str(item or "").strip()
+            if not value:
+                continue
+            lowered = value.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            ordered.append(value)
+            if limit is not None and len(ordered) >= int(limit):
+                break
+        return ordered
+
+    @staticmethod
+    def _extract_repo_local_target_tokens(user_message, limit=5):
+        text = str(user_message or "")
+        tokens = []
+        tokens.extend(re.findall(r"`([^`]+)`", text))
+        tokens.extend(REPO_LOCAL_PATH_PATTERN.findall(text))
+        tokens.extend(REPO_LOCAL_IDENTIFIER_PATTERN.findall(text))
+        return Pico._ordered_unique(tokens, limit=limit)
+
+    @staticmethod
+    def _looks_like_repo_local_question(user_message):
+        text = str(user_message or "")
+        lowered = text.lower()
+        targets = Pico._extract_repo_local_target_tokens(text, limit=5)
+        has_intent = any(phrase in lowered for phrase in REPO_LOCAL_INTENT_PHRASES) or any(
+            phrase in text for phrase in REPO_LOCAL_INTENT_PHRASES if not phrase.isascii()
+        )
+        return bool(targets and has_intent), targets
+
+    @staticmethod
+    def _message_contains_repo_evidence(user_message):
+        text = str(user_message or "")
+        if REPO_LOCAL_FENCED_CODE_PATTERN.search(text):
+            return True
+        if text.count("\n") >= 2 and REPO_LOCAL_CODE_LINE_PATTERN.search(text):
+            return True
+        return False
+
+    @staticmethod
+    def _token_matches_value(token, value):
+        token_text = str(token or "").strip()
+        value_text = str(value or "").strip()
+        if not token_text or not value_text:
+            return False
+        token_lower = token_text.lower()
+        value_lower = value_text.lower()
+        if token_lower in value_lower:
+            return True
+        if ("/" in token_text or "\\" in token_text or "." in token_text) and Path(token_text).name.lower() in value_lower:
+            return True
+        return False
+
+    def has_repo_evidence(self, user_message):
+        looks_local, targets = self._looks_like_repo_local_question(user_message)
+        if not looks_local:
+            return True, {"targets": [], "source": "not_repo_local_question"}
+        if self._message_contains_repo_evidence(user_message):
+            return True, {"targets": targets, "source": "user_message"}
+
+        history = list(self.session.get("history", []))
+        for item in history:
+            if item.get("role") != "tool":
+                continue
+            name = str(item.get("name", "")).strip()
+            if name not in REPO_LOCAL_EVIDENCE_TOOL_NAMES:
+                continue
+            args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
+            metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+            searchable_values = [
+                args.get("path", ""),
+                item.get("summary", ""),
+                metadata.get("archive_summary", ""),
+                item.get("content", ""),
+            ]
+            if any(self._token_matches_value(token, value) for token in targets for value in searchable_values):
+                return True, {"targets": targets, "source": f"history:{name}"}
+        return False, {"targets": targets, "source": "none"}
+
+    @staticmethod
+    def repo_evidence_retry_notice(targets):
+        target_text = ", ".join(str(target) for target in list(targets or [])[:5]) or "the requested repository detail"
+        return (
+            "Runtime notice: current repository evidence is not enough to answer this implementation-detail question yet. "
+            f"Inspect the relevant code for {target_text} before ending as <final>. "
+            "Use grep, glob, or read_file as needed. "
+            "If the user already pasted the needed code, you may answer directly and briefly mention that source."
+        )
+
     def shell_env(self):
         return securitylib.shell_env(allowlist=self.shell_env_allowlist, root=self.root)
+
+    async def complete_text_async(self, prompt, max_new_tokens=None, prompt_cache_key=None, prompt_cache_retention=None):
+        token_limit = int(max_new_tokens or self.max_new_tokens)
+        complete_async = getattr(self.model_client, "complete_async", None)
+        if complete_async is not None:
+            return await complete_async(
+                prompt,
+                token_limit,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
+            )
+        return await asyncio.to_thread(
+            self.model_client.complete,
+            prompt,
+            token_limit,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+        )
+
+    def _request_rewrite_template(self):
+        return REQUEST_REWRITE_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    def _request_rewrite_prompt(self, user_message):
+        user_text = str(user_message or "")
+        max_chars = max(len(user_text), len(user_text) * REQUEST_REWRITE_MAX_CHAR_MULTIPLIER)
+        return (
+            self._request_rewrite_template()
+            .replace("{{MAX_CHARS}}", str(max_chars))
+            .replace("{{USER_REQUEST}}", user_text)
+        )
+
+    @staticmethod
+    def _normalize_rewritten_user_message(raw_text, original_text):
+        text = str(raw_text or "").strip()
+        final_match = re.search(r"<final>(.*?)</final>", text, re.S)
+        if final_match:
+            text = final_match.group(1).strip()
+        fenced = re.search(r"```(?:[A-Za-z0-9_-]+)?\s*(.*?)\s*```", text, re.S)
+        if fenced:
+            text = fenced.group(1).strip()
+        max_chars = max(len(str(original_text or "")), len(str(original_text or "")) * REQUEST_REWRITE_MAX_CHAR_MULTIPLIER)
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip()
+        return text or str(original_text or "")
+
+    async def rewrite_user_message_async(self, user_message):
+        original_text = str(user_message or "")
+        metadata = {
+            "enabled": bool(self.feature_enabled("request_rewrite")),
+            "applied": False,
+            "changed": False,
+            "original_chars": len(original_text),
+            "rewritten_chars": len(original_text),
+            "max_chars": len(original_text) * REQUEST_REWRITE_MAX_CHAR_MULTIPLIER,
+            "template_path": str(REQUEST_REWRITE_TEMPLATE_PATH),
+            "error": "",
+        }
+        self.last_user_request_rewrite = dict(metadata)
+        if not metadata["enabled"] or not original_text.strip():
+            return original_text
+        try:
+            prompt = self._request_rewrite_prompt(original_text)
+            raw = await self.complete_text_async(prompt, max_new_tokens=REQUEST_REWRITE_MAX_NEW_TOKENS)
+            rewritten = self._normalize_rewritten_user_message(raw, original_text)
+            metadata.update(
+                {
+                    "applied": True,
+                    "changed": rewritten != original_text,
+                    "rewritten_chars": len(rewritten),
+                }
+            )
+            self.last_user_request_rewrite = dict(metadata)
+            return rewritten
+        except Exception as exc:
+            metadata["error"] = str(exc)
+            self.last_user_request_rewrite = dict(metadata)
+            return original_text
 
     def prompt_metadata(self, user_message, prompt):
         _, metadata = self._build_prompt_and_metadata(user_message)
@@ -789,6 +1038,7 @@ class Pico:
                 "workspace_changed": refresh["workspace_changed"],
                 "prefix_changed": refresh["prefix_changed"],
                 "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
+                "request_rewrite": dict(self.last_user_request_rewrite or {}),
                 "resume_status": self.resume_state.get("status", CHECKPOINT_NONE_STATUS),
                 "stale_summary_invalidations": int(self.resume_state.get("stale_summary_invalidations", 0)),
                 "stale_paths": list(self.resume_state.get("stale_paths", [])),
@@ -1174,7 +1424,7 @@ class Pico:
             return "retry", Pico.retry_notice("model returned an empty <final> answer")
         raw = raw.strip()
         if raw:
-            return "final", raw
+            return "retry", Pico.retry_notice("model returned text without a <final> tag")
         return "retry", Pico.retry_notice("model returned an empty response")
 
     @staticmethod

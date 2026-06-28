@@ -105,7 +105,7 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         [
             '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
             '<tool>{"name":"glob","args":{"pattern":"**/*.py","path":"lumo"}}</tool>',
-            '<tool>{"name":"grep","args":{"pattern":"binary_search","path":"lumo","output_mode":"content","head_limit":20,"offset":0,"timeout":20}}</tool>',
+            '<tool>{"name":"grep","args":{"pattern":"binary_search","path":"lumo","output_mode":"content","head_limit":20,"offset":0,"-C":3,"timeout":20}}</tool>',
             '<tool>{"name":"read_file","args":{"path":"README.md","offset":1,"limit":80}}</tool>',
             '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
             '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
@@ -132,15 +132,17 @@ def build_prompt_prefix(workspace, tools, built_at=None):
           <tool>{{"name":"tool_name","args":{{...}}}}</tool>
         - For write_file and patch_file with multi-line text, prefer XML style:
           <tool name="write_file" path="file.py"><content>...</content></tool>
-        - Final answers must look like:
-          <final>your answer</final>
+        - Only return <final>your answer</final> when the user's goal is actually satisfied; otherwise do not return a <final> tag yet.
         - Never invent tool results.
         - Keep answers concise and concrete.
         - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
         - Before writing tests for existing code, read the implementation first.
         - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
+        - When the user asks about repository-local implementation details such as a function, class, file, config key, or code path, prefer answering from repository evidence instead of guessing.
+        - Valid evidence can come from code the user pasted, files already read in this session, transcript summaries, or other repository-local context already in the prompt.
+        - When searching for repository evidence, prefer grep in content mode with a small -C window before jumping into full-file reads, so you can inspect the local context around matches.
         - New files should be complete and runnable, including obvious imports.
-        - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
+        - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool.
         - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
 
         Language:

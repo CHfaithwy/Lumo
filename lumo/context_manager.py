@@ -14,7 +14,7 @@ DEFAULT_TOTAL_BUDGET = 260000
 CURRENT_REQUEST_SECTION = "current_request"
 CURRENT_REQUEST_BUDGET = 30000
 CURRENT_REQUEST_OVERFLOW_FILE = "prompt.txt"
-CONTEXT_COMPRESSION_TEMPLATE = "contex_compress.md"
+CONTEXT_COMPRESSION_TEMPLATE = "lumo/prompt/context_compress.md"
 CONTEXT_SUMMARY_KIND = "context_summary"
 CONTEXT_SUMMARY_MAX_TOKENS = 10000
 CONTEXT_COMPRESSION_RETRY_DROP_CHARS = 10000
@@ -500,9 +500,10 @@ class ContextManager:
     def _raw_history_text(self, history):
         if not history:
             return "Transcript:\n- empty"
-        stale_read_indexes = self._stale_read_indexes(history)
+        filtered_history = list(self.agent._iter_history_items_for_prompt(history))
+        stale_read_indexes = self._stale_read_indexes(filtered_history)
         lines = []
-        for index, item in enumerate(history):
+        for index, item in enumerate(filtered_history):
             if self._is_context_summary(item):
                 lines.append("[context_summary]")
                 lines.append(str(item.get("content", "")))

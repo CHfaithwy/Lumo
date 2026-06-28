@@ -366,6 +366,7 @@ def build_agent(args):
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
+            feature_flags={"request_rewrite": True},
             tool_call_reporter=_stderr_tool_call_reporter,
         )
     return Pico(
@@ -376,6 +377,7 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
+        feature_flags={"request_rewrite": True},
         tool_call_reporter=_stderr_tool_call_reporter,
     )
 
