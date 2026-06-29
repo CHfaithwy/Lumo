@@ -173,8 +173,8 @@ class ContextManager:
             "- Score guide:\n"
             "  - 0-25: You have barely started, have very limited evidence, or are still identifying what to inspect.\n"
             "  - 25-50: You have some useful evidence, but large parts of the user's request are still unresolved.\n"
-            "  - 50-90: You have substantial partial coverage, but important reading, verification, or explanation is still missing.\n"
-            "  - 90-100: Only use this range when the current tool results and transcript are already sufficient to support all of the user's requirements. If anything important is still missing, do not output a score in this range.\n\n"
+            "  - 50-95: You have substantial partial coverage, but important reading, verification, or explanation is still missing.\n"
+            "  - 95-100: Only use this range when the current tool results and transcript are already sufficient to support all of the user's requirements. If anything important is still missing, do not output a score in this range.\n\n"
             "Current user request:\n"
             "Before answering, check whether the accumulated durable memory helps you interpret the user's intent or project context.\n"
         )

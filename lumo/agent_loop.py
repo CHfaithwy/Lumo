@@ -112,7 +112,6 @@ class AgentLoop:
         tool_steps = 0
         attempts = 0
         max_attempts = max(agent.max_steps * 3, agent.max_steps + 4)
-        early_final_guard_used = False
         consecutive_retry_without_progress = 0
         forced_summary_used = False
         last_completion_score = None
@@ -338,37 +337,6 @@ class AgentLoop:
             answer_payload = payload if isinstance(payload, dict) else {"text": str(payload or "").strip(), "completion_score": current_completion_score, "raw_text": raw}
             answer_text = str(answer_payload.get("text", "")).strip()
             consecutive_retry_without_progress = 0
-            looks_repo_local, repo_targets = agent._looks_like_repo_local_question(original_user_message)
-            has_repo_evidence, repo_evidence_details = agent.has_repo_evidence(original_user_message)
-            if (
-                kind == "answer"
-                and tool_steps == 0
-                and not early_final_guard_used
-                and looks_repo_local
-                and not has_repo_evidence
-                and current_completion_score is not None
-                and current_completion_score >= 90
-            ):
-                retry_notice = agent.repo_evidence_retry_notice(repo_targets or repo_evidence_details.get("targets", []))
-                early_final_guard_used = True
-                agent.record_history_item({"role": "assistant", "content": retry_notice, "created_at": now()})
-                agent.run_store.write_task_state(task_state)
-                agent.emit_trace(
-                    task_state,
-                    "early_final_soft_retry",
-                    {
-                        "candidate_final": clip(answer_text, 300),
-                        "targets": list(repo_targets or repo_evidence_details.get("targets", [])),
-                        "repo_evidence_source": repo_evidence_details.get("source", ""),
-                        "tool_steps": tool_steps,
-                        "attempts": attempts,
-                        "current_completion_score": current_completion_score,
-                    },
-                )
-                if current_completion_score is not None:
-                    last_completion_score = current_completion_score
-                    previous_scored_completion = current_completion_score
-                continue
 
             stop_reason = ""
             if current_completion_score is not None:
@@ -376,7 +344,7 @@ class AgentLoop:
                     stop_reason = "completion_score_declined"
                 elif previous_scored_completion is not None and current_completion_score == previous_scored_completion:
                     stop_reason = "completion_score_unchanged"
-                elif current_completion_score >= 90:
+                elif current_completion_score >= 95:
                     stop_reason = "completion_score_threshold"
             elif missing_completion_streak >= 2:
                 stop_reason = "completion_score_missing_twice"

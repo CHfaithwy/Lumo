@@ -55,34 +55,9 @@ DURABLE_MEMORY_LINE_PATTERNS = (
     ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
 )
 SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
-REPO_LOCAL_PATH_PATTERN = re.compile(r"(?:(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+)")
-REPO_LOCAL_IDENTIFIER_PATTERN = re.compile(r"\b(?:[A-Z][A-Za-z0-9]+|[a-z]+(?:_[a-z0-9]+)+|[a-z]+(?:[A-Z][a-z0-9]+)+|[A-Z][A-Z0-9_]{2,})\b")
-REPO_LOCAL_FENCED_CODE_PATTERN = re.compile(r"```.+?```", re.S)
-REPO_LOCAL_CODE_LINE_PATTERN = re.compile(
-    r"(?m)^\s*(?:def |class |from |import |\w+\s*=\s*|if __name__ == ['\"]__main__['\"]:|function\s+\w+|\w+\([^)]*\)\s*\{)"
-)
-REPO_LOCAL_INTENT_PHRASES = (
-    "function",
-    "class",
-    "file",
-    "config",
-    "implementation",
-    "what does",
-    "where is",
-    "defined",
-    "函数",
-    "类",
-    "文件",
-    "配置",
-    "实现",
-    "作用",
-    "调用点",
-    "在哪定义",
-)
-REPO_LOCAL_EVIDENCE_TOOL_NAMES = {"read_file", "grep", "glob", "list_files"}
 REQUEST_REWRITE_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompt" / "request_rewrite.md"
 REQUEST_REWRITE_MAX_NEW_TOKENS = 600
-REQUEST_REWRITE_MAX_CHAR_MULTIPLIER = 4
+REQUEST_REWRITE_MAX_CHAR_MULTIPLIER = 8
 COMPLETION_TAG_PATTERN = re.compile(r"<completion>\s*([0-9]{1,3})\s*</completion>", re.I)
 
 __all__ = ["Pico", "SessionStore"]
@@ -826,101 +801,6 @@ class Pico:
         if reporter is None or not message:
             return
         reporter(message)
-
-    @staticmethod
-    def _ordered_unique(items, limit=None):
-        ordered = []
-        seen = set()
-        for item in items:
-            value = str(item or "").strip()
-            if not value:
-                continue
-            lowered = value.lower()
-            if lowered in seen:
-                continue
-            seen.add(lowered)
-            ordered.append(value)
-            if limit is not None and len(ordered) >= int(limit):
-                break
-        return ordered
-
-    @staticmethod
-    def _extract_repo_local_target_tokens(user_message, limit=5):
-        text = str(user_message or "")
-        tokens = []
-        tokens.extend(re.findall(r"`([^`]+)`", text))
-        tokens.extend(REPO_LOCAL_PATH_PATTERN.findall(text))
-        tokens.extend(REPO_LOCAL_IDENTIFIER_PATTERN.findall(text))
-        return Pico._ordered_unique(tokens, limit=limit)
-
-    @staticmethod
-    def _looks_like_repo_local_question(user_message):
-        text = str(user_message or "")
-        lowered = text.lower()
-        targets = Pico._extract_repo_local_target_tokens(text, limit=5)
-        has_intent = any(phrase in lowered for phrase in REPO_LOCAL_INTENT_PHRASES) or any(
-            phrase in text for phrase in REPO_LOCAL_INTENT_PHRASES if not phrase.isascii()
-        )
-        return bool(targets and has_intent), targets
-
-    @staticmethod
-    def _message_contains_repo_evidence(user_message):
-        text = str(user_message or "")
-        if REPO_LOCAL_FENCED_CODE_PATTERN.search(text):
-            return True
-        if text.count("\n") >= 2 and REPO_LOCAL_CODE_LINE_PATTERN.search(text):
-            return True
-        return False
-
-    @staticmethod
-    def _token_matches_value(token, value):
-        token_text = str(token or "").strip()
-        value_text = str(value or "").strip()
-        if not token_text or not value_text:
-            return False
-        token_lower = token_text.lower()
-        value_lower = value_text.lower()
-        if token_lower in value_lower:
-            return True
-        if ("/" in token_text or "\\" in token_text or "." in token_text) and Path(token_text).name.lower() in value_lower:
-            return True
-        return False
-
-    def has_repo_evidence(self, user_message):
-        looks_local, targets = self._looks_like_repo_local_question(user_message)
-        if not looks_local:
-            return True, {"targets": [], "source": "not_repo_local_question"}
-        if self._message_contains_repo_evidence(user_message):
-            return True, {"targets": targets, "source": "user_message"}
-
-        history = list(self.session.get("history", []))
-        for item in history:
-            if item.get("role") != "tool":
-                continue
-            name = str(item.get("name", "")).strip()
-            if name not in REPO_LOCAL_EVIDENCE_TOOL_NAMES:
-                continue
-            args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
-            metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
-            searchable_values = [
-                args.get("path", ""),
-                item.get("summary", ""),
-                metadata.get("archive_summary", ""),
-                item.get("content", ""),
-            ]
-            if any(self._token_matches_value(token, value) for token in targets for value in searchable_values):
-                return True, {"targets": targets, "source": f"history:{name}"}
-        return False, {"targets": targets, "source": "none"}
-
-    @staticmethod
-    def repo_evidence_retry_notice(targets):
-        target_text = ", ".join(str(target) for target in list(targets or [])[:5]) or "the requested repository detail"
-        return (
-            "Runtime notice: current repository evidence is not enough to answer this implementation-detail question yet. "
-            f"Inspect the relevant code for {target_text} before ending as <final>. "
-            "Use grep, glob, or read_file as needed. "
-            "If the user already pasted the needed code, you may answer directly and briefly mention that source."
-        )
 
     def shell_env(self):
         return securitylib.shell_env(allowlist=self.shell_env_allowlist, root=self.root)
