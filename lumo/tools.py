@@ -466,6 +466,8 @@ def _run_rg_command(context, args):
         cwd=context.root,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout_seconds,
     )
     if count_result.returncode not in (0, 1):
@@ -481,6 +483,8 @@ def _run_rg_command(context, args):
             cwd=context.root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_seconds,
         )
         if file_result.returncode not in (0, 1):
@@ -530,6 +534,8 @@ def _run_rg_command(context, args):
         cwd=context.root,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout_seconds,
     )
     if content_result.returncode not in (0, 1):
@@ -950,6 +956,8 @@ def tool_run_shell(context, args):
         shell=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
 
 

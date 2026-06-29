@@ -101,18 +101,6 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         risk = "approval required" if tool["risky"] else "safe"
         tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
     tool_text = "\n".join(tool_lines)
-    examples = "\n".join(
-        [
-            '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-            '<tool>{"name":"glob","args":{"pattern":"**/*.py","path":"lumo"}}</tool>',
-            '<tool>{"name":"grep","args":{"pattern":"binary_search","path":"lumo","output_mode":"content","head_limit":20,"offset":0,"-C":3,"timeout":20}}</tool>',
-            '<tool>{"name":"read_file","args":{"path":"README.md","offset":1,"limit":80}}</tool>',
-            '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-            '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-            '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-            "<final>Done.</final>",
-        ]
-    )
     lumo_instructions = _load_lumo_instructions(workspace)
 
 
@@ -127,12 +115,14 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         - Use tools instead of guessing about the workspace.
         - Use Read before editing files you have not seen.
         - Prefer small, targeted edits.
-        - Return exactly one <tool>...</tool> or one <final>...</final>.
+        - Every response must include exactly one <completion>0-100</completion> tag, where the score represents how complete the current user request or instruction is overall.
+        - Return at most one primary action: either one <tool>...</tool> or one plain answer.
         - Tool calls must look like:
           <tool>{{"name":"tool_name","args":{{...}}}}</tool>
         - For write_file and patch_file with multi-line text, prefer XML style:
           <tool name="write_file" path="file.py"><content>...</content></tool>
-        - Only return <final>your answer</final> when the user's goal is actually satisfied; otherwise do not return a <final> tag yet.
+        - Judge completion against the current request and transcript. If the task is not actually complete yet, keep working and give a lower completion score.
+        - When you are not calling a tool, write the answer directly as plain text after the completion tag.
         - Never invent tool results.
         - Keep answers concise and concrete.
         - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
@@ -152,9 +142,6 @@ def build_prompt_prefix(workspace, tools, built_at=None):
 
         Tools:
         {tool_text}
-
-        Valid response examples:
-        {examples}
 
         {workspace.text()}
         """

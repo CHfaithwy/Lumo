@@ -83,6 +83,7 @@ REPO_LOCAL_EVIDENCE_TOOL_NAMES = {"read_file", "grep", "glob", "list_files"}
 REQUEST_REWRITE_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompt" / "request_rewrite.md"
 REQUEST_REWRITE_MAX_NEW_TOKENS = 600
 REQUEST_REWRITE_MAX_CHAR_MULTIPLIER = 4
+COMPLETION_TAG_PATTERN = re.compile(r"<completion>\s*([0-9]{1,3})\s*</completion>", re.I)
 
 __all__ = ["Pico", "SessionStore"]
 
@@ -155,6 +156,7 @@ class Pico:
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
         self.last_user_request_rewrite = {}
+        self.last_completion_score = 0
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -1273,6 +1275,7 @@ class Pico:
             "resume_status": task_state.resume_status,
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
+            "last_completion_score": int(getattr(self, "last_completion_score", 0) or 0),
             "durable_promotions": list(self.last_durable_promotions),
             "durable_superseded": list(self.last_durable_superseded),
             "redacted_env": self.detected_secret_env_summary(),
@@ -1427,6 +1430,7 @@ class Pico:
         进入平台控制流的第一道结构化关口。
         """
         raw = str(raw)
+        completion_score = Pico.extract_completion_score(raw)
 
 
 
@@ -1435,38 +1439,41 @@ class Pico:
             try:
                 payload = json.loads(body)
             except Exception:
-                return "retry", Pico.retry_payload("model returned malformed tool JSON", raw)
+                return "retry", Pico.retry_payload("model returned malformed tool JSON", raw, completion_score)
             if not isinstance(payload, dict):
-                return "retry", Pico.retry_payload("tool payload must be a JSON object", raw)
+                return "retry", Pico.retry_payload("tool payload must be a JSON object", raw, completion_score)
             if not str(payload.get("name", "")).strip():
-                return "retry", Pico.retry_payload("tool payload is missing a tool name", raw)
+                return "retry", Pico.retry_payload("tool payload is missing a tool name", raw, completion_score)
             args = payload.get("args", {})
             if args is None:
                 payload["args"] = {}
             elif not isinstance(args, dict):
-                return "retry", Pico.retry_payload(raw_text=raw)
+                return "retry", Pico.retry_payload(raw_text=raw, completion_score=completion_score)
+            payload["completion_score"] = completion_score
             return "tool", payload
         if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
             payload = Pico.parse_xml_tool(raw)
             if payload is not None:
+                payload["completion_score"] = completion_score
                 return "tool", payload
-            return "retry", Pico.retry_payload(raw_text=raw)
-        if "<final>" in raw:
-            final = Pico.extract(raw, "final").strip()
-            if final:
-                return "final", final
-            return "retry", Pico.retry_payload("model returned an empty <final> answer", raw)
+            return "retry", Pico.retry_payload(raw_text=raw, completion_score=completion_score)
+        answer_text = Pico.extract_answer_text(raw)
+        if answer_text:
+            return "answer", {"text": answer_text, "completion_score": completion_score, "raw_text": raw.strip()}
+        if completion_score is not None:
+            return "retry", Pico.retry_payload("model returned only a completion score without a usable tool call or answer", raw, completion_score)
         raw = raw.strip()
         if raw:
-            return "retry", Pico.retry_payload("model returned text without a <final> tag", raw)
-        return "retry", Pico.retry_payload("model returned an empty response", "")
+            return "retry", Pico.retry_payload("model returned text without a usable tool call or answer", raw, completion_score)
+        return "retry", Pico.retry_payload("model returned an empty response", "", completion_score)
 
     @staticmethod
-    def retry_payload(problem=None, raw_text=""):
+    def retry_payload(problem=None, raw_text="", completion_score=None):
         return {
             "notice": Pico.retry_notice(problem),
             "problem": str(problem or "").strip(),
             "raw_text": str(raw_text or "").strip(),
+            "completion_score": completion_score if completion_score is None else int(completion_score),
         }
 
     @staticmethod
@@ -1477,9 +1484,38 @@ class Pico:
         else:
             prefix += ": model returned malformed tool output"
         return (
-            f"{prefix}. Reply with a valid <tool> call or a non-empty <final> answer. "
+            f"{prefix}. Reply with exactly one <completion>0-100</completion> tag and either a valid <tool> call or a usable answer. "
             'For multi-line files, prefer <tool name="write_file" path="file.py"><content>...</content></tool>.'
         )
+
+    @staticmethod
+    def extract_completion_score(text):
+        match = COMPLETION_TAG_PATTERN.search(str(text or ""))
+        if not match:
+            return None
+        try:
+            score = int(match.group(1))
+        except Exception:
+            return None
+        if 0 <= score <= 100:
+            return score
+        return None
+
+    @staticmethod
+    def strip_completion_tags(text):
+        return COMPLETION_TAG_PATTERN.sub("", str(text or ""))
+
+    @staticmethod
+    def extract_answer_text(text):
+        raw = str(text or "")
+        if "<final>" in raw:
+            final = Pico.extract(raw, "final").strip()
+            if final:
+                return Pico.strip_completion_tags(final).strip()
+            return ""
+        stripped = Pico.strip_completion_tags(raw).strip()
+        stripped = re.sub(r"<tool(?P<attrs>[^>]*)>.*?</tool>", "", stripped, flags=re.S).strip()
+        return stripped
 
     @staticmethod
     def parse_xml_tool(raw):

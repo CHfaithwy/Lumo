@@ -18,12 +18,12 @@ class AgentLoop:
             [
                 prompt,
                 "Runtime fallback:",
-                "You have already produced two consecutive responses that were neither a valid <tool> call nor a valid <final> answer.",
+                "The completion-driven loop decided to stop normal planning because progress is no longer improving reliably.",
                 "Stop using tools and write the best direct reply to the user now using only the evidence already available in this prompt.",
                 "Respond in the user's language. Be concise and concrete.",
                 "If the evidence is sufficient, answer directly.",
                 "If the evidence is insufficient, clearly state what can already be concluded and what remains uncertain.",
-                "Return plain answer text only. Do not use <tool> tags. Do not use <final> tags.",
+                "Return plain answer text only. Do not use <tool> tags, <final> tags, or <completion> tags.",
             ]
         )
         return await self._complete_model_async(prompt=fallback_prompt)
@@ -35,8 +35,8 @@ class AgentLoop:
         if "<final>" in raw:
             final = self.agent.extract(raw, "final").strip()
             if final:
-                return final
-        return raw
+                return self.agent.strip_completion_tags(final).strip()
+        return self.agent.strip_completion_tags(raw).strip()
 
     def run(self, user_message):
         try:
@@ -115,6 +115,9 @@ class AgentLoop:
         early_final_guard_used = False
         consecutive_retry_without_progress = 0
         forced_summary_used = False
+        last_completion_score = None
+        previous_scored_completion = None
+        missing_completion_streak = 0
 
         while tool_steps < agent.max_steps and attempts < max_attempts:
             attempts += 1
@@ -199,11 +202,23 @@ class AgentLoop:
             agent.last_completion_metadata = completion_metadata
             agent.last_prompt_metadata = prompt_metadata
             kind, payload = agent.parse(raw)
+            current_completion_score = None
+            if isinstance(payload, dict):
+                current_completion_score = payload.get("completion_score")
+            if current_completion_score is not None:
+                current_completion_score = int(current_completion_score)
+                agent.last_completion_score = current_completion_score
+                missing_completion_streak = 0
+            else:
+                missing_completion_streak += 1
             agent.emit_trace(
                 task_state,
                 "model_parsed",
                 {
                     "kind": kind,
+                    "previous_completion_score": previous_scored_completion,
+                    "current_completion_score": current_completion_score,
+                    "missing_completion_streak": missing_completion_streak,
                     "completion_metadata": completion_metadata,
                     "duration_ms": int((time.monotonic() - model_started_at) * 1000),
                 },
@@ -246,6 +261,9 @@ class AgentLoop:
                         **dict(tool_result.metadata or {}),
                     },
                 )
+                if current_completion_score is not None:
+                    last_completion_score = current_completion_score
+                    previous_scored_completion = current_completion_score
                 checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="tool_executed")
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
@@ -271,6 +289,9 @@ class AgentLoop:
                             "attempts": attempts,
                             "tool_steps": tool_steps,
                             "reason": "two_consecutive_non_tool_non_final_responses",
+                            "previous_completion_score": previous_scored_completion,
+                            "current_completion_score": current_completion_score,
+                            "missing_completion_streak": missing_completion_streak,
                         },
                     )
                     fallback_started_at = time.monotonic()
@@ -314,16 +335,19 @@ class AgentLoop:
                 agent.run_store.write_task_state(task_state)
                 continue
 
-            final = (payload or raw).strip()
+            answer_payload = payload if isinstance(payload, dict) else {"text": str(payload or "").strip(), "completion_score": current_completion_score, "raw_text": raw}
+            answer_text = str(answer_payload.get("text", "")).strip()
             consecutive_retry_without_progress = 0
             looks_repo_local, repo_targets = agent._looks_like_repo_local_question(original_user_message)
             has_repo_evidence, repo_evidence_details = agent.has_repo_evidence(original_user_message)
             if (
-                kind == "final"
+                kind == "answer"
                 and tool_steps == 0
                 and not early_final_guard_used
                 and looks_repo_local
                 and not has_repo_evidence
+                and current_completion_score is not None
+                and current_completion_score >= 90
             ):
                 retry_notice = agent.repo_evidence_retry_notice(repo_targets or repo_evidence_details.get("targets", []))
                 early_final_guard_used = True
@@ -333,14 +357,94 @@ class AgentLoop:
                     task_state,
                     "early_final_soft_retry",
                     {
-                        "candidate_final": clip(final, 300),
+                        "candidate_final": clip(answer_text, 300),
                         "targets": list(repo_targets or repo_evidence_details.get("targets", [])),
                         "repo_evidence_source": repo_evidence_details.get("source", ""),
                         "tool_steps": tool_steps,
                         "attempts": attempts,
+                        "current_completion_score": current_completion_score,
                     },
                 )
+                if current_completion_score is not None:
+                    last_completion_score = current_completion_score
+                    previous_scored_completion = current_completion_score
                 continue
+
+            stop_reason = ""
+            if current_completion_score is not None:
+                if previous_scored_completion is not None and current_completion_score < previous_scored_completion:
+                    stop_reason = "completion_score_declined"
+                elif previous_scored_completion is not None and current_completion_score == previous_scored_completion:
+                    stop_reason = "completion_score_unchanged"
+                elif current_completion_score >= 90:
+                    stop_reason = "completion_score_threshold"
+            elif missing_completion_streak >= 2:
+                stop_reason = "completion_score_missing_twice"
+
+            if current_completion_score is not None:
+                last_completion_score = current_completion_score
+                previous_scored_completion = current_completion_score
+
+            if not stop_reason:
+                if answer_text:
+                    agent.report_assistant_message(answer_text)
+                    agent.record_history_item({"role": "assistant", "content": answer_text, "created_at": now()})
+                agent.run_store.write_task_state(task_state)
+                continue
+
+            if stop_reason in {"completion_score_declined", "completion_score_unchanged", "completion_score_missing_twice"} and not forced_summary_used:
+                forced_summary_used = True
+                agent.emit_trace(
+                    task_state,
+                    "forced_summary_requested",
+                    {
+                        "attempts": attempts,
+                        "tool_steps": tool_steps,
+                        "reason": stop_reason,
+                        "previous_completion_score": last_completion_score,
+                        "current_completion_score": current_completion_score,
+                        "missing_completion_streak": missing_completion_streak,
+                    },
+                )
+                fallback_started_at = time.monotonic()
+                fallback_raw = await self._force_summary_reply_async(prompt)
+                fallback_final = self._coerce_fallback_final(fallback_raw)
+                agent.record({"role": "assistant", "content": fallback_final, "created_at": now()})
+                task_state.finish_success(fallback_final)
+                checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="forced_summary")
+                agent.run_store.write_task_state(task_state)
+                agent.emit_trace(
+                    task_state,
+                    "checkpoint_created",
+                    {
+                        "checkpoint_id": checkpoint["checkpoint_id"],
+                        "trigger": "forced_summary",
+                    },
+                )
+                agent.emit_trace(
+                    task_state,
+                    "forced_summary_finished",
+                    {
+                        "reason": stop_reason,
+                        "duration_ms": int((time.monotonic() - fallback_started_at) * 1000),
+                        "final_answer": fallback_final,
+                    },
+                )
+                agent.emit_trace(
+                    task_state,
+                    "run_finished",
+                    {
+                        "status": task_state.status,
+                        "stop_reason": task_state.stop_reason,
+                        "final_answer": fallback_final,
+                        "completion_stop_reason": stop_reason,
+                        "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
+                    },
+                )
+                agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
+                return fallback_final
+
+            final = answer_text or self._coerce_fallback_final(raw)
             agent.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
             checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="run_finished")
@@ -360,6 +464,8 @@ class AgentLoop:
                     "status": task_state.status,
                     "stop_reason": task_state.stop_reason,
                     "final_answer": final,
+                    "completion_stop_reason": stop_reason,
+                    "current_completion_score": current_completion_score,
                     "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
                 },
             )

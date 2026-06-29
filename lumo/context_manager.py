@@ -165,6 +165,16 @@ class ContextManager:
 
     def _current_request_prefix(self):
         return (
+            "Progress:\n"
+            f"- Current task completion score: {int(getattr(self.agent, 'last_completion_score', 0) or 0)}\n"
+            "- Every response must include exactly one <completion>{score}</completion> tag with an integer score from 0 to 100.\n"
+            "- Judge completion against the Current user request and the Transcript, and keep working if the task is not actually complete.\n"
+            "- If the user asked to fully read, fully inspect, or completely review a file, and the Transcript still shows unread file content remains, do not output a high completion score yet.\n\n"
+            "- Score guide:\n"
+            "  - 0-25: You have barely started, have very limited evidence, or are still identifying what to inspect.\n"
+            "  - 25-50: You have some useful evidence, but large parts of the user's request are still unresolved.\n"
+            "  - 50-90: You have substantial partial coverage, but important reading, verification, or explanation is still missing.\n"
+            "  - 90-100: Only use this range when the current tool results and transcript are already sufficient to support all of the user's requirements. If anything important is still missing, do not output a score in this range.\n\n"
             "Current user request:\n"
             "Before answering, check whether the accumulated durable memory helps you interpret the user's intent or project context.\n"
         )
