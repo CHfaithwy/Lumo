@@ -14,6 +14,13 @@ from datetime import datetime
 from pathlib import Path
 
 from . import checkpoint as checkpointlib
+from .background_tasks import (
+    BackgroundTaskManager,
+    format_task_list_text,
+    format_task_output_text,
+    format_task_start_text,
+    format_task_stop_text,
+)
 from .features import memory as memorylib
 from . import security as securitylib
 from .context_manager import ContextManager, _context_units
@@ -23,7 +30,7 @@ from .run_store import RunStore
 from .security import REDACTED_VALUE
 from .session_store import SessionStore
 from .tool_context import ToolContext
-from .tool_executor import ToolExecutor
+from .tool_executor import ToolExecutor, ToolExecutionResult
 from . import tools as toolkit
 from .workspace import AGENT_STATE_DIR, IGNORED_PATH_NAMES, WorkspaceContext, clip, now
 
@@ -102,6 +109,7 @@ class Pico:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / AGENT_STATE_DIR / "runs")
+        self.background_tasks = BackgroundTaskManager(self.run_store, self.root)
         self.assistant_message_reporter = assistant_message_reporter
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
@@ -607,7 +615,7 @@ class Pico:
                 else:
                     summary = self._history_item_summary(item)
                     lines.append(summary or str(item["content"]))
-                    if latest_tool_reminders.get(item["name"]) == index:
+                    if latest_tool_reminders.get(self._tool_reminder_key(item)) == index:
                         reminder = self._history_item_tool_reminder(item)
                         if reminder:
                             lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
@@ -635,13 +643,26 @@ class Pico:
         for index, item in enumerate(history):
             if item.get("role") != "tool":
                 continue
-            name = str(item.get("name", "")).strip()
-            if name not in {"read_file", "grep"}:
+            key = Pico._tool_reminder_key(item)
+            if key is None:
                 continue
             metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
             if str(metadata.get("tool_reminder", "")).strip():
-                latest[name] = index
+                latest[key] = index
         return latest
+
+    @staticmethod
+    def _tool_reminder_key(item):
+        name = str(item.get("name", "")).strip()
+        if name in {"read_file", "grep"}:
+            return (name,)
+        if name == "task_output":
+            args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
+            task_id = str(args.get("task_id", "")).strip()
+            stream = str(args.get("stream", "stdout")).strip() or "stdout"
+            if task_id:
+                return (name, task_id, stream)
+        return None
 
     @staticmethod
     def _history_read_key(item):
@@ -699,6 +720,163 @@ class Pico:
             return False
         current = memorylib.file_freshness(path_key, self.root)
         return expected != current
+
+    def prompt_visible_history(self):
+        return self.context_manager._prompt_history()
+
+    @staticmethod
+    def _merge_line_ranges(ranges):
+        ordered = sorted(
+            (
+                (int(start), int(end), bool(has_more), int(known_line_floor))
+                for start, end, has_more, known_line_floor in ranges
+                if int(start) >= 1 and int(end) >= int(start)
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        merged = []
+        for start, end, has_more, known_line_floor in ordered:
+            if not merged or start > merged[-1][1] + 1:
+                merged.append([start, end, has_more, known_line_floor])
+                continue
+            merged[-1][1] = max(merged[-1][1], end)
+            merged[-1][2] = merged[-1][2] or has_more
+            merged[-1][3] = max(merged[-1][3], known_line_floor)
+        return [tuple(item) for item in merged]
+
+    def _prompt_visible_read_coverage(self, path):
+        target_path = self.path(path)
+        path_key = self._history_path_key({"args": {"path": str(target_path)}})
+        current_freshness = memorylib.file_freshness(path_key, self.root)
+        history = self.prompt_visible_history()
+        ranges = []
+        for item in history:
+            if item.get("role") != "tool" or item.get("name") != "read_file":
+                continue
+            if self._history_path_key(item) != path_key:
+                continue
+            metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+            if str(metadata.get("freshness", "")).strip() != current_freshness:
+                continue
+            read_window = metadata.get("read_window", {}) if isinstance(metadata.get("read_window", {}), dict) else {}
+            start_line = int(read_window.get("start_line", 0) or 0)
+            end_line = int(read_window.get("end_line", 0) or 0)
+            if start_line < 1 or end_line < start_line:
+                continue
+            ranges.append(
+                (
+                    start_line,
+                    end_line,
+                    bool(read_window.get("has_more")),
+                    int(read_window.get("known_line_floor", end_line) or end_line),
+                )
+            )
+        merged = self._merge_line_ranges(ranges)
+        fully_read = bool(merged) and len(merged) == 1 and merged[0][0] == 1 and not merged[0][2]
+        return {
+            "path": target_path.relative_to(self.root).as_posix(),
+            "path_key": path_key,
+            "freshness": current_freshness,
+            "ranges": merged,
+            "fully_read": fully_read,
+        }
+
+    @staticmethod
+    def _first_unread_after_overlap(ranges, start_line):
+        candidate = int(start_line)
+        changed = True
+        while changed:
+            changed = False
+            for covered_start, covered_end, _has_more, _known_line_floor in ranges:
+                if covered_start <= candidate <= covered_end:
+                    candidate = covered_end + 1
+                    changed = True
+        return candidate
+
+    def auto_continue_read_file_args(self, args):
+        args = dict(args or {})
+        path = str(args.get("path", "")).strip()
+        if not path:
+            return {"status": "noop", "args": args}
+        offset, limit = toolkit._read_window_args(args)
+        coverage = self._prompt_visible_read_coverage(path)
+        if not coverage["ranges"]:
+            return {"status": "noop", "args": args, "coverage": coverage}
+        next_offset = self._first_unread_after_overlap(coverage["ranges"], offset)
+        if next_offset == offset:
+            return {"status": "noop", "args": args, "coverage": coverage}
+        if coverage["fully_read"]:
+            return {
+                "status": "fully_read",
+                "args": args,
+                "coverage": coverage,
+                "requested_offset": offset,
+                "effective_offset": next_offset,
+                "limit": limit,
+            }
+        rewritten = dict(args)
+        rewritten["offset"] = next_offset
+        rewritten["limit"] = limit
+        rewritten.pop("start", None)
+        rewritten.pop("end", None)
+        return {
+            "status": "continued",
+            "args": rewritten,
+            "coverage": coverage,
+            "requested_offset": offset,
+            "effective_offset": next_offset,
+            "limit": limit,
+        }
+
+    def synthetic_fully_read_result(self, path, requested_offset, limit, coverage):
+        relative_path = coverage.get("path") or self.path(path).relative_to(self.root).as_posix()
+        ranges = coverage.get("ranges", [])
+        covered_until = max((item[1] for item in ranges), default=max(int(requested_offset) - 1, 0))
+        freshness = str(coverage.get("freshness", "")).strip()
+        content = "\n".join(
+            [
+                f"# {relative_path}",
+                f"# already fully read through line {covered_until}",
+                (
+                    f"<tool_reminder>{relative_path} has already been fully read in the current prompt-visible transcript "
+                    f"through line {covered_until}. Requested reread from line {requested_offset} with limit {limit} was skipped.</tool_reminder>"
+                ),
+                (
+                    f"<summary-for-history>{relative_path} was already fully read in the visible transcript; "
+                    f"skipped duplicate reread request from line {requested_offset}.</summary-for-history>"
+                ),
+            ]
+        )
+        metadata = {
+            "tool_status": "ok",
+            "tool_error_code": "",
+            "security_event_type": "",
+            "risk_level": "low",
+            "read_only": True,
+            "affected_paths": [],
+            "workspace_changed": False,
+            "diff_summary": [],
+            "workspace_fingerprint": self.workspace.fingerprint(),
+            "archive_summary": (
+                f"{relative_path} was already fully read in the visible transcript; "
+                f"skipped duplicate reread request from line {requested_offset}."
+            ),
+            "tool_reminder": (
+                f"{relative_path} has already been fully read in the current prompt-visible transcript through line {covered_until}. "
+                f"Requested reread from line {requested_offset} with limit {limit} was skipped."
+            ),
+            "read_window": {
+                "start_line": int(requested_offset),
+                "end_line": int(covered_until),
+                "known_line_floor": int(covered_until),
+                "returned_lines": 0,
+                "requested_lines": int(limit),
+                "has_more": False,
+            },
+            "freshness": freshness,
+            "auto_read_handling": "fully_read_skip",
+        }
+        return ToolExecutionResult(content=content, metadata=metadata)
 
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name), False))
@@ -785,7 +963,7 @@ class Pico:
     def tool_call_summary(self, name, args):
         args = args if isinstance(args, dict) else {}
         redacted_args = self.redact_artifact(args)
-        if name in {"write_file", "patch_file", "run_shell", "delegate"}:
+        if name in {"write_file", "patch_file", "run_shell", "run_shell_bg", "task_stop", "delegate"}:
             return self.redact_text(self.approval_summary(name, redacted_args))
         return json.dumps(redacted_args, ensure_ascii=False, sort_keys=True)
 
@@ -1124,6 +1302,8 @@ class Pico:
         return self.execute_tool(name, args).content
 
     def repeated_tool_call(self, name, args):
+        if name == "task_output":
+            return False
 
 
         tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
@@ -1137,12 +1317,15 @@ class Pico:
         return "task_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     @staticmethod
+    def new_background_task_id():
+        return "task_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "_" + uuid.uuid4().hex[:6]
+
+    @staticmethod
     def new_run_id():
         return "run_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     def build_report(self, task_state):
-
-
+        background_tasks = self.background_tasks.summarize_run_tasks(task_state.run_id, limit=8)
         return {
             "run_id": task_state.run_id,
             "task_id": task_state.task_id,
@@ -1158,6 +1341,23 @@ class Pico:
             "last_completion_score": int(getattr(self, "last_completion_score", 0) or 0),
             "durable_promotions": list(self.last_durable_promotions),
             "durable_superseded": list(self.last_durable_superseded),
+            "background_tasks": {
+                "total": int(background_tasks.get("total", 0)),
+                "counts": dict(background_tasks.get("counts", {})),
+                "recent": [
+                    {
+                        "task_id": item.task_id,
+                        "status": item.status,
+                        "return_code": item.return_code,
+                        "pid": item.pid,
+                        "started_at": item.started_at,
+                        "finished_at": item.finished_at,
+                        "timeout": item.timeout,
+                        "command": clip(item.command, 160),
+                    }
+                    for item in background_tasks.get("recent", [])
+                ],
+            },
             "redacted_env": self.detected_secret_env_summary(),
         }
 
@@ -1176,6 +1376,11 @@ class Pico:
             depth=self.depth,
             max_depth=self.max_depth,
             spawn_delegate=self.spawn_delegate,
+            background_task_starter=self.start_background_task,
+            background_task_reader=self.read_background_task,
+            background_task_stopper=self.stop_background_task,
+            background_task_lister=self.list_background_tasks,
+            background_task_lookup=self.find_background_task,
         )
 
     def spawn_delegate(self, args):
@@ -1226,6 +1431,112 @@ class Pico:
     def tool_run_shell(self, args):
         return toolkit.tool_run_shell(self.tool_context(), args)
 
+    def _background_task_run_id(self):
+        if getattr(self, "current_task_state", None) is not None:
+            return self.current_task_state.run_id
+        if getattr(self, "current_run_dir", None) is not None:
+            return Path(self.current_run_dir).name
+        run_id = self.new_run_id()
+        self.run_store.run_dir(run_id).mkdir(parents=True, exist_ok=True)
+        return run_id
+
+    def start_background_task(self, args):
+        command = str(args.get("command", "")).strip()
+        timeout = int(args.get("timeout", 3600))
+        task_id = self.new_background_task_id()
+        record = self.background_tasks.start(
+            run_id=self._background_task_run_id(),
+            task_id=task_id,
+            command=command,
+            cwd=self.root,
+            env=self.shell_env(),
+            timeout=timeout,
+        )
+        return format_task_start_text(record)
+
+    def read_background_task(self, args):
+        output_data = self.background_tasks.read_output(
+            task_id=args.get("task_id", ""),
+            offset=int(args.get("offset", 0)),
+            limit=int(args.get("limit", 4000)),
+            stream=str(args.get("stream", "stdout")).strip() or "stdout",
+        )
+        return format_task_output_text(output_data)
+
+    def stop_background_task(self, args):
+        record, stopped = self.background_tasks.stop(args.get("task_id", ""))
+        return format_task_stop_text(record, stopped)
+
+    def list_background_tasks(self, args):
+        listing = self.background_tasks.list_tasks(
+            run_id=self._background_task_run_id(),
+            offset=int(args.get("offset", 0)),
+            limit=int(args.get("limit", 20)),
+            status=str(args.get("status", "all")).strip() or "all",
+        )
+        return format_task_list_text(listing)
+
+    def find_background_task(self, task_id):
+        task_id = str(task_id).strip()
+        if not task_id:
+            return None
+        try:
+            return self.background_tasks.get(task_id).to_dict()
+        except FileNotFoundError:
+            return None
+
+    def tool_run_shell_bg(self, args):
+        return toolkit.tool_run_shell_bg(self.tool_context(), args)
+
+    def tool_task_output(self, args):
+        return toolkit.tool_task_output(self.tool_context(), args)
+
+    def tool_task_stop(self, args):
+        return toolkit.tool_task_stop(self.tool_context(), args)
+
+    def tool_task_list(self, args):
+        return toolkit.tool_task_list(self.tool_context(), args)
+
+    def recent_background_tasks_text(self, limit=3):
+        run_id = self._background_task_run_id()
+        summary = self.background_tasks.summarize_run_tasks(run_id, limit=limit)
+        recent_history = list(self._iter_history_items_for_prompt(self.session.get("history", [])))
+        used_recently = any(
+            isinstance(item, dict)
+            and item.get("role") == "tool"
+            and item.get("name") in {"run_shell_bg", "task_output", "task_stop", "task_list"}
+            for item in recent_history[-6:]
+        )
+        if not used_recently and int(summary.get("counts", {}).get("running", 0)) <= 0:
+            return ""
+        recent = list(summary.get("recent", []))
+        if not recent:
+            return ""
+        lines = ["Recent background tasks:"]
+        for item in recent:
+            return_code = item.return_code if item.return_code is not None else "(running)"
+            stdout_log = self._relative_task_log_path(item.stdout_path)
+            stderr_log = self._relative_task_log_path(item.stderr_path)
+            lines.append(
+                f"- {item.task_id}: status={item.status}, return_code={return_code}, "
+                f"command={clip(item.command, 100)}, stdout_log={stdout_log}, stderr_log={stderr_log}"
+            )
+        lines.append(
+            "If you need the full original log, exact ordering, or details beyond paged task_output, "
+            "use read_file on the corresponding stdout_log or stderr_log path."
+        )
+        return "\n".join(lines)
+
+    def _relative_task_log_path(self, path):
+        path = str(path or "").strip()
+        if not path:
+            return "-"
+        try:
+            relative = Path(path).resolve().relative_to(self.root.resolve())
+            return relative.as_posix()
+        except Exception:
+            return path
+
     def tool_write_file(self, args):
         return toolkit.tool_write_file(self.tool_context(), args)
 
@@ -1274,6 +1585,13 @@ class Pico:
             command = self._approval_preview(args.get("command", ""), 120)
             timeout = args.get("timeout", 20)
             return f"command={json.dumps(command, ensure_ascii=False)}; timeout={timeout}"
+        if name == "run_shell_bg":
+            command = self._approval_preview(args.get("command", ""), 120)
+            timeout = args.get("timeout", 3600)
+            return f"command={json.dumps(command, ensure_ascii=False)}; background=true; timeout={timeout}"
+        if name == "task_stop":
+            task_id = str(args.get("task_id", "")).strip()
+            return f"task_id={json.dumps(task_id, ensure_ascii=False)}"
         if name == "delegate":
             task = self._approval_preview(args.get("task", ""), 120)
             return f"task={json.dumps(task, ensure_ascii=False)}; max_steps={args.get('max_steps', 3)}; inherit_context={args.get('inherit_context', True)}"

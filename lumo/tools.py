@@ -21,6 +21,14 @@ GLOB_MAX_RESULTS = 200
 GREP_DEFAULT_HEAD_LIMIT = 200
 GREP_OUTPUT_MODES = {"content", "files", "count"}
 GREP_TIMEOUT_SECONDS = 20
+RUN_SHELL_BG_DEFAULT_TIMEOUT = 3600
+RUN_SHELL_BG_MAX_TIMEOUT = 86400
+TASK_OUTPUT_DEFAULT_LIMIT = 4000
+TASK_OUTPUT_MAX_LIMIT = 20000
+TASK_OUTPUT_STREAMS = {"stdout", "stderr", "both"}
+TASK_LIST_DEFAULT_LIMIT = 20
+TASK_LIST_MAX_LIMIT = 100
+TASK_LIST_STATUSES = {"all", "running", "exited", "failed", "stopped"}
 
 BASE_TOOL_SPECS = {
     "list_files": {
@@ -71,7 +79,49 @@ BASE_TOOL_SPECS = {
     "run_shell": {
         "schema": {"command": "str", "timeout": "int=20"},
         "risky": True,
-        "description": "Run a shell command in the repo root.",
+        "description": (
+            "Run a short foreground shell command in the repo root and use the result immediately in the current turn. "
+            "Prefer this for quick inspection, git, one-shot scripts, short tests, and short lint commands that should finish soon."
+        ),
+    },
+    "run_shell_bg": {
+        "schema": {"command": "str", "timeout": f"int={RUN_SHELL_BG_DEFAULT_TIMEOUT}"},
+        "risky": True,
+        "description": (
+            "Start a long-running background shell command and return a task_id for later inspection. "
+            "Prefer this for full test suites, builds, servers, benchmarks, watch mode, and other commands that may take a while. "
+            "Use task_output to inspect progress later and task_stop if you need to stop it."
+        ),
+    },
+    "task_output": {
+        "schema": {
+            "task_id": "str",
+            "offset": "int=0",
+            "limit": f"int={TASK_OUTPUT_DEFAULT_LIMIT}",
+            "stream": "str='stdout'",
+        },
+        "risky": False,
+        "description": (
+            "Read paginated stdout or stderr from a background shell task started by run_shell_bg. "
+            "Use this only after you already have a task_id, and use next_offset to continue without replaying the same page."
+        ),
+    },
+    "task_list": {
+        "schema": {
+            "offset": "int=0",
+            "limit": f"int={TASK_LIST_DEFAULT_LIMIT}",
+            "status": "str='all'",
+        },
+        "risky": False,
+        "description": (
+            "List current-run background tasks started by run_shell_bg. "
+            "Use this to discover recent task_id values before calling task_output or task_stop."
+        ),
+    },
+    "task_stop": {
+        "schema": {"task_id": "str"},
+        "risky": True,
+        "description": "Stop a background shell task by task_id. Use this only for tasks previously started with run_shell_bg.",
     },
     "write_file": {
         "schema": {"path": "str", "content": "str"},
@@ -105,6 +155,10 @@ TOOL_EXAMPLES = {
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","offset":1,"limit":80}}</tool>',
     "grep": '<tool>{"name":"grep","args":{"pattern":"binary_search","path":"lumo","output_mode":"content","head_limit":20,"offset":0,"-C":3,"timeout":20}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
+    "run_shell_bg": '<tool>{"name":"run_shell_bg","args":{"command":"uv run pytest -q","timeout":3600}}</tool>',
+    "task_output": '<tool>{"name":"task_output","args":{"task_id":"task_20260630-120000_ab12cd","offset":0,"limit":4000,"stream":"stdout"}}</tool>',
+    "task_list": '<tool>{"name":"task_list","args":{"offset":0,"limit":20,"status":"all"}}</tool>',
+    "task_stop": '<tool>{"name":"task_stop","args":{"task_id":"task_20260630-120000_ab12cd"}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3,"inherit_context":true}}</tool>',
@@ -244,6 +298,47 @@ def _grep_timeout_seconds(args):
         raise ValueError("timeout must be >= 1")
     if value > 120:
         raise ValueError("timeout must be <= 120")
+    return value
+
+
+def _run_shell_bg_timeout(args):
+    value = int(args.get("timeout", RUN_SHELL_BG_DEFAULT_TIMEOUT))
+    if value < 1:
+        raise ValueError("timeout must be >= 1")
+    if value > RUN_SHELL_BG_MAX_TIMEOUT:
+        raise ValueError(f"timeout must be <= {RUN_SHELL_BG_MAX_TIMEOUT}")
+    return value
+
+
+def _task_output_limit(args):
+    value = int(args.get("limit", TASK_OUTPUT_DEFAULT_LIMIT))
+    if value < 1:
+        raise ValueError("limit must be >= 1")
+    if value > TASK_OUTPUT_MAX_LIMIT:
+        raise ValueError(f"limit must be <= {TASK_OUTPUT_MAX_LIMIT}")
+    return value
+
+
+def _task_output_stream(args):
+    value = str(args.get("stream", "stdout")).strip().lower() or "stdout"
+    if value not in TASK_OUTPUT_STREAMS:
+        raise ValueError(f"stream must be one of: {', '.join(sorted(TASK_OUTPUT_STREAMS))}")
+    return value
+
+
+def _task_list_limit(args):
+    value = int(args.get("limit", TASK_LIST_DEFAULT_LIMIT))
+    if value < 1:
+        raise ValueError("limit must be >= 1")
+    if value > TASK_LIST_MAX_LIMIT:
+        raise ValueError(f"limit must be <= {TASK_LIST_MAX_LIMIT}")
+    return value
+
+
+def _task_list_status(args):
+    value = str(args.get("status", "all")).strip().lower() or "all"
+    if value not in TASK_LIST_STATUSES:
+        raise ValueError(f"status must be one of: {', '.join(sorted(TASK_LIST_STATUSES))}")
     return value
 
 
@@ -793,6 +888,38 @@ def validate_tool(context, name, args):
             raise ValueError("timeout must be in [1, 120]")
         return
 
+    if name == "run_shell_bg":
+        command = str(args.get("command", "")).strip()
+        if not command:
+            raise ValueError("command must not be empty")
+        _run_shell_bg_timeout(args)
+        return
+
+    if name == "task_output":
+        task_id = str(args.get("task_id", "")).strip()
+        if not task_id:
+            raise ValueError("task_id must not be empty")
+        if context.find_background_task(task_id) is None:
+            raise ValueError("task_id does not exist")
+        _grep_offset(args)
+        _task_output_limit(args)
+        _task_output_stream(args)
+        return
+
+    if name == "task_list":
+        _grep_offset(args)
+        _task_list_limit(args)
+        _task_list_status(args)
+        return
+
+    if name == "task_stop":
+        task_id = str(args.get("task_id", "")).strip()
+        if not task_id:
+            raise ValueError("task_id must not be empty")
+        if context.find_background_task(task_id) is None:
+            raise ValueError("task_id does not exist")
+        return
+
     if name == "write_file":
         path = context.path(args["path"])
         if path.exists() and path.is_dir():
@@ -974,6 +1101,22 @@ def tool_run_shell(context, args):
     ).strip()
 
 
+def tool_run_shell_bg(context, args):
+    return context.start_background_task(args)
+
+
+def tool_task_output(context, args):
+    return context.read_background_task(args)
+
+
+def tool_task_list(context, args):
+    return context.list_background_tasks(args)
+
+
+def tool_task_stop(context, args):
+    return context.stop_background_task(args)
+
+
 def tool_write_file(context, args):
     path = context.path(args["path"])
     content = str(args["content"])
@@ -1015,6 +1158,10 @@ _TOOL_RUNNERS = {
     "read_file": tool_read_file,
     "grep": tool_grep,
     "run_shell": tool_run_shell,
+    "run_shell_bg": tool_run_shell_bg,
+    "task_output": tool_task_output,
+    "task_list": tool_task_list,
+    "task_stop": tool_task_stop,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
 }

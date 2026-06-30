@@ -11,6 +11,9 @@ TOOL_REMINDER_PATTERN = re.compile(r"<tool_reminder>(.*?)</tool_reminder>", re.D
 READ_FILE_HEADER_PATTERN = re.compile(
     r"# lines\s+(\d+)-(\d+)\s+of at least\s+(\d+)\s+\(returned\s+(\d+),\s+requested\s+(\d+)\)"
 )
+BACKGROUND_TASK_ID_PATTERN = re.compile(r"^task_id:\s*(.+)$", re.MULTILINE)
+BACKGROUND_TASK_STATUS_PATTERN = re.compile(r"^status:\s*(.+)$", re.MULTILINE)
+BACKGROUND_TASK_RETURN_CODE_PATTERN = re.compile(r"^return_code:\s*(.+)$", re.MULTILINE)
 TOOL_HINT_LINE_PATTERNS = (SUMMARY_FOR_HISTORY_PATTERN, TOOL_REMINDER_PATTERN)
 
 
@@ -34,6 +37,9 @@ def _metadata(
     tool_reminder="",
     read_window=None,
     freshness=None,
+    background_task_id="",
+    background_task_status="",
+    background_task_return_code=None,
 ):
     result = {
         "tool_status": tool_status,
@@ -55,6 +61,12 @@ def _metadata(
         result["read_window"] = dict(read_window)
     if freshness:
         result["freshness"] = str(freshness)
+    if background_task_id:
+        result["background_task_id"] = str(background_task_id)
+    if background_task_status:
+        result["background_task_status"] = str(background_task_status)
+    if background_task_return_code is not None:
+        result["background_task_return_code"] = background_task_return_code
     return result
 
 
@@ -120,6 +132,33 @@ def _extract_read_window(content):
         has_more = int(next_offset.group(1)) > int(header.group(1)) and int(header.group(4)) >= requested_lines
     result["has_more"] = has_more
     return result
+
+
+def _extract_background_task_id(content):
+    match = BACKGROUND_TASK_ID_PATTERN.search(str(content))
+    if not match:
+        return ""
+    return str(match.group(1)).strip()
+
+
+def _extract_background_task_status(content):
+    match = BACKGROUND_TASK_STATUS_PATTERN.search(str(content))
+    if not match:
+        return ""
+    return str(match.group(1)).strip()
+
+
+def _extract_background_task_return_code(content):
+    match = BACKGROUND_TASK_RETURN_CODE_PATTERN.search(str(content))
+    if not match:
+        return None
+    value = str(match.group(1)).strip()
+    if value in {"", "(running)", "(none)"}:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return value
 
 
 class ToolExecutor:
@@ -216,7 +255,7 @@ class ToolExecutor:
         after_snapshot = before_snapshot
         try:
             raw_content = tool["run"](args)
-            content = str(raw_content) if name == "read_file" else clip(raw_content)
+            content = str(raw_content) if name in {"read_file", "task_output"} else clip(raw_content)
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
@@ -235,6 +274,9 @@ class ToolExecutor:
             tool_reminder = _extract_tool_reminder(content)
             read_window = _extract_read_window(content) if name == "read_file" else {}
             freshness = memorylib.file_freshness(args.get("path", ""), agent.root) if name == "read_file" else None
+            background_task_id = _extract_background_task_id(content) if name in {"run_shell_bg", "task_output", "task_stop"} else ""
+            background_task_status = _extract_background_task_status(content) if name in {"run_shell_bg", "task_output", "task_stop"} else ""
+            background_task_return_code = _extract_background_task_return_code(content) if name in {"task_output", "task_stop"} else None
             metadata = _metadata(
                 tool_status,
                 tool_error_code=tool_error_code,
@@ -248,6 +290,9 @@ class ToolExecutor:
                 tool_reminder=tool_reminder,
                 read_window=read_window,
                 freshness=freshness,
+                background_task_id=background_task_id,
+                background_task_status=background_task_status,
+                background_task_return_code=background_task_return_code,
             )
             agent.update_memory_after_tool(name, args, content, metadata=metadata)
             agent.record_process_note_for_tool(name, metadata)

@@ -167,14 +167,6 @@ class ContextManager:
         return (
             "Progress:\n"
             f"- Current task completion score: {int(getattr(self.agent, 'last_completion_score', 0) or 0)}\n"
-            "- Every response must include exactly one <completion>{score}</completion> tag with an integer score from 0 to 100.\n"
-            "- Judge completion against the Current user request and the Transcript, and keep working if the task is not actually complete.\n"
-            "- If the user asked to fully read, fully inspect, or completely review a file, and the Transcript still shows unread file content remains, do not output a high completion score yet.\n\n"
-            "- Score guide:\n"
-            "  - 0-25: You have barely started, have very limited evidence, or are still identifying what to inspect.\n"
-            "  - 25-50: You have some useful evidence, but large parts of the user's request are still unresolved.\n"
-            "  - 50-95: You have substantial partial coverage, but important reading, verification, or explanation is still missing.\n"
-            "  - 95-100: Only use this range when the current tool results and transcript are already sufficient to support all of the user's requirements. If anything important is still missing, do not output a score in this range.\n\n"
             "Current user request:\n"
             "Before answering, check whether the accumulated durable memory helps you interpret the user's intent or project context.\n"
         )
@@ -250,6 +242,9 @@ class ContextManager:
     def _render_sections(self, section_texts):
         history = self._prompt_history()
         history_raw = self._raw_history_text(history)
+        background_task_text = str(getattr(self.agent, "recent_background_tasks_text", lambda: "")() or "").strip()
+        if background_task_text:
+            history_raw = "\n".join([background_task_text, "", history_raw]).strip()
         return {
             "prefix": SectionRender(raw=section_texts["prefix"], budget=None, rendered=section_texts["prefix"], details={}),
             "durable_memory": SectionRender(raw=section_texts["durable_memory"], budget=None, rendered=section_texts["durable_memory"], details={}),
@@ -518,13 +513,28 @@ class ContextManager:
         for index, item in enumerate(history):
             if item.get("role") != "tool":
                 continue
-            name = str(item.get("name", "")).strip()
-            if name not in {"read_file", "grep"}:
+            key = ContextManager._tool_reminder_key(item)
+            if key is None:
                 continue
             metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
             if str(metadata.get("tool_reminder", "")).strip():
-                latest[name] = index
+                latest[key] = index
         return latest
+
+    @staticmethod
+    def _tool_reminder_key(item):
+        name = str(item.get("name", "")).strip()
+        if name in {"read_file", "grep"}:
+            return (name,)
+        if name == "task_list":
+            return (name,)
+        if name == "task_output":
+            args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
+            task_id = str(args.get("task_id", "")).strip()
+            stream = str(args.get("stream", "stdout")).strip() or "stdout"
+            if task_id:
+                return (name, task_id, stream)
+        return None
 
     def _raw_history_text(self, history):
         if not history:
@@ -549,18 +559,18 @@ class ContextManager:
                         metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
                         summary = str(metadata.get("archive_summary", "")).strip()
                     lines.append(summary or str(item.get("content", "")))
-                    if latest_tool_reminders.get("read_file") == index:
+                    if latest_tool_reminders.get(self._tool_reminder_key(item)) == index:
                         reminder = self._history_item_tool_reminder(item)
                         if reminder:
                             lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
                 else:
-                    if item.get("name") == "grep":
+                    if item.get("name") in {"grep", "task_output", "task_list", "run_shell_bg", "task_stop"}:
                         summary = str(item.get("summary", "")).strip()
                         if not summary:
                             metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
                             summary = str(metadata.get("archive_summary", "")).strip()
                         lines.append(summary or str(item.get("content", "")))
-                        if latest_tool_reminders.get("grep") == index:
+                        if latest_tool_reminders.get(self._tool_reminder_key(item)) == index:
                             reminder = self._history_item_tool_reminder(item)
                             if reminder:
                                 lines.append(f"<tool_reminder>{reminder}</tool_reminder>")

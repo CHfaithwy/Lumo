@@ -131,9 +131,16 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         - When the user asks about repository-local implementation details such as a function, class, file, config key, or code path, prefer answering from repository evidence instead of guessing.
         - Valid evidence can come from code the user pasted, files already read in this session, transcript summaries, or other repository-local context already in the prompt.
         - When searching for repository evidence, prefer grep in content mode with a small -C window before jumping into full-file reads, so you can inspect the local context around matches.
+        - If the user asked to fully read, fully inspect, or completely review a file, and the transcript still shows unread file content remains, do not output a high completion score yet.
         - New files should be complete and runnable, including obvious imports.
         - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool.
         - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
+
+        Completion scoring:
+        - 0-25: You have barely started, have very limited evidence, or are still identifying what to inspect.
+        - 25-50: You have some useful evidence, but large parts of the user's request are still unresolved.
+        - 50-95: You have substantial partial coverage, but important reading, verification, or explanation is still missing.
+        - 95-100: Only use this range when the current tool results and transcript are already sufficient to support all of the user's requirements. If anything important is still missing, do not output a score in this range.
 
         Language:
         Respond in the same language as the user unless instructed otherwise.

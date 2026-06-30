@@ -228,14 +228,28 @@ class AgentLoop:
                 tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
+                original_args = dict(args) if isinstance(args, dict) else {}
+                auto_read_decision = None
+                if name == "read_file":
+                    auto_read_decision = agent.auto_continue_read_file_args(args)
+                    if auto_read_decision.get("status") == "continued":
+                        args = dict(auto_read_decision.get("args", {}))
                 task_state.record_tool(name)
-                agent.report_tool_call(name, args)
                 tool_started_at = time.monotonic()
-                tool_result = agent.execute_tool(name, args)
+                if name == "read_file" and auto_read_decision and auto_read_decision.get("status") == "fully_read":
+                    tool_result = agent.synthetic_fully_read_result(
+                        path=original_args.get("path", ""),
+                        requested_offset=auto_read_decision.get("requested_offset", 1),
+                        limit=auto_read_decision.get("limit", 1),
+                        coverage=auto_read_decision.get("coverage", {}),
+                    )
+                else:
+                    agent.report_tool_call(name, args)
+                    tool_result = agent.execute_tool(name, args)
                 result = tool_result.content
                 archive_summary = str((tool_result.metadata or {}).get("archive_summary", "")).strip()
                 stored_content = result
-                if name == "read_file" and archive_summary:
+                if name in {"read_file", "run_shell_bg", "task_output", "task_list", "task_stop"} and archive_summary:
                     stored_content = archive_summary
                 tool_record = {
                     "role": "tool",
@@ -255,6 +269,7 @@ class AgentLoop:
                     {
                         "name": name,
                         "args": args,
+                        "requested_args": original_args if name == "read_file" and auto_read_decision else args,
                         "result": clip(result, 500),
                         "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
                         **dict(tool_result.metadata or {}),
