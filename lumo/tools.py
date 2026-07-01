@@ -12,6 +12,7 @@ import textwrap
 import time
 from functools import partial
 
+from . import git_tools as gitlib
 from .workspace import IGNORED_PATH_NAMES
 
 READ_FILE_DEFAULT_LIMIT = 200
@@ -29,6 +30,11 @@ TASK_OUTPUT_STREAMS = {"stdout", "stderr", "both"}
 TASK_LIST_DEFAULT_LIMIT = 20
 TASK_LIST_MAX_LIMIT = 100
 TASK_LIST_STATUSES = {"all", "running", "exited", "failed", "stopped"}
+GIT_STATUS_DEFAULT_LIMIT = gitlib.GIT_STATUS_DEFAULT_LIMIT
+GIT_STATUS_MAX_LIMIT = gitlib.GIT_STATUS_MAX_LIMIT
+GIT_DIFF_DEFAULT_LIMIT = gitlib.GIT_DIFF_DEFAULT_LIMIT
+GIT_DIFF_MAX_LIMIT = gitlib.GIT_DIFF_MAX_LIMIT
+GIT_DIFF_MODES = gitlib.GIT_DIFF_MODES
 
 BASE_TOOL_SPECS = {
     "list_files": {
@@ -74,6 +80,36 @@ BASE_TOOL_SPECS = {
             "When you need code or config context around a match, prefer content mode with a small -C window first, "
             "then follow up with read_file on the best candidate if needed. "
             "If grep times out, treat it as incomplete search rather than proof of no matches."
+        ),
+    },
+    "git_status": {
+        "schema": {
+            "path": "str='.'",
+            "offset": "int=0",
+            "limit": f"int={GIT_STATUS_DEFAULT_LIMIT}",
+        },
+        "risky": False,
+        "description": (
+            "Inspect the current Git working tree to see which files changed. "
+            "Use this after edits to confirm the change scope, detect unexpected files, "
+            "and review staged, unstaged, untracked, or deleted paths before concluding the task. "
+            "Prefer this before git_diff when you first need a lightweight changed-file overview."
+        ),
+    },
+    "git_diff": {
+        "schema": {
+            "path": "str='.'",
+            "mode": "str='workspace'",
+            "offset": "int=1",
+            "limit": f"int={GIT_DIFF_DEFAULT_LIMIT}",
+        },
+        "risky": False,
+        "description": (
+            "Inspect the actual Git patch for the current workspace or a specific path. "
+            "Use mode='workspace' after edits to review the final patch, confirm the exact code changes, "
+            "and prepare a patch candidate for benchmark-style tasks such as SWE-bench Lite. "
+            "Prefer this when the user asks what changed, asks for a diff or patch, or when git_status already told you which files changed. "
+            "If the patch is large, runtime may externalize it to a run artifact path; then use read_file on that path to inspect the full raw patch."
         ),
     },
     "run_shell": {
@@ -126,12 +162,20 @@ BASE_TOOL_SPECS = {
     "write_file": {
         "schema": {"path": "str", "content": "str"},
         "risky": True,
-        "description": "Write a text file.",
+        "description": (
+            "Write a text file. Use this to create a new file or completely overwrite an existing file when a full rewrite is intended. "
+            "Prefer patch_file for small, targeted changes to an existing file."
+        ),
     },
     "patch_file": {
-        "schema": {"path": "str", "old_text": "str", "new_text": "str"},
+        "schema": {"path": "str", "old_text": "str", "new_text": "str", "replace_all": "bool=False"},
         "risky": True,
-        "description": "Replace one exact text block in a file.",
+        "description": (
+            "Replace exact text in an existing file for small, targeted edits. By default old_text must uniquely identify one match. "
+            "Prefer this over write_file when you only need to modify part of an existing file without rewriting the whole file. "
+            "Use replace_all=true to replace all exact matches. If multiple matches exist and replace_all=false, "
+            "provide more surrounding context in old_text to make the target unique."
+        ),
     },
 }
 
@@ -154,13 +198,15 @@ TOOL_EXAMPLES = {
     "glob": '<tool>{"name":"glob","args":{"pattern":"**/*.py","path":"lumo"}}</tool>',
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","offset":1,"limit":80}}</tool>',
     "grep": '<tool>{"name":"grep","args":{"pattern":"binary_search","path":"lumo","output_mode":"content","head_limit":20,"offset":0,"-C":3,"timeout":20}}</tool>',
+    "git_status": '<tool>{"name":"git_status","args":{"path":".","offset":0,"limit":200}}</tool>',
+    "git_diff": '<tool>{"name":"git_diff","args":{"path":".","mode":"workspace","offset":1,"limit":300}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "run_shell_bg": '<tool>{"name":"run_shell_bg","args":{"command":"uv run pytest -q","timeout":3600}}</tool>',
     "task_output": '<tool>{"name":"task_output","args":{"task_id":"task_20260630-120000_ab12cd","offset":0,"limit":4000,"stream":"stdout"}}</tool>',
     "task_list": '<tool>{"name":"task_list","args":{"offset":0,"limit":20,"status":"all"}}</tool>',
     "task_stop": '<tool>{"name":"task_stop","args":{"task_id":"task_20260630-120000_ab12cd"}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-    "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+    "patch_file": '<tool name="patch_file" path="binary_search.py" replace_all="false"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3,"inherit_context":true}}</tool>',
 }
 
@@ -342,6 +388,21 @@ def _task_list_status(args):
     return value
 
 
+def _tool_bool_arg(args, key, default=False):
+    value = args.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n", ""}:
+            return False
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    raise ValueError(f"{key} must be a boolean")
+
+
 def _grep_optional_nonnegative_int(args, key):
     value = args.get(key, None)
     if value in (None, ""):
@@ -518,6 +579,45 @@ def _grep_deadline(timeout_seconds):
 def _check_grep_deadline(deadline, pattern, display_path, timeout_seconds):
     if time.monotonic() >= float(deadline):
         _raise_grep_timeout(pattern, display_path, timeout_seconds)
+
+
+def _git_status_offset(args):
+    offset = int(args.get("offset", 0))
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    return offset
+
+
+def _git_status_limit(args):
+    limit = int(args.get("limit", GIT_STATUS_DEFAULT_LIMIT))
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    if limit > GIT_STATUS_MAX_LIMIT:
+        raise ValueError(f"limit must be <= {GIT_STATUS_MAX_LIMIT}")
+    return limit
+
+
+def _git_diff_mode(args):
+    mode = str(args.get("mode", "workspace")).strip() or "workspace"
+    if mode not in GIT_DIFF_MODES:
+        raise ValueError(f"mode must be one of {', '.join(sorted(GIT_DIFF_MODES))}")
+    return mode
+
+
+def _git_diff_offset(args):
+    offset = int(args.get("offset", 1))
+    if offset < 1:
+        raise ValueError("offset must be >= 1")
+    return offset
+
+
+def _git_diff_limit(args):
+    limit = int(args.get("limit", GIT_DIFF_DEFAULT_LIMIT))
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    if limit > GIT_DIFF_MAX_LIMIT:
+        raise ValueError(f"limit must be <= {GIT_DIFF_MAX_LIMIT}")
+    return limit
 
 
 def _run_rg_command(context, args):
@@ -879,6 +979,21 @@ def validate_tool(context, name, args):
         _grep_optional_nonnegative_int(args, "-C")
         return
 
+    if name == "git_status":
+        context.path(args.get("path", "."))
+        gitlib.ensure_git_repository(context.root)
+        _git_status_offset(args)
+        _git_status_limit(args)
+        return
+
+    if name == "git_diff":
+        context.path(args.get("path", "."))
+        gitlib.ensure_git_repository(context.root)
+        _git_diff_mode(args)
+        _git_diff_offset(args)
+        _git_diff_limit(args)
+        return
+
     if name == "run_shell":
         command = str(args.get("command", "")).strip()
         if not command:
@@ -939,10 +1054,16 @@ def validate_tool(context, name, args):
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
+        replace_all = _tool_bool_arg(args, "replace_all", False)
         text = path.read_text(encoding="utf-8")
         count = text.count(old_text)
-        if count != 1:
-            raise ValueError(f"old_text must occur exactly once, found {count}")
+        if count == 0:
+            raise ValueError(f"old_text not found in file.\nString: {old_text}")
+        if count > 1 and not replace_all:
+            raise ValueError(
+                f"Found {count} matches for old_text, but replace_all is false. "
+                "Set replace_all=true to replace all occurrences, or provide more surrounding context in old_text to make the target unique."
+            )
         return
 
 
@@ -1070,6 +1191,28 @@ def tool_grep(context, args):
     return _run_grep_fallback(context, args)
 
 
+def tool_git_status(context, args):
+    path = context.path(args.get("path", "."))
+    offset = _git_status_offset(args)
+    limit = _git_status_limit(args)
+    return gitlib.git_status_text(context.root, path, offset=offset, limit=limit)
+
+
+def tool_git_diff(context, args):
+    path = context.path(args.get("path", "."))
+    mode = _git_diff_mode(args)
+    offset = _git_diff_offset(args)
+    limit = _git_diff_limit(args)
+    return gitlib.git_diff_text(
+        context.root,
+        path,
+        mode=mode,
+        offset=offset,
+        limit=limit,
+        artifact_writer=context.write_git_diff_artifact,
+    )
+
+
 def tool_run_shell(context, args):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -1134,11 +1277,22 @@ def tool_patch_file(context, args):
         raise ValueError("old_text must not be empty")
     if "new_text" not in args:
         raise ValueError("missing new_text")
+    replace_all = _tool_bool_arg(args, "replace_all", False)
     text = path.read_text(encoding="utf-8")
     count = text.count(old_text)
-    if count != 1:
-        raise ValueError(f"old_text must occur exactly once, found {count}")
-    path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
+    if count == 0:
+        raise ValueError(f"old_text not found in file.\nString: {old_text}")
+    if count > 1 and not replace_all:
+        raise ValueError(
+            f"Found {count} matches for old_text, but replace_all is false. "
+            "Set replace_all=true to replace all occurrences, or provide more surrounding context in old_text to make the target unique."
+        )
+    updated = (
+        text.replace(old_text, str(args["new_text"]))
+        if replace_all
+        else text.replace(old_text, str(args["new_text"]), 1)
+    )
+    path.write_text(updated, encoding="utf-8")
     return f"patched {path.relative_to(context.root)}"
 
 
@@ -1157,6 +1311,8 @@ _TOOL_RUNNERS = {
     "glob": tool_glob,
     "read_file": tool_read_file,
     "grep": tool_grep,
+    "git_status": tool_git_status,
+    "git_diff": tool_git_diff,
     "run_shell": tool_run_shell,
     "run_shell_bg": tool_run_shell_bg,
     "task_output": tool_task_output,

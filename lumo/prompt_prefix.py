@@ -121,11 +121,17 @@ def build_prompt_prefix(workspace, tools, built_at=None):
           <tool>{{"name":"tool_name","args":{{...}}}}</tool>
         - For write_file and patch_file with multi-line text, prefer XML style:
           <tool name="write_file" path="file.py"><content>...</content></tool>
+        - Use write_file to create a new file or intentionally replace the full contents of a file.
+        - Use patch_file for small, targeted edits to an existing file when you can anchor the change with exact old_text.
         - Judge completion against the current request and transcript. If the task is not actually complete yet, keep working and give a lower completion score.
         - When you are not calling a tool, write the answer directly as plain text after the completion tag.
         - Never invent tool results.
         - Keep answers concise and concrete.
         - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
+        - After modifying files, prefer git_status first to confirm the changed file scope, then use git_diff to inspect the resulting patch before deciding the task is complete.
+        - If the task involved code changes, do not give a very high completion score until the visible transcript is already sufficient to support the final changed-file scope and the actual patch, unless the user explicitly asked you not to verify changes.
+        - If the user asks what changed, asks for a patch or diff, or the task is benchmark-style and patch-oriented, prefer git_diff directly.
+        - If git_status shows unexpected files or git_diff shows unexpected edits, keep working instead of concluding the task is complete.
         - Before writing tests for existing code, read the implementation first.
         - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
         - When the user asks about repository-local implementation details such as a function, class, file, config key, or code path, prefer answering from repository evidence instead of guessing.

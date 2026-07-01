@@ -18,6 +18,7 @@ class ToolContext:
     background_task_stopper: Callable[[dict], str]
     background_task_lister: Callable[[dict], str]
     background_task_lookup: Callable[[str], dict | None]
+    git_diff_artifact_writer: Callable[[str], str] | None = None
 
     def path(self, raw_path):
         return self.path_resolver(str(raw_path))
@@ -39,3 +40,8 @@ class ToolContext:
 
     def find_background_task(self, task_id):
         return self.background_task_lookup(str(task_id))
+
+    def write_git_diff_artifact(self, content):
+        if self.git_diff_artifact_writer is None:
+            return ""
+        return str(self.git_diff_artifact_writer(str(content)))

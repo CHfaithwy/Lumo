@@ -104,6 +104,26 @@ def _extract_tool_hint_region(content):
     return "\n".join(suffix)
 
 
+def strip_tool_hints(content):
+    text = str(content)
+    lines = text.splitlines()
+    end = len(lines)
+    saw_hint = False
+    while end > 0:
+        stripped = lines[end - 1].strip()
+        if not stripped:
+            if saw_hint:
+                end -= 1
+                continue
+            break
+        if any(pattern.fullmatch(stripped) for pattern in TOOL_HINT_LINE_PATTERNS):
+            saw_hint = True
+            end -= 1
+            continue
+        break
+    return "\n".join(lines[:end]).rstrip()
+
+
 def _extract_read_window(content):
     text = str(content)
     header = READ_FILE_HEADER_PATTERN.search(text)
@@ -255,7 +275,7 @@ class ToolExecutor:
         after_snapshot = before_snapshot
         try:
             raw_content = tool["run"](args)
-            content = str(raw_content) if name in {"read_file", "task_output"} else clip(raw_content)
+            content = str(raw_content) if name in {"read_file", "task_output", "git_status", "git_diff"} else clip(raw_content)
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)

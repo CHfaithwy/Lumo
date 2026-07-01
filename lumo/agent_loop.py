@@ -6,6 +6,7 @@ import time
 
 from .checkpoint import CHECKPOINT_NONE_STATUS, CHECKPOINT_PARTIAL_STALE_STATUS, CHECKPOINT_WORKSPACE_MISMATCH_STATUS
 from .task_state import TaskState
+from .tool_executor import strip_tool_hints
 from .workspace import clip, now
 
 
@@ -251,6 +252,8 @@ class AgentLoop:
                 stored_content = result
                 if name in {"read_file", "run_shell_bg", "task_output", "task_list", "task_stop"} and archive_summary:
                     stored_content = archive_summary
+                elif name in {"git_status", "git_diff"}:
+                    stored_content = strip_tool_hints(result)
                 tool_record = {
                     "role": "tool",
                     "name": name,

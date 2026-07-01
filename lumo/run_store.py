@@ -38,6 +38,9 @@ class RunStore:
     def task_dir(self, run_id):
         return self.run_dir(run_id) / "tasks"
 
+    def latest_git_diff_path(self, run_id):
+        return self.run_dir(run_id) / "latest_git_diff.patch"
+
     def background_task_meta_path(self, run_id, task_id):
         return self.task_dir(run_id) / f"{str(task_id)}.json"
 
@@ -81,6 +84,12 @@ class RunStore:
         path = self.prompt_path(task_state, index)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(prompt), encoding="utf-8")
+        return path
+
+    def write_latest_git_diff(self, run_id, content):
+        path = self.latest_git_diff_path(run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(content), encoding="utf-8")
         return path
 
     def load_task_state(self, task_id):

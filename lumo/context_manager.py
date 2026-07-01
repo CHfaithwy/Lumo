@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .features import memory as memorylib
+from .tool_executor import strip_tool_hints
 from .workspace import AGENT_STATE_DIR, now
 
 
@@ -508,6 +509,10 @@ class ContextManager:
         return str(metadata.get("tool_reminder", "")).strip()
 
     @staticmethod
+    def _history_item_display_content(item):
+        return strip_tool_hints(item.get("content", ""))
+
+    @staticmethod
     def _latest_tool_reminder_indexes(history):
         latest = {}
         for index, item in enumerate(history):
@@ -524,8 +529,13 @@ class ContextManager:
     @staticmethod
     def _tool_reminder_key(item):
         name = str(item.get("name", "")).strip()
-        if name in {"read_file", "grep"}:
+        if name in {"read_file", "grep", "git_status"}:
             return (name,)
+        if name == "git_diff":
+            args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
+            path = str(args.get("path", ".")).strip() or "."
+            mode = str(args.get("mode", "workspace")).strip() or "workspace"
+            return (name, path, mode)
         if name == "task_list":
             return (name,)
         if name == "task_output":
@@ -564,7 +574,13 @@ class ContextManager:
                         if reminder:
                             lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
                 else:
-                    if item.get("name") in {"grep", "task_output", "task_list", "run_shell_bg", "task_stop"}:
+                    if item.get("name") in {"git_status", "git_diff"}:
+                        lines.append(self._history_item_display_content(item))
+                        if latest_tool_reminders.get(self._tool_reminder_key(item)) == index:
+                            reminder = self._history_item_tool_reminder(item)
+                            if reminder:
+                                lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
+                    elif item.get("name") in {"grep", "task_output", "task_list", "run_shell_bg", "task_stop"}:
                         summary = str(item.get("summary", "")).strip()
                         if not summary:
                             metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}

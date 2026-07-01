@@ -30,7 +30,7 @@ from .run_store import RunStore
 from .security import REDACTED_VALUE
 from .session_store import SessionStore
 from .tool_context import ToolContext
-from .tool_executor import ToolExecutor, ToolExecutionResult
+from .tool_executor import ToolExecutor, ToolExecutionResult, strip_tool_hints
 from . import tools as toolkit
 from .workspace import AGENT_STATE_DIR, IGNORED_PATH_NAMES, WorkspaceContext, clip, now
 
@@ -613,8 +613,11 @@ class Pico:
                 if index in stale_read_indexes:
                     lines.append(STALE_READ_MESSAGE)
                 else:
-                    summary = self._history_item_summary(item)
-                    lines.append(summary or str(item["content"]))
+                    if item["name"] in {"git_status", "git_diff"}:
+                        lines.append(self._history_item_display_content(item))
+                    else:
+                        summary = self._history_item_summary(item)
+                        lines.append(summary or str(item["content"]))
                     if latest_tool_reminders.get(self._tool_reminder_key(item)) == index:
                         reminder = self._history_item_tool_reminder(item)
                         if reminder:
@@ -638,6 +641,10 @@ class Pico:
         return str(metadata.get("tool_reminder", "")).strip()
 
     @staticmethod
+    def _history_item_display_content(item):
+        return strip_tool_hints(item.get("content", ""))
+
+    @staticmethod
     def _latest_tool_reminder_indexes(history):
         latest = {}
         for index, item in enumerate(history):
@@ -654,8 +661,13 @@ class Pico:
     @staticmethod
     def _tool_reminder_key(item):
         name = str(item.get("name", "")).strip()
-        if name in {"read_file", "grep"}:
+        if name in {"read_file", "grep", "git_status"}:
             return (name,)
+        if name == "git_diff":
+            args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
+            path = str(args.get("path", ".")).strip() or "."
+            mode = str(args.get("mode", "workspace")).strip() or "workspace"
+            return (name, path, mode)
         if name == "task_output":
             args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
             task_id = str(args.get("task_id", "")).strip()
@@ -1361,6 +1373,15 @@ class Pico:
             "redacted_env": self.detected_secret_env_summary(),
         }
 
+    def write_git_diff_artifact(self, content):
+        if self.current_task_state is None:
+            return ""
+        path = self.run_store.write_latest_git_diff(self.current_task_state.run_id, content)
+        try:
+            return path.resolve().relative_to(self.root.resolve()).as_posix()
+        except Exception:
+            return str(path)
+
     def tool_example(self, name):
         return toolkit.tool_example(name)
 
@@ -1381,6 +1402,7 @@ class Pico:
             background_task_stopper=self.stop_background_task,
             background_task_lister=self.list_background_tasks,
             background_task_lookup=self.find_background_task,
+            git_diff_artifact_writer=self.write_git_diff_artifact,
         )
 
     def spawn_delegate(self, args):
@@ -1427,6 +1449,12 @@ class Pico:
 
     def tool_grep(self, args):
         return toolkit.tool_grep(self.tool_context(), args)
+
+    def tool_git_status(self, args):
+        return toolkit.tool_git_status(self.tool_context(), args)
+
+    def tool_git_diff(self, args):
+        return toolkit.tool_git_diff(self.tool_context(), args)
 
     def tool_run_shell(self, args):
         return toolkit.tool_run_shell(self.tool_context(), args)
@@ -1560,6 +1588,7 @@ class Pico:
         if name == "patch_file":
             old_text = str(args.get("old_text", ""))
             new_text = str(args.get("new_text", ""))
+            replace_all = args.get("replace_all", False)
             anchor = self._approval_preview(old_text, 70) or "<empty old_text>"
             if old_text and new_text.endswith(old_text):
                 inserted = new_text[: -len(old_text)]
@@ -1573,6 +1602,7 @@ class Pico:
                 action = "replace one exact matched block"
             return (
                 f"path={path or '-'}; {action}; "
+                f"replace_all={replace_all}; "
                 f"anchor={json.dumps(anchor, ensure_ascii=False)}; "
                 f"old={len(old_text.splitlines())} lines/{len(old_text)} chars; "
                 f"new={len(new_text.splitlines())} lines/{len(new_text)} chars"
