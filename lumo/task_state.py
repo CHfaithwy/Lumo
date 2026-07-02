@@ -32,7 +32,13 @@ class TaskState:
     status: str = STATUS_RUNNING
     tool_steps: int = 0
     attempts: int = 0
+    logical_steps: int = 0
+    raw_tool_calls: int = 0
+    raw_attempts: int = 0
     last_tool: str = ""
+    last_progress_chain: str = ""
+    last_progress_cursor: str = ""
+    last_stall_reason: str = ""
     stop_reason: str = ""
     final_answer: str = ""
     checkpoint_id: str = ""
@@ -53,7 +59,13 @@ class TaskState:
             status=str(data.get("status", STATUS_RUNNING)),
             tool_steps=int(data.get("tool_steps", 0)),
             attempts=int(data.get("attempts", 0)),
+            logical_steps=int(data.get("logical_steps", data.get("tool_steps", 0))),
+            raw_tool_calls=int(data.get("raw_tool_calls", data.get("tool_steps", 0))),
+            raw_attempts=int(data.get("raw_attempts", data.get("attempts", 0))),
             last_tool=str(data.get("last_tool", "")),
+            last_progress_chain=str(data.get("last_progress_chain", "")),
+            last_progress_cursor=str(data.get("last_progress_cursor", "")),
+            last_stall_reason=str(data.get("last_stall_reason", "")),
             stop_reason=str(data.get("stop_reason", "")),
             final_answer=str(data.get("final_answer", "")),
             checkpoint_id=str(data.get("checkpoint_id", "")),
@@ -61,18 +73,31 @@ class TaskState:
         )
 
     def record_attempt(self):
-
         self.attempts += 1
+        self.raw_attempts += 1
         return self
 
-    def record_tool(self, name):
-
-        self.tool_steps += 1
+    def record_raw_tool_call(self, name):
+        self.raw_tool_calls += 1
         self.last_tool = str(name or "")
         return self
 
-    def stop(self, stop_reason, status=STATUS_STOPPED, final_answer=""):
+    def record_logical_step(self, name):
+        self.logical_steps += 1
+        self.tool_steps = self.logical_steps
+        self.last_tool = str(name or "")
+        return self
 
+    def record_tool(self, name):
+        return self.record_logical_step(name)
+
+    def update_progress_state(self, chain="", cursor="", stall_reason=""):
+        self.last_progress_chain = str(chain or "")
+        self.last_progress_cursor = str(cursor or "")
+        self.last_stall_reason = str(stall_reason or "")
+        return self
+
+    def stop(self, stop_reason, status=STATUS_STOPPED, final_answer=""):
         self.status = status
         self.stop_reason = stop_reason
         if final_answer != "":
@@ -102,7 +127,13 @@ class TaskState:
             "status": self.status,
             "tool_steps": self.tool_steps,
             "attempts": self.attempts,
+            "logical_steps": self.logical_steps,
+            "raw_tool_calls": self.raw_tool_calls,
+            "raw_attempts": self.raw_attempts,
             "last_tool": self.last_tool,
+            "last_progress_chain": self.last_progress_chain,
+            "last_progress_cursor": self.last_progress_cursor,
+            "last_stall_reason": self.last_stall_reason,
             "stop_reason": self.stop_reason,
             "final_answer": self.final_answer,
             "checkpoint_id": self.checkpoint_id,

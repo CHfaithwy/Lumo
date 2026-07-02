@@ -15,8 +15,9 @@ from functools import partial
 from . import git_tools as gitlib
 from .workspace import IGNORED_PATH_NAMES
 
-READ_FILE_DEFAULT_LIMIT = 200
 READ_FILE_MAX_LIMIT = 2000
+READ_FILE_DEFAULT_LIMIT = 200
+READ_FILE_DEFAULT_UNSPECIFIED_LIMIT = READ_FILE_MAX_LIMIT
 READ_FILE_ARCHIVE_SUMMARY_LINES = 12
 GLOB_MAX_RESULTS = 200
 GREP_DEFAULT_HEAD_LIMIT = 200
@@ -51,11 +52,13 @@ BASE_TOOL_SPECS = {
         ),
     },
     "read_file": {
-        "schema": {"path": "str", "offset": "int=1", "limit": "int=200"},
+        "schema": {"path": "str", "offset": "int=1", "limit": "int|None=None"},
         "risky": False,
         "description": (
-            "Read a UTF-8 file by line window. Use offset/limit for long files; "
-            'if has_more is true, continue with next_offset or a targeted window like {"offset":8600,"limit":300}. '
+            "Read a UTF-8 file by line window. Use this for whole-file reading, targeted follow-up after grep, raw artifact or log inspection, "
+            "and explicit user requests to read a known file itself. By default, omit limit when read_file is already the right tool so you can read the whole file when it fits within the safe per-read cap. "
+            "Only pass offset/limit when you already know the target range or when continuing from next_offset. "
+            'If has_more is true, continue with next_offset or a targeted window like {"offset":8600,"limit":300}. '
             "After each chunk, summarize the relevant facts before deciding whether to read more."
         ),
     },
@@ -74,10 +77,13 @@ BASE_TOOL_SPECS = {
         },
         "risky": False,
         "description": (
-            "Search file contents with rg or a simple fallback. Use output_mode='files' to list matching files, "
+            "Search file contents with rg or a simple fallback. Use this first when you can name what to search for, "
+            "such as a symbol name, config key, error text, path fragment, function or class name, or an exact quoted phrase from the user. "
+            "Prefer output_mode='content' with a small -C window for the first pass so you can inspect local context before opening full files. "
+            "Use output_mode='files' to list matching files, "
             "output_mode='count' for per-file match counts, glob to narrow file candidates, head_limit+offset to page "
             "results, -A/-B/-C for surrounding lines in content mode, and timeout to bound slow searches. "
-            "When you need code or config context around a match, prefer content mode with a small -C window first, "
+            "When you need deeper code or config context around a match, prefer content mode with a small -C window first, "
             "then follow up with read_file on the best candidate if needed. "
             "If grep times out, treat it as incomplete search rather than proof of no matches."
         ),
@@ -196,8 +202,8 @@ def legal_tool_names():
 TOOL_EXAMPLES = {
     "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
     "glob": '<tool>{"name":"glob","args":{"pattern":"**/*.py","path":"lumo"}}</tool>',
-    "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","offset":1,"limit":80}}</tool>',
     "grep": '<tool>{"name":"grep","args":{"pattern":"binary_search","path":"lumo","output_mode":"content","head_limit":20,"offset":0,"-C":3,"timeout":20}}</tool>',
+    "read_file": '<tool>{"name":"read_file","args":{"path":"README.md"}}</tool>',
     "git_status": '<tool>{"name":"git_status","args":{"path":".","offset":0,"limit":200}}</tool>',
     "git_diff": '<tool>{"name":"git_diff","args":{"path":".","mode":"workspace","offset":1,"limit":300}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
@@ -211,10 +217,11 @@ TOOL_EXAMPLES = {
 }
 
 
-def _read_window_args(args):
-    """Return one-based offset and line limit, accepting legacy start/end."""
+def _read_window_request(args):
+    """Return one-based offset, effective line limit, and whether limit/end was explicit."""
     args = args or {}
     offset = int(args.get("offset", args.get("start", 1)))
+    limit_explicit = "limit" in args or "end" in args
     if "limit" in args:
         limit = int(args.get("limit", READ_FILE_DEFAULT_LIMIT))
     elif "end" in args:
@@ -223,13 +230,19 @@ def _read_window_args(args):
             raise ValueError("invalid line range")
         limit = end - offset + 1
     else:
-        limit = READ_FILE_DEFAULT_LIMIT
+        limit = READ_FILE_DEFAULT_UNSPECIFIED_LIMIT
     if offset < 1:
         raise ValueError("offset must be >= 1")
     if limit < 1:
         raise ValueError("limit must be >= 1")
     if limit > READ_FILE_MAX_LIMIT:
         raise ValueError(f"limit must be <= {READ_FILE_MAX_LIMIT}")
+    return offset, limit, limit_explicit
+
+
+def _read_window_args(args):
+    """Return one-based offset and effective line limit, accepting legacy start/end."""
+    offset, limit, _limit_explicit = _read_window_request(args)
     return offset, limit
 
 
@@ -1144,7 +1157,7 @@ def tool_read_file(context, args):
     path = context.path(args["path"])
     if not path.is_file():
         raise ValueError("path is not a file")
-    offset, limit = _read_window_args(args)
+    offset, limit, _limit_explicit = _read_window_request(args)
     relative_path = path.relative_to(context.root).as_posix()
     window = _read_file_window(path, offset, limit)
     body = "\n".join(window["lines"]) or "(empty)"

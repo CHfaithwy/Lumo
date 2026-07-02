@@ -66,6 +66,14 @@ REQUEST_REWRITE_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompt" / "re
 REQUEST_REWRITE_MAX_NEW_TOKENS = 600
 REQUEST_REWRITE_MAX_CHAR_MULTIPLIER = 8
 COMPLETION_TAG_PATTERN = re.compile(r"<completion>\s*([0-9]{1,3})\s*</completion>", re.I)
+FINAL_TAG_PATTERN = re.compile(r"</?final>", re.I)
+TOOL_BLOCK_PATTERN = re.compile(r"<tool\b[\s\S]*?(?:</tool>|$)", re.I)
+WHITESPACE_PATTERN = re.compile(r"\s+")
+ASSISTANT_TERMINAL_PREVIEW_LIMIT = 120
+ASSISTANT_TERMINAL_FULL_TEXT_PATTERN = re.compile(
+    r"(?i)(\?|\uFF1F|\b(error|failed|failure|blocker|blocked|permission denied|need your input|choose|which option|prefer)\b|错误|失败|报错|需要你|是否|要不要|哪一种|选哪个)"
+)
+FIRST_SENTENCE_PATTERN = re.compile(r"(.+?(?:[。！？!?](?=\s|$)|\.(?=\s|$)))")
 
 __all__ = ["Pico", "SessionStore"]
 
@@ -140,6 +148,7 @@ class Pico:
         self._last_tool_result_metadata = {}
         self.last_user_request_rewrite = {}
         self.last_completion_score = 0
+        self.transient_runtime_requirements = []
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -975,6 +984,8 @@ class Pico:
     def tool_call_summary(self, name, args):
         args = args if isinstance(args, dict) else {}
         redacted_args = self.redact_artifact(args)
+        if name == "read_file":
+            return self._read_file_tool_target_summary(redacted_args)
         if name in {"write_file", "patch_file", "run_shell", "run_shell_bg", "task_stop", "delegate"}:
             return self.redact_text(self.approval_summary(name, redacted_args))
         return json.dumps(redacted_args, ensure_ascii=False, sort_keys=True)
@@ -985,12 +996,210 @@ class Pico:
             return
         reporter(name, self.tool_call_summary(name, args))
 
+    def report_tool_result(self, name, args, metadata, content=""):
+        reporter = getattr(self, "tool_call_reporter", None)
+        if reporter is None:
+            return
+        summary = self.tool_result_summary(name, args, metadata, content=content)
+        summary = self.redact_text(str(summary or "").strip())
+        if not summary:
+            return
+        reporter(name, f"-> {summary}")
+
+    def tool_result_summary(self, name, args, metadata, content=""):
+        args = args if isinstance(args, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if name == "read_file":
+            return self._read_file_tool_result_summary(args, metadata, content=content)
+        return ""
+
+    def _display_tool_path(self, path):
+        raw = str(path or "").strip()
+        if not raw:
+            return ""
+        try:
+            resolved = self.path(raw)
+            return resolved.relative_to(self.root).as_posix()
+        except Exception:
+            return raw.replace("\\", "/").lstrip("./")
+
+    def _read_file_tool_target_summary(self, args):
+        path = self._display_tool_path(args.get("path", ""))
+        return path or json.dumps(args, ensure_ascii=False, sort_keys=True)
+
+    def _read_file_tool_result_summary(self, args, metadata, content=""):
+        if str(metadata.get("tool_status", "")).strip() not in {"", "ok"}:
+            return ""
+        auto_handling = str(metadata.get("auto_read_handling", "")).strip()
+        if auto_handling == "fully_read_skip":
+            return "already fully read, skipped reread"
+
+        normalized_content = str(content or "").strip().lower()
+        if "unchanged since last read" in normalized_content:
+            return "unchanged since last read"
+
+        read_window = metadata.get("read_window", {}) if isinstance(metadata.get("read_window", {}), dict) else {}
+        returned_lines = int(read_window.get("returned_lines", 0) or 0)
+        start_line = int(read_window.get("start_line", args.get("offset", args.get("start", 1)) or 1) or 1)
+        end_line = int(read_window.get("end_line", 0) or 0)
+        has_more = bool(read_window.get("has_more", False))
+        path = self._display_tool_path(args.get("path", ""))
+        if returned_lines > 0 and end_line >= start_line:
+            summary = f"{returned_lines} lines from {path} ({start_line}-{end_line})" if path else f"{returned_lines} lines ({start_line}-{end_line})"
+        elif path:
+            summary = f"0 lines from {path}"
+        else:
+            summary = "0 lines"
+        if has_more:
+            summary += ", more remains"
+        return summary
+
     def report_assistant_message(self, text):
         reporter = getattr(self, "assistant_message_reporter", None)
-        message = self.redact_text(str(text or "").strip())
+        message = self._normalize_assistant_terminal_message(text)
+        message = self.redact_text(message)
         if reporter is None or not message:
             return
+        if not self._should_keep_full_assistant_terminal_message(message):
+            message = self._compact_assistant_terminal_message(message)
+        if not message:
+            return
         reporter(message)
+
+    @staticmethod
+    def _normalize_assistant_terminal_message(text):
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        if "<final>" in value:
+            extracted = Pico.extract_answer_text(value)
+            if extracted:
+                value = extracted
+        value = TOOL_BLOCK_PATTERN.sub(" ", value)
+        value = Pico.strip_completion_tags(value)
+        value = FINAL_TAG_PATTERN.sub(" ", value)
+        value = WHITESPACE_PATTERN.sub(" ", value).strip()
+        return value
+
+    @staticmethod
+    def _compact_assistant_terminal_message(text):
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        sentence_match = FIRST_SENTENCE_PATTERN.match(value)
+        preview = sentence_match.group(1).strip() if sentence_match else value
+        if len(preview) > ASSISTANT_TERMINAL_PREVIEW_LIMIT:
+            return preview[: ASSISTANT_TERMINAL_PREVIEW_LIMIT - 3].rstrip() + "..."
+        return preview
+
+    @staticmethod
+    def _should_keep_full_assistant_terminal_message(text):
+        value = str(text or "").strip()
+        if not value:
+            return False
+        return bool(ASSISTANT_TERMINAL_FULL_TEXT_PATTERN.search(value))
+
+    @staticmethod
+    def _artifact_like_path(path):
+        normalized = str(path or "").strip().replace("\\", "/").lstrip("./")
+        return normalized.endswith(".patch") and "/runs/" in normalized
+
+    def render_obligation_progress_message(self, obligation):
+        if not isinstance(obligation, dict):
+            return ""
+        required_tool = str(obligation.get("required_tool", "")).strip()
+        if not required_tool:
+            return ""
+        args = obligation.get("suggested_args", {})
+        args = args if isinstance(args, dict) else {}
+        reason = str(obligation.get("reason", "")).strip()
+
+        if required_tool == "git_status":
+            path = str(args.get("path", ".")).strip() or "."
+            return f"继续执行：git_status(path={path})" if path != "." else "继续执行：git_status"
+
+        if required_tool == "git_diff":
+            path = str(args.get("path", ".")).strip() or "."
+            mode = str(args.get("mode", "workspace")).strip() or "workspace"
+            details = [f"mode={mode}"]
+            if path != ".":
+                details.append(f"path={path}")
+            return f"继续执行：git_diff({', '.join(details)})"
+
+        if required_tool == "read_file":
+            path = str(args.get("path", "")).strip()
+            offset = args.get("offset")
+            if reason == "git_diff_externalized" or self._artifact_like_path(path):
+                return f"继续核对补丁文件：{path}" if path else "继续核对补丁文件"
+            if path and offset:
+                return f"继续读取：{path}（从第 {offset} 行）"
+            if path:
+                return f"继续读取：{path}"
+            return "继续执行：read_file"
+
+        if required_tool == "task_output":
+            task_id = str(args.get("task_id", "")).strip()
+            if task_id:
+                return f"继续等待后台任务：{task_id}"
+            return "继续执行：task_output"
+
+        if args:
+            summary = self.tool_call_summary(required_tool, args)
+            return f"继续执行：{required_tool} {summary}"
+        return f"继续执行：{required_tool}"
+
+    def report_obligation_progress(self, obligation):
+        reporter = getattr(self, "assistant_message_reporter", None)
+        if reporter is None:
+            return
+        message = self.render_obligation_progress_message(obligation)
+        message = self.redact_text(str(message or "").strip())
+        if not message:
+            return
+        reporter(message)
+
+    def set_transient_runtime_requirements(self, obligations):
+        normalized = []
+        for obligation in list(obligations or []):
+            if not isinstance(obligation, dict):
+                continue
+            normalized.append(
+                {
+                    "key": str(obligation.get("key", "")).strip(),
+                    "source": str(obligation.get("source", "")).strip(),
+                    "reason": str(obligation.get("reason", "")).strip(),
+                    "required_tool": str(obligation.get("required_tool", "")).strip(),
+                    "suggested_args": dict(obligation.get("suggested_args", {}) or {}),
+                    "chain_key": str(obligation.get("chain_key", "")).strip(),
+                    "completion_block_policy": str(obligation.get("completion_block_policy", "")).strip(),
+                    "blocks_completion": bool(obligation.get("blocks_completion", False)),
+                }
+            )
+        self.transient_runtime_requirements = normalized
+
+    def clear_transient_runtime_requirements(self):
+        self.transient_runtime_requirements = []
+
+    def runtime_requirements_text(self):
+        requirements = list(getattr(self, "transient_runtime_requirements", []) or [])
+        if not requirements:
+            return ""
+        lines = [
+            "Runtime requirements:",
+            "Do not conclude the task yet. The following obligations are still unfinished:",
+        ]
+        for obligation in requirements:
+            required_tool = str(obligation.get("required_tool", "")).strip() or "(unknown tool)"
+            reason = str(obligation.get("reason", "")).strip() or "pending_obligation"
+            line = f"- {reason}: call {required_tool}"
+            completion_block_policy = str(obligation.get("completion_block_policy", "")).strip()
+            if completion_block_policy:
+                line += f" [{completion_block_policy}]"
+            suggested_args = obligation.get("suggested_args", {})
+            if suggested_args:
+                line += f" with args {json.dumps(suggested_args, ensure_ascii=False, sort_keys=True)}"
+            lines.append(line)
+        return "\n".join(lines)
 
     def shell_env(self):
         return securitylib.shell_env(allowlist=self.shell_env_allowlist, root=self.root)
@@ -1287,8 +1496,8 @@ class Pico:
 
         return await AgentLoop(self).run_async(user_message)
 
-    def execute_tool(self, name, args):
-        result = self.tool_executor.execute(name, args)
+    def execute_tool(self, name, args, execution_context=None):
+        result = self.tool_executor.execute(name, args, execution_context=execution_context)
         self._last_tool_result_metadata = dict(result.metadata)
         return result
 
@@ -1338,6 +1547,12 @@ class Pico:
 
     def build_report(self, task_state):
         background_tasks = self.background_tasks.summarize_run_tasks(task_state.run_id, limit=8)
+        logical_steps = int(getattr(task_state, "logical_steps", getattr(task_state, "tool_steps", 0)) or 0)
+        raw_tool_calls = int(getattr(task_state, "raw_tool_calls", getattr(task_state, "tool_steps", 0)) or 0)
+        raw_attempts = int(getattr(task_state, "raw_attempts", getattr(task_state, "attempts", 0)) or 0)
+        last_progress_chain = str(getattr(task_state, "last_progress_chain", "") or "")
+        last_progress_cursor = str(getattr(task_state, "last_progress_cursor", "") or "")
+        last_stall_reason = str(getattr(task_state, "last_stall_reason", "") or "")
         return {
             "run_id": task_state.run_id,
             "task_id": task_state.task_id,
@@ -1346,11 +1561,24 @@ class Pico:
             "final_answer": task_state.final_answer,
             "tool_steps": task_state.tool_steps,
             "attempts": task_state.attempts,
+            "logical_steps": logical_steps,
+            "raw_tool_calls": raw_tool_calls,
+            "raw_attempts": raw_attempts,
             "checkpoint_id": task_state.checkpoint_id,
             "resume_status": task_state.resume_status,
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
             "last_completion_score": int(getattr(self, "last_completion_score", 0) or 0),
+            "progress_state": {
+                "logical_steps_used": logical_steps,
+                "raw_tool_calls": raw_tool_calls,
+                "raw_attempts": raw_attempts,
+                "last_progress_chain": last_progress_chain,
+                "last_progress_cursor": last_progress_cursor,
+            },
+            "stall_summary": {
+                "last_stall_reason": last_stall_reason,
+            },
             "durable_promotions": list(self.last_durable_promotions),
             "durable_superseded": list(self.last_durable_superseded),
             "background_tasks": {

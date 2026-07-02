@@ -45,8 +45,9 @@ def aggregate_benchmark_artifact(path):
     rows = list(payload.get("rows", []))
     summary = dict(payload.get("summary", {}))
     task_count = int(summary.get("total_tasks", len(rows) or 0))
-    tool_steps = [int(row.get("tool_steps", 0)) for row in rows]
-    attempts = [int(row.get("attempts", 0)) for row in rows]
+    logical_steps = [int(row.get("logical_steps", row.get("tool_steps", 0))) for row in rows]
+    raw_tool_calls = [int(row.get("raw_tool_calls", row.get("tool_steps", 0))) for row in rows]
+    raw_attempts = [int(row.get("raw_attempts", row.get("attempts", 0))) for row in rows]
     categories = {}
     for row in rows:
         category = str(row.get("category", "")).strip()
@@ -61,8 +62,10 @@ def aggregate_benchmark_artifact(path):
         "within_budget": int(summary.get("within_budget", 0)),
         "verifier_passes": int(summary.get("verifier_passes", 0)),
         "failure_category_counts": dict(summary.get("failure_category_counts", {})),
-        "avg_tool_steps": _safe_mean(tool_steps),
-        "avg_attempts": _safe_mean(attempts),
+        "avg_logical_steps": _safe_mean(logical_steps),
+        "avg_raw_tool_calls": _safe_mean(raw_tool_calls),
+        "avg_attempts": _safe_mean(raw_attempts),
+        "avg_tool_steps": _safe_mean(logical_steps),
         "category_counts": categories,
         "rows": rows,
     }
@@ -120,8 +123,9 @@ def aggregate_run_artifacts(runs_root):
             if event.get("duration_ms") is not None:
                 tool_durations.append(float(event["duration_ms"]))
 
-    tool_steps = [int(report.get("tool_steps", 0)) for report in reports]
-    attempts = [int(report.get("attempts", 0)) for report in reports]
+    logical_steps = [int(report.get("logical_steps", report.get("tool_steps", 0))) for report in reports]
+    raw_tool_calls = [int(report.get("raw_tool_calls", report.get("tool_steps", 0))) for report in reports]
+    raw_attempts = [int(report.get("raw_attempts", report.get("attempts", 0))) for report in reports]
     prompt_chars = [int((report.get("prompt_metadata") or {}).get("prompt_chars", 0)) for report in reports]
     cached_tokens = [int((report.get("prompt_metadata") or {}).get("cached_tokens", 0) or 0) for report in reports]
     cache_hits = [bool((report.get("prompt_metadata") or {}).get("cache_hit")) for report in reports]
@@ -138,8 +142,10 @@ def aggregate_run_artifacts(runs_root):
 
     return {
         "run_count": len(reports) if reports else len(run_dirs),
-        "avg_tool_steps": _safe_mean(tool_steps),
-        "avg_attempts": _safe_mean(attempts),
+        "avg_logical_steps": _safe_mean(logical_steps),
+        "avg_raw_tool_calls": _safe_mean(raw_tool_calls),
+        "avg_attempts": _safe_mean(raw_attempts),
+        "avg_tool_steps": _safe_mean(logical_steps),
         "avg_prompt_chars": _safe_mean(prompt_chars),
         "cache_hit_rate": _safe_ratio(sum(1 for hit in cache_hits if hit), len(cache_hits)),
         "cached_token_ratio": _safe_ratio(sum(cached_tokens), sum(input_tokens)),
@@ -1163,7 +1169,7 @@ def render_resume_metrics_markdown(metrics):
         f"- Fixed benchmark tasks: {benchmark['task_count']}",
         f"- Fixed benchmark pass rate: {benchmark['pass_rate']:.2%}",
         f"- Aggregated runs: {runs['run_count']}",
-        f"- Average tool steps per run: {runs['avg_tool_steps']:.2f}",
+        f"- Average logical steps per run: {runs['avg_logical_steps']:.2f}",
         f"- Average attempts per run: {runs['avg_attempts']:.2f}",
         f"- Cache hit rate: {runs['cache_hit_rate']:.2%}",
         (

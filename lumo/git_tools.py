@@ -133,6 +133,7 @@ def git_diff_text(
                 *header_lines,
                 f"# total patch lines: {total_lines}",
                 f"This git diff is larger than {int(inline_transcript_line_limit)} lines and was written to {artifact_path}.",
+                f"externalized_patch_path: {artifact_path}",
                 f"想知道文件改动请找文件：{artifact_path}",
                 (
                     f"<tool_reminder>This git diff was externalized because it is too large for transcript reuse. "

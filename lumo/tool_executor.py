@@ -14,6 +14,8 @@ READ_FILE_HEADER_PATTERN = re.compile(
 BACKGROUND_TASK_ID_PATTERN = re.compile(r"^task_id:\s*(.+)$", re.MULTILINE)
 BACKGROUND_TASK_STATUS_PATTERN = re.compile(r"^status:\s*(.+)$", re.MULTILINE)
 BACKGROUND_TASK_RETURN_CODE_PATTERN = re.compile(r"^return_code:\s*(.+)$", re.MULTILINE)
+BACKGROUND_TASK_NEXT_OFFSET_PATTERN = re.compile(r"^next_offset:\s*(\d+)\s*$", re.MULTILINE)
+EXTERNALIZED_PATCH_PATH_PATTERN = re.compile(r"^externalized_patch_path:\s*(.+)$", re.MULTILINE)
 TOOL_HINT_LINE_PATTERNS = (SUMMARY_FOR_HISTORY_PATTERN, TOOL_REMINDER_PATTERN)
 
 
@@ -40,6 +42,16 @@ def _metadata(
     background_task_id="",
     background_task_status="",
     background_task_return_code=None,
+    background_task_next_offset=None,
+    externalized_patch_path="",
+    followup_tool="",
+    followup_args=None,
+    followup_reason="",
+    followup_key="",
+    chain_key="",
+    completion_block_policy="",
+    followup_is_blocking=False,
+    blocks_completion=False,
 ):
     result = {
         "tool_status": tool_status,
@@ -50,6 +62,14 @@ def _metadata(
         "affected_paths": list(affected_paths or []),
         "workspace_changed": bool(workspace_changed),
         "diff_summary": list(diff_summary or []),
+        "followup_tool": str(followup_tool or ""),
+        "followup_args": dict(followup_args or {}),
+        "followup_reason": str(followup_reason or ""),
+        "followup_key": str(followup_key or ""),
+        "chain_key": str(chain_key or ""),
+        "completion_block_policy": str(completion_block_policy or ""),
+        "followup_is_blocking": bool(followup_is_blocking),
+        "blocks_completion": bool(blocks_completion),
     }
     if workspace_fingerprint:
         result["workspace_fingerprint"] = workspace_fingerprint
@@ -67,6 +87,10 @@ def _metadata(
         result["background_task_status"] = str(background_task_status)
     if background_task_return_code is not None:
         result["background_task_return_code"] = background_task_return_code
+    if background_task_next_offset is not None:
+        result["background_task_next_offset"] = int(background_task_next_offset)
+    if externalized_patch_path:
+        result["externalized_patch_path"] = str(externalized_patch_path)
     return result
 
 
@@ -142,7 +166,7 @@ def _extract_read_window(content):
         )
     if next_offset:
         result["next_offset"] = int(next_offset.group(1))
-    has_more = bool(TOOL_REMINDER_PATTERN.search(text))
+    has_more = bool(TOOL_REMINDER_PATTERN.search(hint_region))
     if not has_more and header:
         end_line = int(header.group(2))
         known_line_floor = int(header.group(3))
@@ -181,6 +205,111 @@ def _extract_background_task_return_code(content):
         return value
 
 
+def _extract_background_task_next_offset(content):
+    match = BACKGROUND_TASK_NEXT_OFFSET_PATTERN.search(str(content))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _extract_externalized_patch_path(content):
+    match = EXTERNALIZED_PATCH_PATH_PATTERN.search(str(content))
+    if not match:
+        return ""
+    return str(match.group(1)).strip()
+
+
+def _build_followup_metadata(
+    name,
+    args,
+    *,
+    content="",
+    read_window=None,
+    freshness=None,
+    background_task_id="",
+    background_task_status="",
+    execution_context=None,
+):
+    args = args if isinstance(args, dict) else {}
+    read_window = read_window if isinstance(read_window, dict) else {}
+    execution_context = execution_context if isinstance(execution_context, dict) else {}
+    active_obligation = execution_context.get("active_obligation", {}) if isinstance(execution_context.get("active_obligation", {}), dict) else {}
+    active_required_tool = str(active_obligation.get("required_tool", "")).strip()
+    active_chain_key = str(active_obligation.get("chain_key", "")).strip()
+    active_block_policy = str(active_obligation.get("completion_block_policy", "")).strip()
+    if name == "read_file" and read_window.get("has_more"):
+        path = str(args.get("path", "")).strip()
+        next_offset = int(read_window.get("next_offset", 0) or 0)
+        requested_lines = int(read_window.get("requested_lines", args.get("limit", 0) or 0) or 0)
+        if path and next_offset >= 1 and requested_lines >= 1 and freshness:
+            is_blocking = active_required_tool == "read_file" and active_block_policy == "until_eof"
+            return {
+                "followup_tool": "read_file",
+                "followup_args": {
+                    "path": path,
+                    "offset": next_offset,
+                    "limit": requested_lines,
+                },
+                "followup_reason": "read_window_incomplete",
+                "followup_key": f"read_file_continue:{path}:{freshness}",
+                "chain_key": active_chain_key or f"read_file:{path}:{freshness}",
+                "completion_block_policy": "until_eof" if is_blocking else "",
+                "followup_is_blocking": is_blocking,
+                "blocks_completion": is_blocking,
+            }
+    if name == "task_output" and str(background_task_status).strip() == "running":
+        task_id = str(background_task_id or args.get("task_id", "")).strip()
+        stream = str(args.get("stream", "stdout")).strip() or "stdout"
+        limit = int(args.get("limit", 4000) or 4000)
+        next_offset = _extract_background_task_next_offset(content)
+        if task_id:
+            return {
+                "followup_tool": "task_output",
+                "followup_args": {
+                    "task_id": task_id,
+                    "offset": int(next_offset if next_offset is not None else int(args.get("offset", 0) or 0)),
+                    "stream": stream,
+                    "limit": limit,
+                },
+                "followup_reason": "background_task_still_running",
+                "followup_key": f"task_output_wait:{task_id}:{stream}",
+                "chain_key": active_chain_key or f"task_output:{task_id}:{stream}",
+                "completion_block_policy": "until_terminal",
+                "followup_is_blocking": True,
+                "blocks_completion": True,
+            }
+    if name == "git_diff":
+        externalized_path = _extract_externalized_patch_path(content)
+        if externalized_path:
+            return {
+                "followup_tool": "read_file",
+                "followup_args": {
+                    "path": externalized_path,
+                    "offset": 1,
+                },
+                "followup_reason": "git_diff_externalized",
+                "followup_key": f"git_diff_artifact:{externalized_path}",
+                "chain_key": active_chain_key
+                or f"git_diff:{str(args.get('path', '.')).strip()}:{str(args.get('mode', 'workspace')).strip() or 'workspace'}",
+                "completion_block_policy": "until_opened",
+                "followup_is_blocking": True,
+                "blocks_completion": True,
+            }
+    return {
+        "followup_tool": "",
+        "followup_args": {},
+        "followup_reason": "",
+        "followup_key": "",
+        "chain_key": active_chain_key,
+        "completion_block_policy": "",
+        "followup_is_blocking": False,
+        "blocks_completion": False,
+    }
+
+
 class ToolExecutor:
     def __init__(self, agent):
         self.agent = agent
@@ -204,8 +333,9 @@ class ToolExecutor:
     最近两次工具事件如果和当前调用完全一样，直接拒绝:
 
     """
-    def execute(self, name, args):
+    def execute(self, name, args, execution_context=None):
         agent = self.agent
+        execution_context = execution_context if isinstance(execution_context, dict) else {}
         if agent.allowed_tools is not None and name not in agent.allowed_tools:
             return ToolExecutionResult(
                 content=f"error: tool '{name}' is not allowed in this run",
@@ -297,6 +427,18 @@ class ToolExecutor:
             background_task_id = _extract_background_task_id(content) if name in {"run_shell_bg", "task_output", "task_stop"} else ""
             background_task_status = _extract_background_task_status(content) if name in {"run_shell_bg", "task_output", "task_stop"} else ""
             background_task_return_code = _extract_background_task_return_code(content) if name in {"task_output", "task_stop"} else None
+            background_task_next_offset = _extract_background_task_next_offset(content) if name == "task_output" else None
+            externalized_patch_path = _extract_externalized_patch_path(content) if name == "git_diff" else ""
+            followup = _build_followup_metadata(
+                name,
+                args,
+                content=content,
+                read_window=read_window,
+                freshness=freshness,
+                background_task_id=background_task_id,
+                background_task_status=background_task_status,
+                execution_context=execution_context,
+            )
             metadata = _metadata(
                 tool_status,
                 tool_error_code=tool_error_code,
@@ -313,6 +455,16 @@ class ToolExecutor:
                 background_task_id=background_task_id,
                 background_task_status=background_task_status,
                 background_task_return_code=background_task_return_code,
+                background_task_next_offset=background_task_next_offset,
+                externalized_patch_path=externalized_patch_path,
+                followup_tool=followup.get("followup_tool", ""),
+                followup_args=followup.get("followup_args", {}),
+                followup_reason=followup.get("followup_reason", ""),
+                followup_key=followup.get("followup_key", ""),
+                chain_key=followup.get("chain_key", ""),
+                completion_block_policy=followup.get("completion_block_policy", ""),
+                followup_is_blocking=followup.get("followup_is_blocking", False),
+                blocks_completion=followup.get("blocks_completion", False),
             )
             agent.update_memory_after_tool(name, args, content, metadata=metadata)
             agent.record_process_note_for_tool(name, metadata)

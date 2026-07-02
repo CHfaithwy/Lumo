@@ -165,12 +165,20 @@ class ContextManager:
         return prompt, metadata
 
     def _current_request_prefix(self):
-        return (
+        parts = [
             "Progress:\n"
-            f"- Current task completion score: {int(getattr(self.agent, 'last_completion_score', 0) or 0)}\n"
-            "Current user request:\n"
-            "Before answering, check whether the accumulated durable memory helps you interpret the user's intent or project context.\n"
+            f"- Current task completion score: {int(getattr(self.agent, 'last_completion_score', 0) or 0)}"
+        ]
+        runtime_requirements = str(getattr(self.agent, "runtime_requirements_text", lambda: "")() or "").strip()
+        if runtime_requirements:
+            parts.append(runtime_requirements)
+        parts.extend(
+            [
+                "Current user request:",
+                "Before answering, check whether the accumulated durable memory helps you interpret the user's intent or project context.",
+            ]
         )
+        return "\n".join(parts) + "\n"
 
     def _prepare_current_request(self, user_message):
         prefix = self._current_request_prefix()
@@ -597,14 +605,22 @@ class ContextManager:
         return "\n".join(["Transcript:", *lines])
 
     def _assemble_prompt(self, rendered):
-        return "\n\n".join(
-            [
-                rendered["prefix"].rendered,
-                rendered["durable_memory"].rendered,
-                rendered["history"].rendered,
-                rendered[CURRENT_REQUEST_SECTION].rendered,
-            ]
-        ).strip()
+        sections = [
+            self._normalize_prompt_block(rendered["prefix"].rendered),
+            self._normalize_prompt_block(rendered["durable_memory"].rendered),
+            self._normalize_prompt_block(rendered["history"].rendered),
+            self._normalize_prompt_block(rendered[CURRENT_REQUEST_SECTION].rendered),
+        ]
+        return "\n\n".join(section for section in sections if section).strip()
+
+    @staticmethod
+    def _normalize_prompt_block(text):
+        lines = [line.rstrip() for line in str(text).splitlines()]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines)
 
     def _metadata(self, prompt, rendered, user_message, section_texts, compression_metadata):
         section_metadata = {}
@@ -674,4 +690,5 @@ class ContextManager:
                 "rendered_units": _context_units(user_message) if not current_request_externalized else rendered[CURRENT_REQUEST_SECTION].rendered_units,
                 "section_units": rendered[CURRENT_REQUEST_SECTION].rendered_units,
             },
+            "runtime_requirements_count": len(getattr(self.agent, "transient_runtime_requirements", []) or []),
         }

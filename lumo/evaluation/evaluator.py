@@ -531,7 +531,7 @@ class BenchmarkEvaluator:
             text=True,
         )
 
-        within_budget = task_state.tool_steps <= int(task["step_budget"])
+        within_budget = int(task_state.logical_steps or task_state.tool_steps) <= int(task["step_budget"])
         verifier_passed = verifier.returncode == 0
         non_failure_stop_reason = task_state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED
         passed = within_budget and verifier_passed and expected_artifact_exists and non_failure_stop_reason
@@ -571,6 +571,9 @@ class BenchmarkEvaluator:
             "non_failure_stop_reason": non_failure_stop_reason,
             "tool_steps": task_state.tool_steps,
             "attempts": task_state.attempts,
+            "logical_steps": task_state.logical_steps,
+            "raw_tool_calls": task_state.raw_tool_calls,
+            "raw_attempts": task_state.raw_attempts,
             "final_answer": final_answer,
             "stop_reason": task_state.stop_reason,
             "initial_history_empty": initial_history_empty,
