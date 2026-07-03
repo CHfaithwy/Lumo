@@ -10,6 +10,7 @@ import hashlib
 import os
 import re
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
@@ -65,9 +66,11 @@ SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|pass
 REQUEST_REWRITE_TEMPLATE_PATH = Path(__file__).resolve().parent / "prompt" / "request_rewrite.md"
 REQUEST_REWRITE_MAX_NEW_TOKENS = 600
 REQUEST_REWRITE_MAX_CHAR_MULTIPLIER = 8
-COMPLETION_TAG_PATTERN = re.compile(r"<completion>\s*([0-9]{1,3})\s*</completion>", re.I)
 FINAL_TAG_PATTERN = re.compile(r"</?final>", re.I)
 TOOL_BLOCK_PATTERN = re.compile(r"<tool\b[\s\S]*?(?:</tool>|$)", re.I)
+TODO_UPDATE_BLOCK_PATTERN = re.compile(r"<todo_update\b[\s\S]*?</todo_update>", re.I)
+REQUEST_PLAN_BLOCK_PATTERN = re.compile(r"<request_plan\b[\s\S]*?</request_plan>", re.I)
+DISPLAY_BLOCK_PATTERN = re.compile(r"<display\b[\s\S]*?</display>", re.I)
 WHITESPACE_PATTERN = re.compile(r"\s+")
 ASSISTANT_TERMINAL_PREVIEW_LIMIT = 120
 ASSISTANT_TERMINAL_FULL_TEXT_PATTERN = re.compile(
@@ -147,8 +150,12 @@ class Pico:
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
         self.last_user_request_rewrite = {}
-        self.last_completion_score = 0
-        self.transient_runtime_requirements = []
+        self.transient_todo_state = {
+            "rewritten_request": "",
+            "todos": [],
+            "active_todo_id": "",
+            "blocked_todo_id": "",
+        }
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -1054,13 +1061,13 @@ class Pico:
             summary += ", more remains"
         return summary
 
-    def report_assistant_message(self, text):
+    def report_assistant_message(self, text, *, compact=True):
         reporter = getattr(self, "assistant_message_reporter", None)
         message = self._normalize_assistant_terminal_message(text)
         message = self.redact_text(message)
         if reporter is None or not message:
             return
-        if not self._should_keep_full_assistant_terminal_message(message):
+        if compact and not self._should_keep_full_assistant_terminal_message(message):
             message = self._compact_assistant_terminal_message(message)
         if not message:
             return
@@ -1076,7 +1083,9 @@ class Pico:
             if extracted:
                 value = extracted
         value = TOOL_BLOCK_PATTERN.sub(" ", value)
-        value = Pico.strip_completion_tags(value)
+        value = TODO_UPDATE_BLOCK_PATTERN.sub(" ", value)
+        value = REQUEST_PLAN_BLOCK_PATTERN.sub(" ", value)
+        value = DISPLAY_BLOCK_PATTERN.sub(" ", value)
         value = FINAL_TAG_PATTERN.sub(" ", value)
         value = WHITESPACE_PATTERN.sub(" ", value).strip()
         return value
@@ -1098,6 +1107,56 @@ class Pico:
         if not value:
             return False
         return bool(ASSISTANT_TERMINAL_FULL_TEXT_PATTERN.search(value))
+
+    def set_transient_todo_state(self, rewritten_request="", todos=None, active_todo_id="", blocked_todo_id=""):
+        self.transient_todo_state = {
+            "rewritten_request": str(rewritten_request or ""),
+            "todos": list(todos or []),
+            "active_todo_id": str(active_todo_id or ""),
+            "blocked_todo_id": str(blocked_todo_id or ""),
+        }
+
+    def clear_transient_todo_state(self):
+        self.set_transient_todo_state()
+
+    def current_todo_request_text(self):
+        state = dict(getattr(self, "transient_todo_state", {}) or {})
+        rewritten_request = str(state.get("rewritten_request", "")).strip()
+        todos = list(state.get("todos", []) or [])
+        active_todo_id = str(state.get("active_todo_id", "")).strip()
+        if not rewritten_request and not todos:
+            return ""
+        lines = []
+        if rewritten_request:
+            lines.append("Rewritten request:")
+            lines.append(rewritten_request)
+        if todos:
+            done_count = sum(1 for item in todos if str(item.get("status", "")).strip() == "done")
+            lines.append(f"Todo progress: Done {done_count}/{len(todos)}")
+        unfinished_todos = [item for item in todos if str(item.get("status", "")).strip() != "done"]
+        active_todo = None
+        for item in unfinished_todos:
+            if str(item.get("id", "")).strip() == active_todo_id:
+                active_todo = item
+                break
+        if active_todo is not None:
+            lines.append("")
+            lines.append("Current focus todo:")
+            lines.append(f'- [{active_todo_id}] {str(active_todo.get("text", "")).strip()}')
+        remaining_todos = [
+            item for item in unfinished_todos if str(item.get("id", "")).strip() != active_todo_id
+        ]
+        if remaining_todos:
+            lines.append("")
+            lines.append("Remaining todos:")
+            for item in remaining_todos:
+                todo_id = str(item.get("id", "")).strip()
+                todo_text = str(item.get("text", "")).strip()
+                lines.append(f"- [{todo_id}] {todo_text}")
+        blocked_todo_id = str(state.get("blocked_todo_id", "")).strip()
+        if blocked_todo_id:
+            lines.append(f"Blocked todo: {blocked_todo_id}")
+        return "\n".join(lines).strip()
 
     @staticmethod
     def _artifact_like_path(path):
@@ -1148,59 +1207,6 @@ class Pico:
             return f"继续执行：{required_tool} {summary}"
         return f"继续执行：{required_tool}"
 
-    def report_obligation_progress(self, obligation):
-        reporter = getattr(self, "assistant_message_reporter", None)
-        if reporter is None:
-            return
-        message = self.render_obligation_progress_message(obligation)
-        message = self.redact_text(str(message or "").strip())
-        if not message:
-            return
-        reporter(message)
-
-    def set_transient_runtime_requirements(self, obligations):
-        normalized = []
-        for obligation in list(obligations or []):
-            if not isinstance(obligation, dict):
-                continue
-            normalized.append(
-                {
-                    "key": str(obligation.get("key", "")).strip(),
-                    "source": str(obligation.get("source", "")).strip(),
-                    "reason": str(obligation.get("reason", "")).strip(),
-                    "required_tool": str(obligation.get("required_tool", "")).strip(),
-                    "suggested_args": dict(obligation.get("suggested_args", {}) or {}),
-                    "chain_key": str(obligation.get("chain_key", "")).strip(),
-                    "completion_block_policy": str(obligation.get("completion_block_policy", "")).strip(),
-                    "blocks_completion": bool(obligation.get("blocks_completion", False)),
-                }
-            )
-        self.transient_runtime_requirements = normalized
-
-    def clear_transient_runtime_requirements(self):
-        self.transient_runtime_requirements = []
-
-    def runtime_requirements_text(self):
-        requirements = list(getattr(self, "transient_runtime_requirements", []) or [])
-        if not requirements:
-            return ""
-        lines = [
-            "Runtime requirements:",
-            "Do not conclude the task yet. The following obligations are still unfinished:",
-        ]
-        for obligation in requirements:
-            required_tool = str(obligation.get("required_tool", "")).strip() or "(unknown tool)"
-            reason = str(obligation.get("reason", "")).strip() or "pending_obligation"
-            line = f"- {reason}: call {required_tool}"
-            completion_block_policy = str(obligation.get("completion_block_policy", "")).strip()
-            if completion_block_policy:
-                line += f" [{completion_block_policy}]"
-            suggested_args = obligation.get("suggested_args", {})
-            if suggested_args:
-                line += f" with args {json.dumps(suggested_args, ensure_ascii=False, sort_keys=True)}"
-            lines.append(line)
-        return "\n".join(lines)
-
     def shell_env(self):
         return securitylib.shell_env(allowlist=self.shell_env_allowlist, root=self.root)
 
@@ -1235,18 +1241,89 @@ class Pico:
         )
 
     @staticmethod
-    def _normalize_rewritten_user_message(raw_text, original_text):
-        text = str(raw_text or "").strip()
-        final_match = re.search(r"<final>(.*?)</final>", text, re.S)
-        if final_match:
-            text = final_match.group(1).strip()
-        fenced = re.search(r"```(?:[A-Za-z0-9_-]+)?\s*(.*?)\s*```", text, re.S)
+    def _fallback_request_plan(original_text, error=""):
+        text = str(original_text or "").strip()
+        return {
+            "rewritten_request": text,
+            "todos": [{"id": "t1", "status": "active", "text": text or "Handle the current user request"}],
+            "active_todo_id": "t1",
+            "valid": False,
+            "error": str(error or "").strip(),
+            "raw_text": "",
+        }
+
+    @staticmethod
+    def _normalize_request_plan_text(text, max_chars):
+        normalized = str(text or "").strip()
+        fenced = re.search(r"```(?:[A-Za-z0-9_-]+)?\s*(.*?)\s*```", normalized, re.S)
         if fenced:
-            text = fenced.group(1).strip()
-        max_chars = max(len(str(original_text or "")), len(str(original_text or "")) * REQUEST_REWRITE_MAX_CHAR_MULTIPLIER)
-        if len(text) > max_chars:
-            text = text[:max_chars].rstrip()
-        return text or str(original_text or "")
+            normalized = fenced.group(1).strip()
+        if len(normalized) > max_chars:
+            normalized = normalized[:max_chars].rstrip()
+        return normalized
+
+    @staticmethod
+    def parse_request_plan(raw_text, original_text):
+        original_text = str(original_text or "")
+        fallback = Pico._fallback_request_plan(original_text)
+        raw_text = str(raw_text or "").strip()
+        if not raw_text:
+            fallback["error"] = "empty_request_plan"
+            return fallback
+        match = REQUEST_PLAN_BLOCK_PATTERN.search(raw_text)
+        if not match:
+            fallback["error"] = "missing_request_plan_block"
+            fallback["raw_text"] = raw_text
+            return fallback
+        try:
+            root = ET.fromstring(match.group(0))
+        except Exception as exc:
+            fallback["error"] = f"invalid_request_plan_xml:{exc}"
+            fallback["raw_text"] = raw_text
+            return fallback
+        rewritten_node = root.find("rewritten_request")
+        todo_list_node = root.find("todo_list")
+        max_chars = max(len(original_text), len(original_text) * REQUEST_REWRITE_MAX_CHAR_MULTIPLIER)
+        rewritten_request = Pico._normalize_request_plan_text(
+            rewritten_node.text if rewritten_node is not None else original_text,
+            max_chars=max_chars,
+        ) or original_text
+        todos = []
+        active_ids = []
+        seen_ids = set()
+        if todo_list_node is not None:
+            for todo_node in todo_list_node.findall("todo"):
+                todo_id = str(todo_node.attrib.get("id", "")).strip()
+                status = str(todo_node.attrib.get("status", "")).strip().lower()
+                todo_text = Pico._normalize_request_plan_text("".join(todo_node.itertext()), max_chars=max_chars)
+                if not todo_id or todo_id in seen_ids:
+                    fallback["error"] = "duplicate_or_missing_todo_id"
+                    fallback["raw_text"] = raw_text
+                    return fallback
+                if status not in {"active", "pending"}:
+                    fallback["error"] = "invalid_initial_todo_status"
+                    fallback["raw_text"] = raw_text
+                    return fallback
+                if not todo_text:
+                    fallback["error"] = "empty_todo_text"
+                    fallback["raw_text"] = raw_text
+                    return fallback
+                seen_ids.add(todo_id)
+                todos.append({"id": todo_id, "status": status, "text": todo_text})
+                if status == "active":
+                    active_ids.append(todo_id)
+        if not todos or len(active_ids) != 1:
+            fallback["error"] = "invalid_initial_todo_shape"
+            fallback["raw_text"] = raw_text
+            return fallback
+        return {
+            "rewritten_request": rewritten_request,
+            "todos": todos,
+            "active_todo_id": active_ids[0],
+            "valid": True,
+            "error": "",
+            "raw_text": raw_text,
+        }
 
     async def rewrite_user_message_async(self, user_message):
         original_text = str(user_message or "")
@@ -1259,27 +1336,32 @@ class Pico:
             "max_chars": len(original_text) * REQUEST_REWRITE_MAX_CHAR_MULTIPLIER,
             "template_path": str(REQUEST_REWRITE_TEMPLATE_PATH),
             "error": "",
+            "todo_count": 1,
+            "active_todo_id": "t1",
         }
         self.last_user_request_rewrite = dict(metadata)
         if not metadata["enabled"] or not original_text.strip():
-            return original_text
+            return self._fallback_request_plan(original_text)
         try:
             prompt = self._request_rewrite_prompt(original_text)
             raw = await self.complete_text_async(prompt, max_new_tokens=REQUEST_REWRITE_MAX_NEW_TOKENS)
-            rewritten = self._normalize_rewritten_user_message(raw, original_text)
+            plan = self.parse_request_plan(raw, original_text)
             metadata.update(
                 {
                     "applied": True,
-                    "changed": rewritten != original_text,
-                    "rewritten_chars": len(rewritten),
+                    "changed": str(plan.get("rewritten_request", "")) != original_text,
+                    "rewritten_chars": len(str(plan.get("rewritten_request", ""))),
+                    "todo_count": len(plan.get("todos", []) or []),
+                    "active_todo_id": str(plan.get("active_todo_id", "")).strip(),
+                    "error": str(plan.get("error", "")).strip(),
                 }
             )
             self.last_user_request_rewrite = dict(metadata)
-            return rewritten
+            return plan
         except Exception as exc:
             metadata["error"] = str(exc)
             self.last_user_request_rewrite = dict(metadata)
-            return original_text
+            return self._fallback_request_plan(original_text, error=str(exc))
 
     def prompt_metadata(self, user_message, prompt):
         _, metadata = self._build_prompt_and_metadata(user_message)
@@ -1568,7 +1650,14 @@ class Pico:
             "resume_status": task_state.resume_status,
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
-            "last_completion_score": int(getattr(self, "last_completion_score", 0) or 0),
+            "todo_state": {
+                "rewritten_request": str(getattr(task_state, "rewritten_request", "") or ""),
+                "todos": list(getattr(task_state, "todos", []) or []),
+                "active_todo_id": str(getattr(task_state, "active_todo_id", "") or ""),
+                "todo_version": int(getattr(task_state, "todo_version", 0) or 0),
+                "last_todo_update": str(getattr(task_state, "last_todo_update", "") or ""),
+                "blocked_todo_id": str(getattr(task_state, "blocked_todo_id", "") or ""),
+            },
             "progress_state": {
                 "logical_steps_used": logical_steps,
                 "raw_tool_calls": raw_tool_calls,
@@ -1869,6 +1958,57 @@ class Pico:
         return answer.strip().lower() in {"y", "yes"}
 
     @staticmethod
+    def parse_todo_update(raw):
+        raw = str(raw or "")
+        match = TODO_UPDATE_BLOCK_PATTERN.search(raw)
+        if not match:
+            return None
+        try:
+            root = ET.fromstring(match.group(0))
+        except Exception:
+            return None
+        if root.tag != "todo_update":
+            return None
+        operations = []
+        active_targets = []
+        for child in list(root):
+            tag = str(child.tag or "").strip()
+            if tag not in {"complete", "activate", "append", "drop", "block"}:
+                return None
+            todo_id = str(child.attrib.get("id", "")).strip()
+            if tag == "append":
+                if not todo_id:
+                    return None
+                text = " ".join(part.strip() for part in child.itertext() if str(part or "").strip()).strip()
+                if not text:
+                    return None
+                operations.append({"op": "append", "id": todo_id, "text": text})
+                continue
+            if not todo_id:
+                return None
+            operations.append({"op": tag, "id": todo_id})
+            if tag == "activate":
+                active_targets.append(todo_id)
+        if len(active_targets) > 1:
+            return None
+        return {"raw": match.group(0), "operations": operations}
+
+    @staticmethod
+    def extract_display_text(raw):
+        raw = str(raw or "")
+        match = DISPLAY_BLOCK_PATTERN.search(raw)
+        if not match:
+            return ""
+        try:
+            root = ET.fromstring(match.group(0))
+        except Exception:
+            return ""
+        if root.tag != "display":
+            return ""
+        text = " ".join(part.strip() for part in root.itertext() if str(part or "").strip()).strip()
+        return WHITESPACE_PATTERN.sub(" ", text).strip()
+
+    @staticmethod
     def parse(raw):
         """把模型原始输出解析成 runtime 可执行的动作或最终答案。
 
@@ -1886,50 +2026,64 @@ class Pico:
         进入平台控制流的第一道结构化关口。
         """
         raw = str(raw)
-        completion_score = Pico.extract_completion_score(raw)
-
-
+        todo_update = Pico.parse_todo_update(raw)
+        if todo_update is None:
+            stripped = raw.strip()
+            if stripped:
+                return "retry", Pico.retry_payload("model response is missing a valid <todo_update> block", raw)
+            return "retry", Pico.retry_payload("model returned an empty response", "")
 
         if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
             body = Pico.extract(raw, "tool")
             try:
                 payload = json.loads(body)
             except Exception:
-                return "retry", Pico.retry_payload("model returned malformed tool JSON", raw, completion_score)
+                return "retry", Pico.retry_payload("model returned malformed tool JSON", raw)
             if not isinstance(payload, dict):
-                return "retry", Pico.retry_payload("tool payload must be a JSON object", raw, completion_score)
+                return "retry", Pico.retry_payload("tool payload must be a JSON object", raw)
             if not str(payload.get("name", "")).strip():
-                return "retry", Pico.retry_payload("tool payload is missing a tool name", raw, completion_score)
+                return "retry", Pico.retry_payload("tool payload is missing a tool name", raw)
             args = payload.get("args", {})
             if args is None:
                 payload["args"] = {}
             elif not isinstance(args, dict):
-                return "retry", Pico.retry_payload(raw_text=raw, completion_score=completion_score)
-            payload["completion_score"] = completion_score
+                return "retry", Pico.retry_payload(raw_text=raw)
+            payload["todo_update"] = todo_update
+            payload["display_text"] = Pico.extract_display_text(raw)
             return "tool", payload
         if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
             payload = Pico.parse_xml_tool(raw)
             if payload is not None:
-                payload["completion_score"] = completion_score
+                payload["todo_update"] = todo_update
+                payload["display_text"] = Pico.extract_display_text(raw)
                 return "tool", payload
-            return "retry", Pico.retry_payload(raw_text=raw, completion_score=completion_score)
+            return "retry", Pico.retry_payload(raw_text=raw)
         answer_text = Pico.extract_answer_text(raw)
+        display_text = Pico.extract_display_text(raw)
         if answer_text:
-            return "answer", {"text": answer_text, "completion_score": completion_score, "raw_text": raw.strip()}
-        if completion_score is not None:
-            return "retry", Pico.retry_payload("model returned only a completion score without a usable tool call or answer", raw, completion_score)
+            return "answer", {
+                "text": answer_text,
+                "todo_update": todo_update,
+                "raw_text": raw.strip(),
+                "display_text": display_text,
+            }
+        if todo_update.get("operations"):
+            return "todo_only", {
+                "todo_update": todo_update,
+                "raw_text": raw.strip(),
+                "display_text": display_text,
+            }
         raw = raw.strip()
         if raw:
-            return "retry", Pico.retry_payload("model returned text without a usable tool call or answer", raw, completion_score)
-        return "retry", Pico.retry_payload("model returned an empty response", "", completion_score)
+            return "retry", Pico.retry_payload("model returned text without a usable tool call or answer", raw)
+        return "retry", Pico.retry_payload("model returned an empty response", "")
 
     @staticmethod
-    def retry_payload(problem=None, raw_text="", completion_score=None):
+    def retry_payload(problem=None, raw_text=""):
         return {
             "notice": Pico.retry_notice(problem),
             "problem": str(problem or "").strip(),
             "raw_text": str(raw_text or "").strip(),
-            "completion_score": completion_score if completion_score is None else int(completion_score),
         }
 
     @staticmethod
@@ -1940,26 +2094,10 @@ class Pico:
         else:
             prefix += ": model returned malformed tool output"
         return (
-            f"{prefix}. Reply with exactly one <completion>0-100</completion> tag and either a valid <tool> call or a usable answer. "
+            f"{prefix}. Reply with exactly one <todo_update>...</todo_update> block and then either one valid <tool> call or a usable plain-text answer. "
+            "If you only need to switch todo state, return the <todo_update> block by itself. "
             'For multi-line files, prefer <tool name="write_file" path="file.py"><content>...</content></tool>.'
         )
-
-    @staticmethod
-    def extract_completion_score(text):
-        match = COMPLETION_TAG_PATTERN.search(str(text or ""))
-        if not match:
-            return None
-        try:
-            score = int(match.group(1))
-        except Exception:
-            return None
-        if 0 <= score <= 100:
-            return score
-        return None
-
-    @staticmethod
-    def strip_completion_tags(text):
-        return COMPLETION_TAG_PATTERN.sub("", str(text or ""))
 
     @staticmethod
     def extract_answer_text(text):
@@ -1967,11 +2105,15 @@ class Pico:
         if "<final>" in raw:
             final = Pico.extract(raw, "final").strip()
             if final:
-                return Pico.strip_completion_tags(final).strip()
+                final = TODO_UPDATE_BLOCK_PATTERN.sub(" ", final)
+                final = DISPLAY_BLOCK_PATTERN.sub(" ", final)
+                return WHITESPACE_PATTERN.sub(" ", final).strip()
             return ""
-        stripped = Pico.strip_completion_tags(raw).strip()
-        stripped = re.sub(r"<tool(?P<attrs>[^>]*)>.*?</tool>", "", stripped, flags=re.S).strip()
-        return stripped
+        stripped = TODO_UPDATE_BLOCK_PATTERN.sub(" ", raw).strip()
+        stripped = re.sub(r"<tool(?P<attrs>[^>]*)>.*?</tool>", " ", stripped, flags=re.S).strip()
+        stripped = DISPLAY_BLOCK_PATTERN.sub(" ", stripped).strip()
+        stripped = FINAL_TAG_PATTERN.sub(" ", stripped).strip()
+        return WHITESPACE_PATTERN.sub(" ", stripped).strip()
 
     @staticmethod
     def parse_xml_tool(raw):

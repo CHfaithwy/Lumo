@@ -165,30 +165,22 @@ class ContextManager:
         return prompt, metadata
 
     def _current_request_prefix(self):
-        parts = [
-            "Progress:\n"
-            f"- Current task completion score: {int(getattr(self.agent, 'last_completion_score', 0) or 0)}"
-        ]
-        runtime_requirements = str(getattr(self.agent, "runtime_requirements_text", lambda: "")() or "").strip()
-        if runtime_requirements:
-            parts.append(runtime_requirements)
-        parts.extend(
-            [
-                "Current user request:",
-                "Before answering, check whether the accumulated durable memory helps you interpret the user's intent or project context.",
-            ]
+        return (
+            "Current user request:\n"
+            "Before answering, check whether the accumulated durable memory helps you interpret the user's intent or project context.\n"
         )
-        return "\n".join(parts) + "\n"
 
     def _prepare_current_request(self, user_message):
         prefix = self._current_request_prefix()
-        inline_text = prefix + str(user_message)
-        user_units = _context_units(user_message)
+        todo_text = str(getattr(self.agent, "current_todo_request_text", lambda: "")() or "").strip()
+        body = todo_text or str(user_message)
+        inline_text = prefix + body
+        user_units = _context_units(body)
         inline_units = _context_units(inline_text)
         details = {
             "externalized": False,
             "externalized_path": "",
-            "raw_user_chars": len(str(user_message)),
+            "raw_user_chars": len(str(body)),
             "raw_user_units": user_units,
             "budget_units": CURRENT_REQUEST_BUDGET,
         }
@@ -690,5 +682,6 @@ class ContextManager:
                 "rendered_units": _context_units(user_message) if not current_request_externalized else rendered[CURRENT_REQUEST_SECTION].rendered_units,
                 "section_units": rendered[CURRENT_REQUEST_SECTION].rendered_units,
             },
-            "runtime_requirements_count": len(getattr(self.agent, "transient_runtime_requirements", []) or []),
+            "todo_count": len(getattr(self.agent, "transient_todo_state", {}).get("todos", []) or []),
+            "active_todo_id": str(getattr(self.agent, "transient_todo_state", {}).get("active_todo_id", "") or ""),
         }

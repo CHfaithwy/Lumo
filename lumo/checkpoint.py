@@ -181,7 +181,7 @@ def create_checkpoint(agent, task_state, user_message, trigger):
         "current_goal": str(user_message),
         "completed": [task_state.final_answer] if task_state.final_answer else [],
         "excluded": [],
-        "current_blocker": "" if str(task_state.stop_reason or "") in ("", "final_answer_returned") else str(task_state.stop_reason),
+        "current_blocker": "" if str(task_state.stop_reason or "") in ("", "final_answer_returned", "todo_list_completed") else str(task_state.stop_reason),
         "next_step": infer_next_step(task_state),
         "key_files": key_files,
         "freshness": freshness,

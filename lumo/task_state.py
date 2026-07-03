@@ -14,6 +14,10 @@ STATUS_STOPPED = "stopped"
 STATUS_FAILED = "failed"
 
 STOP_REASON_FINAL_ANSWER_RETURNED = "final_answer_returned"
+STOP_REASON_TODO_LIST_COMPLETED = "todo_list_completed"
+STOP_REASON_TODO_BLOCKED_WAITING_FOR_USER = "todo_blocked_waiting_for_user"
+STOP_REASON_INVALID_TODO_PROTOCOL = "invalid_todo_protocol"
+STOP_REASON_FINAL_ANSWER_CALL_FAILED = "final_answer_call_failed"
 STOP_REASON_STEP_LIMIT_REACHED = "step_limit_reached"
 STOP_REASON_RETRY_LIMIT_REACHED = "retry_limit_reached"
 STOP_REASON_MODEL_ERROR = "model_error"
@@ -39,6 +43,12 @@ class TaskState:
     last_progress_chain: str = ""
     last_progress_cursor: str = ""
     last_stall_reason: str = ""
+    rewritten_request: str = ""
+    todos: list | None = None
+    active_todo_id: str = ""
+    todo_version: int = 0
+    last_todo_update: str = ""
+    blocked_todo_id: str = ""
     stop_reason: str = ""
     final_answer: str = ""
     checkpoint_id: str = ""
@@ -66,6 +76,12 @@ class TaskState:
             last_progress_chain=str(data.get("last_progress_chain", "")),
             last_progress_cursor=str(data.get("last_progress_cursor", "")),
             last_stall_reason=str(data.get("last_stall_reason", "")),
+            rewritten_request=str(data.get("rewritten_request", "")),
+            todos=list(data.get("todos", []) or []),
+            active_todo_id=str(data.get("active_todo_id", "")),
+            todo_version=int(data.get("todo_version", 0)),
+            last_todo_update=str(data.get("last_todo_update", "")),
+            blocked_todo_id=str(data.get("blocked_todo_id", "")),
             stop_reason=str(data.get("stop_reason", "")),
             final_answer=str(data.get("final_answer", "")),
             checkpoint_id=str(data.get("checkpoint_id", "")),
@@ -97,6 +113,24 @@ class TaskState:
         self.last_stall_reason = str(stall_reason or "")
         return self
 
+    def update_todo_state(
+        self,
+        rewritten_request="",
+        todos=None,
+        active_todo_id="",
+        todo_version=None,
+        last_todo_update="",
+        blocked_todo_id="",
+    ):
+        self.rewritten_request = str(rewritten_request or "")
+        self.todos = list(todos or [])
+        self.active_todo_id = str(active_todo_id or "")
+        if todo_version is not None:
+            self.todo_version = int(todo_version)
+        self.last_todo_update = str(last_todo_update or "")
+        self.blocked_todo_id = str(blocked_todo_id or "")
+        return self
+
     def stop(self, stop_reason, status=STATUS_STOPPED, final_answer=""):
         self.status = status
         self.stop_reason = stop_reason
@@ -115,7 +149,7 @@ class TaskState:
 
     def finish_success(self, final_answer):
         self.status = STATUS_COMPLETED
-        self.stop_reason = STOP_REASON_FINAL_ANSWER_RETURNED
+        self.stop_reason = STOP_REASON_TODO_LIST_COMPLETED
         self.final_answer = str(final_answer)
         return self
 
@@ -134,6 +168,12 @@ class TaskState:
             "last_progress_chain": self.last_progress_chain,
             "last_progress_cursor": self.last_progress_cursor,
             "last_stall_reason": self.last_stall_reason,
+            "rewritten_request": self.rewritten_request,
+            "todos": list(self.todos or []),
+            "active_todo_id": self.active_todo_id,
+            "todo_version": self.todo_version,
+            "last_todo_update": self.last_todo_update,
+            "blocked_todo_id": self.blocked_todo_id,
             "stop_reason": self.stop_reason,
             "final_answer": self.final_answer,
             "checkpoint_id": self.checkpoint_id,
