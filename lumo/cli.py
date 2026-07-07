@@ -20,14 +20,18 @@ from .runtime import Pico, SessionStore
 from .workspace import AGENT_STATE_DIR, WorkspaceContext
 
 DEFAULT_SECRET_ENV_NAMES = (
+    "LUMO_OPENAI_API_KEY",
     "PICO_OPENAI_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_API_TOKEN",
+    "LUMO_ANTHROPIC_API_KEY",
     "PICO_ANTHROPIC_API_KEY",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
+    "LUMO_DEEPSEEK_API_KEY",
     "PICO_DEEPSEEK_API_KEY",
     "DEEPSEEK_API_KEY",
+    "LUMO_RIGHT_CODES_API_KEY",
     "PICO_RIGHT_CODES_API_KEY",
     "RIGHT_CODES_API_KEY",
     "GITHUB_PAT",
@@ -78,7 +82,7 @@ DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
-SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
+SECRET_ENV_NAMES_VARS = ("LUMO_SECRET_ENV_NAMES", "PICO_SECRET_ENV_NAMES")
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 ANSI_RESET = "\x1b[0m"
 WELCOME_BORDER_COLOR = "\x1b[38;2;125;211;252m"
@@ -176,17 +180,17 @@ def _effective_model(args, provider):
     if explicit_model:
         return explicit_model
     if provider == "openai":
-        model = provider_env("PICO_OPENAI_MODEL", ("OPENAI_MODEL",))
+        model = provider_env("LUMO_OPENAI_MODEL", ("PICO_OPENAI_MODEL", "OPENAI_MODEL"))
         if model:
             return model
         return DEFAULT_OPENAI_MODEL
     if provider == "anthropic":
-        model = provider_env("PICO_ANTHROPIC_MODEL", ("ANTHROPIC_MODEL",))
+        model = provider_env("LUMO_ANTHROPIC_MODEL", ("PICO_ANTHROPIC_MODEL", "ANTHROPIC_MODEL"))
         if model:
             return model
         return DEFAULT_ANTHROPIC_MODEL
     if provider == "deepseek":
-        model = provider_env("PICO_DEEPSEEK_MODEL", ("DEEPSEEK_MODEL",))
+        model = provider_env("LUMO_DEEPSEEK_MODEL", ("PICO_DEEPSEEK_MODEL", "DEEPSEEK_MODEL"))
         if model:
             return model
         return DEFAULT_DEEPSEEK_MODEL
@@ -196,13 +200,14 @@ def _effective_model(args, provider):
 def _configured_secret_names(args):
     configured_secret_names = set(DEFAULT_SECRET_ENV_NAMES)
     configured_secret_names.update(str(name).upper() for name in args.secret_env_names)
-    extra_names = os.environ.get(SECRET_ENV_NAMES_VAR, "")
-    if extra_names.strip():
-        configured_secret_names.update(
-            item.strip().upper()
-            for item in extra_names.split(",")
-            if item.strip()
-        )
+    for env_var in SECRET_ENV_NAMES_VARS:
+        extra_names = os.environ.get(env_var, "")
+        if extra_names.strip():
+            configured_secret_names.update(
+                item.strip().upper()
+                for item in extra_names.split(",")
+                if item.strip()
+            )
     return sorted(configured_secret_names)
 
 
@@ -212,10 +217,23 @@ def _build_model_client(args):
 
     if provider == "openai":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("PICO_OPENAI_API_BASE", ("OPENAI_API_BASE",), DEFAULT_OPENAI_BASE_URL)
+        base_url = getattr(args, "base_url", None) or provider_env(
+            "LUMO_OPENAI_API_BASE",
+            ("PICO_OPENAI_API_BASE", "OPENAI_API_BASE"),
+            DEFAULT_OPENAI_BASE_URL,
+        )
         api_key = provider_env(
-            "PICO_OPENAI_API_KEY",
-            ("OPENAI_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "PICO_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+            "LUMO_OPENAI_API_KEY",
+            (
+                "PICO_OPENAI_API_KEY",
+                "OPENAI_API_KEY",
+                "LUMO_RIGHT_CODES_API_KEY",
+                "PICO_RIGHT_CODES_API_KEY",
+                "RIGHT_CODES_API_KEY",
+                "LUMO_ANTHROPIC_API_KEY",
+                "PICO_ANTHROPIC_API_KEY",
+                "ANTHROPIC_API_KEY",
+            ),
         )
         return OpenAICompatibleModelClient(
             model=model,
@@ -226,10 +244,23 @@ def _build_model_client(args):
         )
     if provider == "anthropic":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("PICO_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",), DEFAULT_ANTHROPIC_BASE_URL)
+        base_url = getattr(args, "base_url", None) or provider_env(
+            "LUMO_ANTHROPIC_API_BASE",
+            ("PICO_ANTHROPIC_API_BASE", "ANTHROPIC_API_BASE"),
+            DEFAULT_ANTHROPIC_BASE_URL,
+        )
         api_key = provider_env(
-            "PICO_ANTHROPIC_API_KEY",
-            ("ANTHROPIC_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "PICO_OPENAI_API_KEY", "OPENAI_API_KEY"),
+            "LUMO_ANTHROPIC_API_KEY",
+            (
+                "PICO_ANTHROPIC_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "LUMO_RIGHT_CODES_API_KEY",
+                "PICO_RIGHT_CODES_API_KEY",
+                "RIGHT_CODES_API_KEY",
+                "LUMO_OPENAI_API_KEY",
+                "PICO_OPENAI_API_KEY",
+                "OPENAI_API_KEY",
+            ),
         )
         return AnthropicCompatibleModelClient(
             model=model,
@@ -240,8 +271,12 @@ def _build_model_client(args):
         )
     if provider == "deepseek":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("PICO_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",), DEFAULT_DEEPSEEK_BASE_URL)
-        api_key = provider_env("PICO_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",))
+        base_url = getattr(args, "base_url", None) or provider_env(
+            "LUMO_DEEPSEEK_API_BASE",
+            ("PICO_DEEPSEEK_API_BASE", "DEEPSEEK_API_BASE"),
+            DEFAULT_DEEPSEEK_BASE_URL,
+        )
+        api_key = provider_env("LUMO_DEEPSEEK_API_KEY", ("PICO_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"))
         return AnthropicCompatibleModelClient(
             model=model,
             base_url=base_url,
@@ -406,7 +441,7 @@ def build_arg_parser():
     parser.add_argument(
         "--model",
         default=None,
-        help="Model name override. Defaults to qwen3.5:4b for Ollama, PICO_OPENAI_MODEL for openai, PICO_ANTHROPIC_MODEL for anthropic, and PICO_DEEPSEEK_MODEL for deepseek when set.",
+        help="Model name override. Defaults to qwen3.5:4b for Ollama, LUMO_OPENAI_MODEL for openai, LUMO_ANTHROPIC_MODEL for anthropic, and LUMO_DEEPSEEK_MODEL for deepseek when set.",
     )
     parser.add_argument("--host", default=DEFAULT_OLLAMA_HOST, help="Ollama server URL.")
     parser.add_argument("--base-url", default=None, help="Provider API base URL for deepseek, openai, or anthropic.")
@@ -432,8 +467,6 @@ def build_arg_parser():
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     agent = build_agent(args)
-    if args.resume and not args.no_memory_evolution:
-        _maybe_evolve_durable_memory(agent, "resume_activation")
 
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
 

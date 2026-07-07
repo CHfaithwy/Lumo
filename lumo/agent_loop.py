@@ -395,12 +395,12 @@ class AgentLoop:
         invalid_protocol_streak = 0
 
         while True:
-            if progress_state.logical_steps_used >= agent.max_steps:
-                final = "Stopped after reaching the logical step limit without completing the todo list."
-                return self._finalize_run(task_state, original_user_message, final, run_started_at, stop_reason="step_limit_reached")
-            if progress_state.raw_tool_calls >= raw_tool_call_backstop:
-                final = "Stopped after too many tool calls without completing the todo list."
-                return self._finalize_run(task_state, original_user_message, final, run_started_at, stop_reason="retry_limit_reached")
+            # if progress_state.logical_steps_used >= agent.max_steps:
+            #     final = "Stopped after reaching the logical step limit without completing the todo list."
+            #     return self._finalize_run(task_state, original_user_message, final, run_started_at, stop_reason="step_limit_reached")
+            # if progress_state.raw_tool_calls >= raw_tool_call_backstop:
+            #     final = "Stopped after too many tool calls without completing the todo list."
+            #     return self._finalize_run(task_state, original_user_message, final, run_started_at, stop_reason="retry_limit_reached")
             if progress_state.raw_model_attempts >= raw_attempt_backstop:
                 final = "Stopped after too many model attempts without completing the todo list."
                 return self._finalize_run(task_state, original_user_message, final, run_started_at, stop_reason="retry_limit_reached")

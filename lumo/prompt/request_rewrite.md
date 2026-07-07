@@ -3,7 +3,7 @@ Rewrite the user's request into a structured execution plan for a coding agent.
 Requirements:
 - Preserve the user's intent exactly. Do not add new goals, files, tools, or assumptions.
 - Keep the output in the same language as the user.
-- Preserve tool names exactly as written by the user.
+- If the user explicitly mentions a tool name, preserve it verbatim.
 - Preserve explicit step order exactly as written by the user.
 - When the request already contains searchable identifiers or quoted strings, preserve them verbatim so they remain usable as grep patterns.
 - Preserve paths, config keys, symbols, and error text verbatim.
