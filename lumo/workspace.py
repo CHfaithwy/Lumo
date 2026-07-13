@@ -15,7 +15,7 @@ MAX_TOOL_OUTPUT = 4000
 AGENT_STATE_DIR = ".lumo"
 
 
-MAX_PROJECT_TREE_ENTRIES = 100
+MAX_PROJECT_TREE_ENTRIES = 50
 IGNORED_PATH_NAMES = {
     ".git",
     AGENT_STATE_DIR,
@@ -84,7 +84,10 @@ def project_tree(root, max_entries=MAX_PROJECT_TREE_ENTRIES):
             level_children.extend(children)
             next_level.extend(item for item in children if item.is_dir() and not item.is_symlink())
 
-        if total_entries + len(level_children) > max_entries:
+        remaining_entries = max_entries - total_entries
+        if len(level_children) > remaining_entries:
+            included.update(level_children[:remaining_entries])
+            total_entries += remaining_entries
             stopped_at_depth = depth
             break
 
@@ -106,7 +109,7 @@ def project_tree(root, max_entries=MAX_PROJECT_TREE_ENTRIES):
     lines = [".", *render(root, 1)]
     if stopped_at_depth is not None:
         lines.append(
-            f"...[truncated before depth {stopped_at_depth}; next level would exceed {max_entries} entries]"
+            f"...[truncated at depth {stopped_at_depth}; capped at {max_entries} entries]"
         )
     return "\n".join(lines)
 
@@ -117,14 +120,15 @@ def indent_block(text, prefix):
 
 
 class WorkspaceContext:
-    def __init__(self, cwd, repo_root, branch, default_branch, status, recent_commits, project_docs):
+    def __init__(self, cwd, repo_root, branch, default_branch, status, recent_commits, directory_tree, directory_tree_note):
         self.cwd = cwd
         self.repo_root = repo_root
         self.branch = branch
         self.default_branch = default_branch
         self.status = status
         self.recent_commits = recent_commits
-        self.project_docs = project_docs
+        self.directory_tree = directory_tree
+        self.directory_tree_note = directory_tree_note
 
     @classmethod
     def build(cls, cwd, repo_root_override=None):
@@ -150,14 +154,6 @@ class WorkspaceContext:
             else Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
         )
 
-        docs = {
-            "directory_tree": project_tree(cwd),
-            "directory_tree_note": (
-                f"This directory tree is a truncated navigation snapshot capped at {MAX_PROJECT_TREE_ENTRIES} visible entries, so use glob or list_files for exact current file sets or pattern-based file discovery."
-            ),
-        }
-
-
         return cls(
             cwd=str(cwd),
             repo_root=str(repo_root),
@@ -167,32 +163,35 @@ class WorkspaceContext:
             )(git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], "origin/main") or "origin/main"),
             status=clip(git(["status", "--short"], "clean") or "clean", 1500),
             recent_commits=[line for line in git(["log", "--oneline", "-5"]).splitlines() if line],
-            project_docs=docs,
+            directory_tree=project_tree(cwd),
+            directory_tree_note=(
+                f"This directory tree is a truncated navigation snapshot capped at {MAX_PROJECT_TREE_ENTRIES} visible entries, so use glob or list_files for exact current file sets or pattern-based file discovery."
+            ),
         )
 
-    def text(self):
-
-        commits = "\n".join(f"- {line}" for line in self.recent_commits) or "- none"
-        doc_lines = []
-        for path, snippet in self.project_docs.items():
-            doc_lines.append(f"  - {path}:")
-            doc_lines.append(indent_block(snippet, "    "))
-        docs = "\n".join(doc_lines) or "  - none"
-        return "\n".join(
-            [
-                "Workspace:",
-                f"- cwd: {self.cwd}",
-                f"- repo_root: {self.repo_root}",
-                f"- branch: {self.branch}",
-                f"- default_branch: {self.default_branch}",
-                "- status:",
-                indent_block(self.status, "  "),
-                "- recent_commits:",
-                indent_block(commits, "  "),
-                "- project_docs:",
-                docs,
-            ]
-        ).strip()
+    def text(self, include_navigation=False):
+        lines = [
+            "Optional workspace snapshot:",
+            "This is a lightweight reference snapshot, not proof of current file contents. Use tools for exact workspace facts.",
+            f"- cwd: {self.cwd}",
+            f"- repo_root: {self.repo_root}",
+            f"- branch: {self.branch}",
+            f"- default_branch: {self.default_branch}",
+            "- git_status_snapshot:",
+            indent_block(self.status, "  "),
+        ]
+        if include_navigation:
+            commits = "\n".join(f"- {line}" for line in self.recent_commits) or "- none"
+            lines.extend(
+                [
+                    "- recent_commits:",
+                    indent_block(commits, "  "),
+                    "- directory_tree:",
+                    indent_block(self.directory_tree, "  "),
+                    f"- directory_tree_note: {self.directory_tree_note}",
+                ]
+            )
+        return "\n".join(lines).strip()
 
     def fingerprint(self):
 
@@ -204,6 +203,7 @@ class WorkspaceContext:
             "default_branch": self.default_branch,
             "status": self.status,
             "recent_commits": list(self.recent_commits),
-            "project_docs": dict(self.project_docs),
+            "directory_tree": self.directory_tree,
+            "directory_tree_note": self.directory_tree_note,
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()

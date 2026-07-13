@@ -12,7 +12,7 @@ from ..features import memory as memorylib
 from ..providers.clients import FakeModelClient
 from ..runtime import Pico, SessionStore
 from ..run_store import RunStore
-from ..task_state import STOP_REASON_TODO_LIST_COMPLETED
+from ..task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 from ..tools import legal_tool_names
 from ..workspace import AGENT_STATE_DIR, WorkspaceContext
 
@@ -533,7 +533,7 @@ class BenchmarkEvaluator:
 
         within_budget = int(task_state.logical_steps or task_state.tool_steps) <= int(task["step_budget"])
         verifier_passed = verifier.returncode == 0
-        non_failure_stop_reason = task_state.stop_reason == STOP_REASON_TODO_LIST_COMPLETED
+        non_failure_stop_reason = task_state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED
         passed = within_budget and verifier_passed and expected_artifact_exists and non_failure_stop_reason
         failure_category = None if passed else self._failure_category(
             within_budget=within_budget,

@@ -20,11 +20,8 @@ _WORD_PATTERN = re.compile(r"[A-Za-z0-9_]+(?:[-'][A-Za-z0-9_]+)?")
 
 @dataclass
 class PromptPrefix:
-
-
     text: str
     hash: str
-    workspace_fingerprint: str
     tool_signature: str
     built_at: str
 
@@ -36,8 +33,9 @@ def tool_signature(tools):
         payload.append(
             {
                 "name": name,
-                "schema": tool["schema"],
+                "parameters": tool.get("parameters", {}),
                 "risky": tool["risky"],
+                "concurrency_safe": bool(tool.get("concurrency_safe", False)),
                 "description": tool["description"],
             }
         )
@@ -99,12 +97,6 @@ def _join_sections(*sections):
 
 
 def build_prompt_prefix(workspace, tools, built_at=None):
-    tool_lines = []
-    for name, tool in tools.items():
-        fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
-        risk = "approval required" if tool["risky"] else "safe"
-        tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
-    tool_text = "\n".join(tool_lines)
     lumo_instructions = _load_lumo_instructions(workspace)
     text = _join_sections(
         "\n".join(
@@ -118,47 +110,24 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         "\n".join(
             [
                 "Rules:",
-                "- Use tools instead of guessing about the workspace.",
-                "- Use Read before editing files you have not seen.",
+                "- Use tools for workspace facts instead of guessing; read files before editing unseen code.",
                 "- Prefer small, targeted edits.",
-                "- Every normal response must include exactly one <todo_update>...</todo_update> block.",
-                "- Return at most one primary action: either one <tool>...</tool> or one plain answer.",
-                "- A response may also contain only the <todo_update> block when you only need to switch todo state and continue.",
-                "- For intermediate non-final replies, prefer adding a short <display>...</display> block with one sentence suitable for terminal display.",
-                "- Tool calls must look like:",
-                '  <tool>{"name":"tool_name","args":{...}}</tool>',
-                "- For write_file and patch_file with multi-line text, prefer XML style:",
-                '  <tool name="write_file" path="file.py"><content>...</content></tool>',
-                "- Use write_file to create a new file or intentionally replace the full contents of a file.",
-                "- Use patch_file for small, targeted edits to an existing file when you can anchor the change with exact old_text.",
-                "- Use todo_update to mark finished work, switch the active todo, add branch todos when needed, or block when you truly need the user.",
-                "- You may complete one or more remaining todos in the same turn if the current answer or tool evidence already supports them.",
-                "- Prefer advancing the current focus todo first; only complete later todos when they are genuinely covered by the same answer or the same gathered evidence.",
-                "- When one reply already covers multiple unfinished todos, mark them all complete in one <todo_update> instead of deferring and restating them next round.",
-                "- When you are not calling a tool, write the answer directly as plain text after the todo_update block.",
-                "- The <display> block is optional and only for a short user-visible progress summary; the full final answer should be written directly, not hidden inside <display>.",
+                "- Simple questions and one-step tasks do not need a todo list; answer directly or call the needed tool.",
+                "- Use todo_write only for genuinely multi-step work, such as multiple files, verification phases, background tasks, or an explicit planning request.",
+                "- Once a todo list exists, keep its statuses current with todo_write and advance the active item first.",
+                "- Use native function tools when workspace evidence or an action is needed; tool arguments are validated by runtime.",
+                "- Assistant text accompanying native tool calls is optional. When present, use it only for context the tool call itself does not show; do not restate the imminent tool action. Without a tool call, text is the final answer.",
                 "- Never invent tool results.",
                 "- Keep answers concise and concrete.",
-                "- Between tool calls, keep user-visible text to one short sentence when possible.",
-                "- If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.",
-                "- After modifying files, prefer git_status first to confirm the changed file scope, then use git_diff to inspect the resulting patch before deciding the task is complete.",
-                "- If the user asks what changed, asks for a patch or diff, or the task is benchmark-style and patch-oriented, prefer git_diff directly.",
-                "- If git_status shows unexpected files or git_diff shows unexpected edits, keep working instead of concluding the task is complete.",
                 "- If your next sentence says a specific tool is still needed, call that tool instead of describing the next step in plain text.",
-                "- Workspace snapshots, directory trees, and prefix summaries are hints, not substitutes for explicit tool evidence when the user asks you to inspect a tool result, diff, patch, or log.",
+                "- Workspace snapshots, directory trees, and prefix summaries are hints, not substitutes for explicit tool evidence.",
                 "- Before writing tests for existing code, read the implementation first.",
                 "- When writing tests, match the current implementation unless the user explicitly asked you to change the code.",
-                "- When the user asks about repository-local implementation details such as a function, class, file, config key, or code path, prefer answering from repository evidence instead of guessing.",
-                "- Valid evidence can come from code the user pasted, files already read in this session, transcript summaries, or other repository-local context already in the prompt.",
-                "- For repository lookup or inspection tasks, if you can state a reliable search token or pattern from the user request, transcript, or visible repo evidence, prefer grep first.",
-                "- Good grep patterns include symbol names, config keys, error text, path fragments, function or class names, and exact quoted phrases from the user.",
-                "- Do not invent an uncertain pattern just to force grep. If the pattern is unclear, use read_file, glob, or list_files first to gather context.",
-                "- When using grep for repository evidence, prefer content mode with a small -C window before escalating to full-file reads, so you can inspect local context around matches.",
-                "- Read_file first is still appropriate when the user explicitly asks to fully read or fully inspect a file, when runtime points you to an externalized patch, log, or artifact file that must be read as raw text, or when the task is clearly about whole-file understanding of a known file rather than locating content.",
-                "- For read_file, omit limit by default when read_file is already the right tool so you can read the whole file when it fits; only pass offset/limit for targeted windows or next_offset follow-ups.",
+                "- For repository-local details, answer from evidence: pasted code, read files, transcript summaries, or visible repo context.",
+                "- If an available skill clearly matches the task, call use_skill first and then follow that workflow.",
                 "- New files should be complete and runnable, including obvious imports.",
-                "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool.",
-                "- Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={}.",
+                "- Do not repeat an unhelpful identical tool call; choose a different tool or narrower arguments.",
+                "- Required tool arguments must not be empty.",
             ]
         ),
         "\n".join(
@@ -169,54 +138,18 @@ def build_prompt_prefix(workspace, tools, built_at=None):
         ),
         "\n".join(
             [
-                "Response format examples:",
-                "- When you finish the current todo and then need one JSON tool call for the next step, return:",
-                "  <todo_update><complete id=\"t1\"/><activate id=\"t2\"/></todo_update>",
-                '  <tool>{"name":"grep","args":{"pattern":"ContextManager","path":"lumo","output_mode":"content","head_limit":40,"offset":0,"-C":2,"timeout":20}}</tool>',
-                "- When you finish one todo and the next action is an XML-style tool call such as write_file, return:",
-                "  <todo_update><complete id=\"t2\"/><activate id=\"t3\"/></todo_update>",
-                '  <tool name="write_file" path="file.py"><content>print("hello")</content></tool>',
-                "- When you have not finished a todo yet and only want to switch focus to t2 before calling a tool, return:",
-                "  <todo_update><activate id=\"t2\"/></todo_update>",
-                '  <tool>{"name":"read_file","args":{"path":"README.md"}}</tool>',
-                "- When you want a short terminal-visible progress summary before one tool call, return:",
-                "  <todo_update><activate id=\"t2\"/></todo_update>",
-                "  <display>Checking the next file.</display>",
-                '  <tool>{"name":"read_file","args":{"path":"README.md"}}</tool>',
-                "- When you can answer directly after completing a todo, return:",
-                "  <todo_update><complete id=\"t3\"/></todo_update>",
-                "  Here is the answer.",
-                "- When you want a short progress summary plus a fuller intermediate answer, return:",
-                "  <todo_update><complete id=\"t1\"/><activate id=\"t2\"/></todo_update>",
-                "  <display>Summarized the first finding.</display>",
-                "  Here is the fuller intermediate explanation.",
-                "- When the same answer already covers multiple unfinished todos, complete them in one turn like this:",
-                "  <todo_update><complete id=\"t1\"/><complete id=\"t2\"/><activate id=\"t3\"/></todo_update>",
-                "  Here is the answer that already covers both t1 and t2.",
-                "- When you only need to switch todo state and continue without a tool call or answer, return:",
-                "  <todo_update><complete id=\"t2\"/><activate id=\"t3\"/></todo_update>",
-                "- When you only need to switch todo state and show a short progress message, return:",
-                "  <todo_update><activate id=\"t4\"/></todo_update>",
-                "  <display>Moving on to the next task.</display>",
-                "- When the current todo is blocked and you need user input before continuing, return:",
-                "  <todo_update><block id=\"t3\"/></todo_update>",
-                "  I need your choice between option A and option B before continuing.",
-                "- When you want to wrap the final answer explicitly, you may return:",
-                "  <todo_update><complete id=\"t4\"/></todo_update>",
-                "  <final>Here is the final answer.</final>",
-                "- When the plan changes and you need to add or remove todos, return:",
-                "  <todo_update><append id=\"t5\">Read the externalized patch file if one appears.</append><drop id=\"t4\"/></todo_update>",
+                "Native response behavior:",
+                "- Use the provider's native function-call interface for tools. Do not emit XML tool, display, final, or todo tags.",
+                "- Call todo_write only for genuinely multi-step work; use status=done when the plan is complete.",
+                "- A text response without a native tool call is returned to the user as the final answer.",
             ]
         ),
         lumo_instructions,
-        "\n".join(["Tools:", tool_text]),
-        workspace.text(),
     )
     signature = tool_signature(tools)
     return PromptPrefix(
         text=text,
         hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        workspace_fingerprint=workspace.fingerprint(),
         tool_signature=signature,
         built_at=built_at or now(),
     )

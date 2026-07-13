@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import os
-import signal
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .workspace import clip, now
@@ -41,6 +39,14 @@ class BackgroundTaskRecord:
     timeout: int
     stdout_path: str
     stderr_path: str
+    original_command: str = ""
+    executed_command: str = ""
+    python_env_used: bool = False
+    python_env_path: str = ""
+    repair_authorized: bool = False
+    repair_attempted: bool = False
+    retry_of_task_id: str = ""
+    replacement_task_id: str = ""
 
     def to_dict(self):
         return {
@@ -56,6 +62,14 @@ class BackgroundTaskRecord:
             "timeout": self.timeout,
             "stdout_path": self.stdout_path,
             "stderr_path": self.stderr_path,
+            "original_command": self.original_command,
+            "executed_command": self.executed_command,
+            "python_env_used": self.python_env_used,
+            "python_env_path": self.python_env_path,
+            "repair_authorized": self.repair_authorized,
+            "repair_attempted": self.repair_attempted,
+            "retry_of_task_id": self.retry_of_task_id,
+            "replacement_task_id": self.replacement_task_id,
         }
 
 
@@ -73,6 +87,14 @@ def _normalize_record(data):
         timeout=int(data.get("timeout", 0) or 0),
         stdout_path=str(data.get("stdout_path", "")).strip(),
         stderr_path=str(data.get("stderr_path", "")).strip(),
+        original_command=str(data.get("original_command", data.get("command", ""))).strip(),
+        executed_command=str(data.get("executed_command", data.get("command", ""))).strip(),
+        python_env_used=bool(data.get("python_env_used", False)),
+        python_env_path=str(data.get("python_env_path", "")).strip(),
+        repair_authorized=bool(data.get("repair_authorized", False)),
+        repair_attempted=bool(data.get("repair_attempted", False)),
+        retry_of_task_id=str(data.get("retry_of_task_id", "")).strip(),
+        replacement_task_id=str(data.get("replacement_task_id", "")).strip(),
     )
 
 
@@ -81,7 +103,21 @@ class BackgroundTaskManager:
         self.run_store = run_store
         self.workspace_root = Path(workspace_root)
 
-    def start(self, run_id, task_id, command, cwd, env, timeout):
+    def start(
+        self,
+        run_id,
+        task_id,
+        command,
+        cwd,
+        env,
+        timeout,
+        original_command="",
+        python_env_used=False,
+        python_env_path="",
+        repair_authorized=False,
+        repair_attempted=False,
+        retry_of_task_id="",
+    ):
         stdout_path = self.run_store.background_task_stdout_path(run_id, task_id)
         stderr_path = self.run_store.background_task_stderr_path(run_id, task_id)
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,9 +152,23 @@ class BackgroundTaskManager:
             timeout=int(timeout),
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
+            original_command=str(original_command or command),
+            executed_command=str(command),
+            python_env_used=bool(python_env_used),
+            python_env_path=str(python_env_path or ""),
+            repair_authorized=bool(repair_authorized),
+            repair_attempted=bool(repair_attempted),
+            retry_of_task_id=str(retry_of_task_id or ""),
+            replacement_task_id="",
         )
         self.run_store.write_background_task(record)
         return record
+
+    def update(self, record, **changes):
+        normalized = _normalize_record(record.to_dict() if isinstance(record, BackgroundTaskRecord) else record)
+        updated = replace(normalized, **changes)
+        self.run_store.write_background_task(updated)
+        return updated
 
     def get(self, task_id):
         record = self.run_store.find_background_task(task_id)
@@ -317,6 +367,14 @@ class BackgroundTaskManager:
             timeout=record.timeout,
             stdout_path=record.stdout_path,
             stderr_path=record.stderr_path,
+            original_command=record.original_command,
+            executed_command=record.executed_command,
+            python_env_used=record.python_env_used,
+            python_env_path=record.python_env_path,
+            repair_authorized=record.repair_authorized,
+            repair_attempted=record.repair_attempted,
+            retry_of_task_id=record.retry_of_task_id,
+            replacement_task_id=record.replacement_task_id,
         )
         self.run_store.write_background_task(finalized)
         if finalized.status != STATUS_RUNNING:
@@ -362,6 +420,9 @@ def format_task_start_text(record):
         f"pid: {record.pid}",
         f"timeout: {record.timeout}",
         f"command: {record.command}",
+        f"python_env_used: {'true' if record.python_env_used else 'false'}",
+        f"python_env_path: {record.python_env_path}",
+        f"executed_command: {record.executed_command or record.command}",
         f"<summary-for-history>{summary}</summary-for-history>",
     ]
     return "\n".join(lines)

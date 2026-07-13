@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import re
 
 from .features import memory as memorylib
+from .tool_output import ShellOutputCapture
 from .workspace import clip
 
 SUMMARY_FOR_HISTORY_PATTERN = re.compile(r"<summary-for-history>(.*?)</summary-for-history>", re.DOTALL)
@@ -16,6 +17,12 @@ BACKGROUND_TASK_STATUS_PATTERN = re.compile(r"^status:\s*(.+)$", re.MULTILINE)
 BACKGROUND_TASK_RETURN_CODE_PATTERN = re.compile(r"^return_code:\s*(.+)$", re.MULTILINE)
 BACKGROUND_TASK_NEXT_OFFSET_PATTERN = re.compile(r"^next_offset:\s*(\d+)\s*$", re.MULTILINE)
 EXTERNALIZED_PATCH_PATH_PATTERN = re.compile(r"^externalized_patch_path:\s*(.+)$", re.MULTILINE)
+PYTHON_ENV_USED_PATTERN = re.compile(r"^python_env_used:\s*(true|false)$", re.MULTILINE | re.IGNORECASE)
+PYTHON_ENV_PATH_PATTERN = re.compile(r"^python_env_path:\s*(.+)$", re.MULTILINE)
+PYTHON_EXECUTABLE_PATTERN = re.compile(r"^python_executable:\s*(.+)$", re.MULTILINE)
+PYTHON_ENV_STATUS_PATTERN = re.compile(r"^python_env_status:\s*(.+)$", re.MULTILINE)
+PYTHON_ENV_ERROR_PATTERN = re.compile(r"^python_env_error:\s*(.+)$", re.MULTILINE)
+EXECUTED_COMMAND_PATTERN = re.compile(r"^executed_command:\s*(.+)$", re.MULTILINE)
 TOOL_HINT_LINE_PATTERNS = (SUMMARY_FOR_HISTORY_PATTERN, TOOL_REMINDER_PATTERN)
 
 
@@ -23,6 +30,7 @@ TOOL_HINT_LINE_PATTERNS = (SUMMARY_FOR_HISTORY_PATTERN, TOOL_REMINDER_PATTERN)
 class ToolExecutionResult:
     content: str
     metadata: dict
+    output_capture: ShellOutputCapture | None = None
 
 
 def _metadata(
@@ -52,6 +60,15 @@ def _metadata(
     completion_block_policy="",
     followup_is_blocking=False,
     blocks_completion=False,
+    python_env_used=False,
+    python_env_path="",
+    python_executable="",
+    python_env_status="",
+    python_env_error="",
+    executed_command="",
+    requested_args=None,
+    effective_args=None,
+    argument_normalizations=None,
 ):
     result = {
         "tool_status": tool_status,
@@ -70,7 +87,18 @@ def _metadata(
         "completion_block_policy": str(completion_block_policy or ""),
         "followup_is_blocking": bool(followup_is_blocking),
         "blocks_completion": bool(blocks_completion),
+        "python_env_used": bool(python_env_used),
     }
+    if python_env_path:
+        result["python_env_path"] = str(python_env_path)
+    if python_executable:
+        result["python_executable"] = str(python_executable)
+    if python_env_status:
+        result["python_env_status"] = str(python_env_status)
+    if python_env_error:
+        result["python_env_error"] = str(python_env_error)
+    if executed_command:
+        result["executed_command"] = str(executed_command)
     if workspace_fingerprint:
         result["workspace_fingerprint"] = workspace_fingerprint
     if archive_summary:
@@ -91,6 +119,12 @@ def _metadata(
         result["background_task_next_offset"] = int(background_task_next_offset)
     if externalized_patch_path:
         result["externalized_patch_path"] = str(externalized_patch_path)
+    if requested_args is not None:
+        result["requested_args"] = dict(requested_args)
+    if effective_args is not None:
+        result["effective_args"] = dict(effective_args)
+    if argument_normalizations:
+        result["argument_normalizations"] = [dict(item) for item in argument_normalizations]
     return result
 
 
@@ -220,6 +254,24 @@ def _extract_externalized_patch_path(content):
     if not match:
         return ""
     return str(match.group(1)).strip()
+
+
+def _extract_python_execution(content):
+    text = str(content)
+    used = PYTHON_ENV_USED_PATTERN.search(text)
+    path = PYTHON_ENV_PATH_PATTERN.search(text)
+    executable = PYTHON_EXECUTABLE_PATTERN.search(text)
+    status = PYTHON_ENV_STATUS_PATTERN.search(text)
+    error = PYTHON_ENV_ERROR_PATTERN.search(text)
+    command = EXECUTED_COMMAND_PATTERN.search(text)
+    return {
+        "python_env_used": bool(used and used.group(1).lower() == "true"),
+        "python_env_path": str(path.group(1)).strip() if path else "",
+        "python_executable": str(executable.group(1)).strip() if executable else "",
+        "python_env_status": str(status.group(1)).strip() if status else "",
+        "python_env_error": str(error.group(1)).strip() if error else "",
+        "executed_command": str(command.group(1)).strip() if command else "",
+    }
 
 
 def _build_followup_metadata(
@@ -359,19 +411,33 @@ class ToolExecutor:
                 ),
             )
 
+        context_requested_args = execution_context.get("requested_args")
+        requested_args = (
+            dict(context_requested_args)
+            if isinstance(context_requested_args, dict)
+            else dict(args)
+            if isinstance(args, dict)
+            else args
+        )
+        args, local_normalizations = agent.normalize_tool_arguments(name, args)
+        supplied_normalizations = execution_context.get("argument_normalizations", [])
+        argument_normalizations = [
+            dict(item)
+            for item in [*supplied_normalizations, *local_normalizations]
+            if isinstance(item, dict)
+        ]
+
         try:
             agent.validate_tool(name, args)
         except Exception as exc:
-            example = agent.tool_example(name)
             message = f"error: invalid arguments for {name}: {exc}"
-            if example:
-                message += f"\nexample: {example}"
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+            tool_error_code = str(getattr(exc, "tool_error_code", "") or "invalid_arguments")
             return ToolExecutionResult(
                 content=message,
                 metadata=_metadata(
                     "rejected",
-                    tool_error_code="invalid_arguments",
+                    tool_error_code=tool_error_code,
                     security_event_type=security_event_type,
                     risk_level="high" if tool["risky"] else "low",
                     read_only=not tool["risky"],
@@ -386,6 +452,9 @@ class ToolExecutor:
                     tool_error_code="repeated_identical_call",
                     risk_level="high" if tool["risky"] else "low",
                     read_only=not tool["risky"],
+                    requested_args=requested_args if argument_normalizations else None,
+                    effective_args=args if argument_normalizations else None,
+                    argument_normalizations=argument_normalizations,
                 ),
             )
 
@@ -398,6 +467,9 @@ class ToolExecutor:
                     security_event_type="read_only_block" if agent.read_only else "approval_denied",
                     risk_level="high",
                     read_only=False,
+                    requested_args=requested_args if argument_normalizations else None,
+                    effective_args=args if argument_normalizations else None,
+                    argument_normalizations=argument_normalizations,
                 ),
             )
 
@@ -405,7 +477,16 @@ class ToolExecutor:
         after_snapshot = before_snapshot
         try:
             raw_content = tool["run"](args)
-            content = str(raw_content) if name in {"read_file", "task_output", "git_status", "git_diff"} else clip(raw_content)
+            output_capture = raw_content if isinstance(raw_content, ShellOutputCapture) else None
+            content = output_capture.diagnostic_text() if output_capture is not None else str(raw_content)
+            if argument_normalizations:
+                normalized_lines = [
+                    "argument_normalized: "
+                    f"{item.get('argument', '')} {item.get('requested')} -> {item.get('effective')} "
+                    f"({item.get('reason', 'normalized')})"
+                    for item in argument_normalizations
+                ]
+                content = "\n".join([*normalized_lines, content])
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
@@ -429,6 +510,7 @@ class ToolExecutor:
             background_task_return_code = _extract_background_task_return_code(content) if name in {"task_output", "task_stop"} else None
             background_task_next_offset = _extract_background_task_next_offset(content) if name == "task_output" else None
             externalized_patch_path = _extract_externalized_patch_path(content) if name == "git_diff" else ""
+            python_execution = _extract_python_execution(content) if name in {"run_shell", "run_shell_bg"} else {}
             followup = _build_followup_metadata(
                 name,
                 args,
@@ -465,10 +547,14 @@ class ToolExecutor:
                 completion_block_policy=followup.get("completion_block_policy", ""),
                 followup_is_blocking=followup.get("followup_is_blocking", False),
                 blocks_completion=followup.get("blocks_completion", False),
+                requested_args=requested_args if argument_normalizations else None,
+                effective_args=args if argument_normalizations else None,
+                argument_normalizations=argument_normalizations,
+                **python_execution,
             )
             agent.update_memory_after_tool(name, args, content, metadata=metadata)
             agent.record_process_note_for_tool(name, metadata)
-            return ToolExecutionResult(content=content, metadata=metadata)
+            return ToolExecutionResult(content=content, metadata=metadata, output_capture=output_capture)
         except Exception as exc:
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
@@ -484,6 +570,9 @@ class ToolExecutor:
                 workspace_changed=workspace_changed,
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
+                requested_args=requested_args if argument_normalizations else None,
+                effective_args=args if argument_normalizations else None,
+                argument_normalizations=argument_normalizations,
             )
             agent.record_process_note_for_tool(name, metadata)
             return ToolExecutionResult(content=f"error: tool {name} failed: {exc}", metadata=metadata)

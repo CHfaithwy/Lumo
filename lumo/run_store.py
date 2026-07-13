@@ -8,6 +8,8 @@ import json
 import tempfile
 from pathlib import Path
 
+from .tool_output import PersistedToolOutput, TOOL_RESULT_ARTIFACT_MAX_BYTES, safe_artifact_component, truncate_utf8_to_bytes
+
 
 def _run_id(value):
     if hasattr(value, "run_id"):
@@ -32,14 +34,34 @@ class RunStore:
     def report_path(self, run_id):
         return self.run_dir(run_id) / "report.json"
 
-    def prompt_path(self, run_id, index):
-        return self.run_dir(run_id) / f"prompt{int(index)}.md"
+    def request_path(self, run_id, index):
+        return self.run_dir(run_id) / f"request{int(index)}.json"
+
+    def response_path(self, run_id, index):
+        return self.run_dir(run_id) / f"response{int(index)}.json"
+
+    def auxiliary_request_path(self, run_id, kind, index):
+        return self.run_dir(run_id) / f"aux_{str(kind)}_{int(index)}_request.json"
+
+    def auxiliary_response_path(self, run_id, kind, index):
+        return self.run_dir(run_id) / f"aux_{str(kind)}_{int(index)}_response.json"
 
     def task_dir(self, run_id):
         return self.run_dir(run_id) / "tasks"
 
     def latest_git_diff_path(self, run_id):
         return self.run_dir(run_id) / "latest_git_diff.patch"
+
+    def shell_repair_log_path(self, run_id, index):
+        return self.run_dir(run_id) / f"shell_repair_{int(index)}.log"
+
+    def tool_results_dir(self, run_id):
+        return self.run_dir(run_id) / "tool-results"
+
+    def tool_result_path(self, run_id, call_id, suffix=".txt"):
+        safe_call_id = safe_artifact_component(call_id)
+        safe_suffix = ".json" if str(suffix) == ".json" else ".txt"
+        return self.tool_results_dir(run_id) / f"{safe_call_id}{safe_suffix}"
 
     def background_task_meta_path(self, run_id, task_id):
         return self.task_dir(run_id) / f"{str(task_id)}.json"
@@ -80,17 +102,66 @@ class RunStore:
         self._write_json_atomic(path, report)
         return path
 
-    def write_prompt(self, task_state, index, prompt):
-        path = self.prompt_path(task_state, index)
+    def write_request(self, task_state, index, request):
+        path = self.request_path(task_state, index)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(prompt), encoding="utf-8")
+        self._write_json_atomic(path, dict(request or {}))
         return path
+
+    def write_response(self, task_state, index, response):
+        path = self.response_path(task_state, index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_json_atomic(path, dict(response or {}))
+        return path
+
+    def write_auxiliary_exchange(self, task_state, kind, index, request, response):
+        request_path = self.auxiliary_request_path(task_state, kind, index)
+        response_path = self.auxiliary_response_path(task_state, kind, index)
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_json_atomic(request_path, dict(request or {}))
+        self._write_json_atomic(response_path, dict(response or {}))
+        return request_path, response_path
 
     def write_latest_git_diff(self, run_id, content):
         path = self.latest_git_diff_path(run_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(content), encoding="utf-8")
         return path
+
+    def write_shell_repair_log(self, run_id, index, content):
+        path = self.shell_repair_log_path(run_id, index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(content), encoding="utf-8")
+        return path
+
+    def write_tool_result(self, run_id, call_id, content, suffix=".txt"):
+        path = self.tool_result_path(run_id, call_id, suffix=suffix)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = str(content or "")
+        payload, artifact_truncated = truncate_utf8_to_bytes(text, TOOL_RESULT_ARTIFACT_MAX_BYTES)
+        if not path.exists():
+            with tempfile.NamedTemporaryFile(
+                "wb",
+                delete=False,
+                dir=str(path.parent),
+                prefix=path.name + ".",
+                suffix=".tmp",
+            ) as handle:
+                handle.write(payload)
+                temp_name = handle.name
+            Path(temp_name).replace(path)
+        stored_bytes = path.stat().st_size
+        return PersistedToolOutput(
+            relative_path=str(path),
+            original_chars=len(text),
+            original_bytes=len(text.encode("utf-8")),
+            stored_bytes=stored_bytes,
+            artifact_truncated=artifact_truncated,
+        )
+
+    def write_captured_tool_result(self, run_id, call_id, capture):
+        path = self.tool_result_path(run_id, call_id, suffix=".txt")
+        return capture.persist(path, TOOL_RESULT_ARTIFACT_MAX_BYTES)
 
     def load_task_state(self, task_id):
         return json.loads(self.task_state_path(task_id).read_text(encoding="utf-8"))

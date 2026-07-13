@@ -5,7 +5,7 @@ import uuid
 from .features import memory as memorylib
 from .workspace import clip, now
 
-CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
+CHECKPOINT_SCHEMA_VERSION = "native-v1"
 CHECKPOINT_NONE_STATUS = "no-checkpoint"
 CHECKPOINT_FULL_VALID_STATUS = "full-valid"
 CHECKPOINT_PARTIAL_STALE_STATUS = "partial-stale"
@@ -39,7 +39,7 @@ def current_runtime_identity(agent):
         "max_new_tokens": int(agent.max_new_tokens),
         "feature_flags": dict(agent.feature_flags),
         "shell_env_allowlist": list(agent.shell_env_allowlist),
-        "workspace_fingerprint": getattr(getattr(agent, "prefix_state", None), "workspace_fingerprint", agent.workspace.fingerprint()),
+        "workspace_fingerprint": agent.workspace.fingerprint(),
         "tool_signature": agent.tool_signature(),
     }
 
@@ -183,6 +183,7 @@ def create_checkpoint(agent, task_state, user_message, trigger):
         "excluded": [],
         "current_blocker": "" if str(task_state.stop_reason or "") in ("", "final_answer_returned", "todo_list_completed") else str(task_state.stop_reason),
         "next_step": infer_next_step(task_state),
+        "loaded_skills": [dict(item) for item in list(getattr(task_state, "loaded_skills", []) or []) if isinstance(item, dict)],
         "key_files": key_files,
         "freshness": freshness,
         "summary": f"{trigger}: {clip(str(user_message), 120)}",

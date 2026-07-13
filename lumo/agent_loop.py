@@ -6,14 +6,15 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from .checkpoint import CHECKPOINT_NONE_STATUS, CHECKPOINT_PARTIAL_STALE_STATUS, CHECKPOINT_WORKSPACE_MISMATCH_STATUS
+from .checkpoint import CHECKPOINT_NONE_STATUS
 from .task_state import (
-    STOP_REASON_FINAL_ANSWER_CALL_FAILED,
-    STOP_REASON_INVALID_TODO_PROTOCOL,
-    STOP_REASON_TODO_BLOCKED_WAITING_FOR_USER,
+    STOP_REASON_FINAL_ANSWER_RETURNED,
+    STOP_REASON_INVALID_NATIVE_RESPONSE,
     TaskState,
 )
 from .tool_executor import strip_tool_hints
+from .model_protocol import AssistantToolCall, ModelTurnRequest, ToolResultMessage
+from .tool_output import TOOL_RESULT_BATCH_LIMIT_CHARS, TOOL_RESULT_INLINE_LIMIT_CHARS
 from .workspace import clip, now
 
 
@@ -26,9 +27,36 @@ class ProgressState:
     last_chain_cursor_by_key: dict = field(default_factory=dict)
 
 
+@dataclass
+class PreparedToolResult:
+    call: AssistantToolCall
+    arguments: dict
+    requested_args: dict
+    tool_result: object
+    record_progress: bool = True
+    rejection_error: str = ""
+
+
 class AgentLoop:
     def __init__(self, agent):
         self.agent = agent
+
+    def _report_assistant_progress(self, task_state, text, source, last_message):
+        message = self.agent.assistant_progress_message(text)
+        if not message or message == last_message:
+            return last_message
+        reported_message = self.agent.report_assistant_message(message, compact=False)
+        if not reported_message:
+            return last_message
+        self.agent.emit_trace(
+            task_state,
+            "assistant_progress_reported",
+            {
+                "source": str(source),
+                "message": reported_message,
+            },
+        )
+        return reported_message
 
     def run(self, user_message):
         try:
@@ -54,159 +82,204 @@ class AgentLoop:
     async def run_async(self, user_message):
         return await self._run(user_message)
 
-    async def _complete_model_async(self, prompt, prompt_cache_key=None, prompt_cache_retention=None):
+    async def _complete_model_async(self, model_request, prompt_cache_key=None, prompt_cache_retention=None):
         agent = self.agent
-        return await agent.complete_text_async(
-            prompt,
-            max_new_tokens=agent.max_new_tokens,
+        return await agent.complete_turn_async(
+            ModelTurnRequest.from_dict(model_request or {}, max_output_tokens=agent.max_new_tokens),
             prompt_cache_key=prompt_cache_key,
             prompt_cache_retention=prompt_cache_retention,
         )
 
     @staticmethod
-    def _todo_lookup(todos):
-        return {str(item.get("id", "")).strip(): item for item in list(todos or [])}
+    def _normalize_null_args(arguments):
+        return {key: value for key, value in dict(arguments or {}).items() if value is not None}
 
-    @staticmethod
-    def _todo_is_done(todo):
-        return str((todo or {}).get("status", "")).strip() == "done"
-
-    @staticmethod
-    def _todos_complete(todos):
-        return all(str(item.get("status", "")).strip() == "done" for item in list(todos or []))
-
-    def _normalize_plan(self, plan, original_user_message):
-        if not isinstance(plan, dict):
-            return self.agent._fallback_request_plan(original_user_message, error="invalid_request_plan_object")
-        rewritten_request = str(plan.get("rewritten_request", "")).strip() or str(original_user_message or "").strip()
-        todos = []
-        seen_ids = set()
-        active_ids = []
-        for item in list(plan.get("todos", []) or []):
-            if not isinstance(item, dict):
-                continue
-            todo_id = str(item.get("id", "")).strip()
-            status = str(item.get("status", "")).strip().lower()
-            text = str(item.get("text", "")).strip()
-            if not todo_id or todo_id in seen_ids or status not in {"active", "pending"} or not text:
-                return self.agent._fallback_request_plan(original_user_message, error="invalid_request_plan_shape")
-            seen_ids.add(todo_id)
-            todos.append({"id": todo_id, "status": status, "text": text})
-            if status == "active":
-                active_ids.append(todo_id)
-        if not todos or len(active_ids) != 1:
-            return self.agent._fallback_request_plan(original_user_message, error="invalid_request_plan_shape")
+    def _structured_tool_output(self, tool_result):
+        agent = self.agent
+        metadata = agent.redact_artifact(dict(getattr(tool_result, "metadata", {}) or {}))
         return {
-            "rewritten_request": rewritten_request,
-            "todos": todos,
-            "active_todo_id": active_ids[0],
-            "valid": bool(plan.get("valid", True)),
-            "error": str(plan.get("error", "")).strip(),
-            "raw_text": str(plan.get("raw_text", "")).strip(),
+            "status": str(metadata.get("tool_status", "ok")),
+            "content": agent.redact_text(strip_tool_hints(str(getattr(tool_result, "content", "")))),
+            "metadata": metadata,
+            "error": str(metadata.get("tool_error_code", "")),
         }
 
-    def _apply_todo_update(self, task_state, todo_update):
-        operations = list((todo_update or {}).get("operations", []) or [])
-        todos = [dict(item) for item in list(task_state.todos or [])]
-        lookup = self._todo_lookup(todos)
-        changed = False
-        blocked_todo_id = ""
+    @staticmethod
+    def _is_concurrency_safe(agent, call):
+        tool = agent.tools.get(call.name, {})
+        return bool(tool.get("concurrency_safe", False)) and not bool(tool.get("risky", True))
 
-        for op in operations:
-            action = str(op.get("op", "")).strip()
-            todo_id = str(op.get("id", "")).strip()
-            if action == "append":
-                if not todo_id or todo_id in lookup:
-                    return {"valid": False, "error": f"invalid_append:{todo_id}"}
-                text = str(op.get("text", "")).strip()
-                if not text:
-                    return {"valid": False, "error": "empty_append_text"}
-                new_item = {"id": todo_id, "status": "pending", "text": text}
-                todos.append(new_item)
-                lookup[todo_id] = new_item
-                changed = True
+    def _has_same_turn_duplicates(self, calls):
+        signatures = set()
+        for call in calls:
+            if call.error or not call.call_id or not call.name or not isinstance(call.arguments, dict):
                 continue
+            arguments = self._normalize_null_args(call.arguments)
+            signature = (call.name, json.dumps(arguments, ensure_ascii=False, sort_keys=True))
+            if signature in signatures:
+                return True
+            signatures.add(signature)
+        return False
 
-            item = lookup.get(todo_id)
-            if item is None:
-                return {"valid": False, "error": f"unknown_todo_id:{todo_id}"}
+    @staticmethod
+    def _prepare_native_rejection(call, arguments, error, content):
+        from .tool_executor import ToolExecutionResult
 
-            if action == "complete":
-                if item.get("status") != "done":
-                    item["status"] = "done"
-                    changed = True
-                continue
+        return PreparedToolResult(
+            call=call,
+            arguments=dict(arguments or {}),
+            requested_args=dict(arguments or {}),
+            tool_result=ToolExecutionResult(
+                content=content,
+                metadata={"tool_status": "rejected", "tool_error_code": error},
+            ),
+            record_progress=False,
+            rejection_error=error,
+        )
 
-            if action == "activate":
-                if item.get("status") == "done":
-                    return {"valid": False, "error": f"cannot_activate_done:{todo_id}"}
-                for current in todos:
-                    if current.get("status") == "active":
-                        current["status"] = "pending"
-                item["status"] = "active"
-                changed = True
-                continue
-
-            if action == "drop":
-                if item.get("status") == "done":
-                    return {"valid": False, "error": f"cannot_drop_done:{todo_id}"}
-                todos = [current for current in todos if str(current.get("id", "")).strip() != todo_id]
-                lookup.pop(todo_id, None)
-                changed = True
-                continue
-
-            if action == "block":
-                if item.get("status") == "done":
-                    return {"valid": False, "error": f"cannot_block_done:{todo_id}"}
-                for current in todos:
-                    if current.get("status") == "active":
-                        current["status"] = "pending"
-                item["status"] = "blocked"
-                blocked_todo_id = todo_id
-                changed = True
-                continue
-
-            return {"valid": False, "error": f"unsupported_todo_op:{action}"}
-
-        active_ids = [str(item.get("id", "")).strip() for item in todos if str(item.get("status", "")).strip() == "active"]
-        blocked_ids = [str(item.get("id", "")).strip() for item in todos if str(item.get("status", "")).strip() == "blocked"]
-        if len(active_ids) > 1 or len(blocked_ids) > 1:
-            return {"valid": False, "error": "invalid_todo_state_shape"}
-        if blocked_ids:
-            blocked_todo_id = blocked_ids[0]
-            active_todo_id = ""
+    async def _execute_native_tool_call(self, task_state, progress_state, call, seen_signatures):
+        agent = self.agent
+        arguments = self._normalize_null_args(call.arguments)
+        requested_args = dict(arguments)
+        arguments, argument_normalizations = agent.normalize_tool_arguments(call.name, arguments)
+        signature = (call.name, json.dumps(arguments, ensure_ascii=False, sort_keys=True))
+        if call.error or not call.call_id or not call.name or not isinstance(call.arguments, dict):
+            return self._prepare_native_rejection(
+                call,
+                arguments,
+                call.error or "invalid_tool_call",
+                "error: invalid native tool call arguments",
+            )
+        if signature in seen_signatures:
+            return self._prepare_native_rejection(
+                call,
+                arguments,
+                "duplicate_same_turn_call",
+                f"error: duplicate tool call for {call.name} in the same model turn",
+            )
+        seen_signatures.add(signature)
+        auto_read_decision = None
+        if call.name == "read_file":
+            auto_read_decision = agent.auto_continue_read_file_args(arguments)
+            if auto_read_decision.get("status") == "continued":
+                arguments = dict(auto_read_decision.get("args", {}))
+        agent.report_tool_call(call.name, arguments)
+        if call.name == "read_file" and auto_read_decision and auto_read_decision.get("status") == "fully_read":
+            tool_result = agent.synthetic_fully_read_result(
+                path=requested_args.get("path", ""), requested_offset=auto_read_decision.get("requested_offset", 1),
+                limit=auto_read_decision.get("limit", 1), coverage=auto_read_decision.get("coverage", {}),
+            )
         else:
-            if not active_ids:
-                for item in todos:
-                    if str(item.get("status", "")).strip() == "pending":
-                        item["status"] = "active"
-                        active_ids = [str(item.get("id", "")).strip()]
-                        changed = True
-                        break
-            active_todo_id = active_ids[0] if active_ids else ""
+            tool_execution_context = {
+                "requested_args": requested_args,
+                "argument_normalizations": argument_normalizations,
+            }
+            if self._is_concurrency_safe(agent, call):
+                tool_result = await asyncio.to_thread(
+                    agent.execute_tool,
+                    call.name,
+                    arguments,
+                    tool_execution_context,
+                )
+            else:
+                tool_result = agent.execute_tool(
+                    call.name,
+                    arguments,
+                    execution_context=tool_execution_context,
+                )
+        if call.name in {"run_shell", "task_output"}:
+            tool_result = await agent.maybe_repair_shell_failure_async(call.name, arguments, tool_result)
+        return PreparedToolResult(
+            call=call,
+            arguments=arguments,
+            requested_args=requested_args,
+            tool_result=tool_result,
+        )
 
-        task_state.update_todo_state(
-            rewritten_request=task_state.rewritten_request,
-            todos=todos,
-            active_todo_id=active_todo_id,
-            todo_version=int(task_state.todo_version or 0) + 1,
-            last_todo_update=json.dumps(operations, ensure_ascii=False),
-            blocked_todo_id=blocked_todo_id,
+    def _commit_native_tool_result(self, task_state, progress_state, prepared, externalization_reason=""):
+        agent = self.agent
+        call = prepared.call
+        tool_result = agent.externalize_tool_result(
+            call.call_id or "invalid_call",
+            call.name or "unknown",
+            prepared.tool_result,
+            externalization_reason,
         )
-        self.agent.set_transient_todo_state(
-            rewritten_request=task_state.rewritten_request,
-            todos=todos,
-            active_todo_id=active_todo_id,
-            blocked_todo_id=blocked_todo_id,
-        )
-        return {
-            "valid": True,
-            "changed": changed,
-            "todos": todos,
-            "active_todo_id": active_todo_id,
-            "blocked_todo_id": blocked_todo_id,
-            "all_done": self._todos_complete(todos),
-        }
+        if call.name == "use_skill" and str((tool_result.metadata or {}).get("tool_status", "")) == "ok":
+            agent.register_pending_task_skill(call.call_id, task_state)
+        if call.name == "read_file":
+            agent.report_tool_result(call.name, prepared.arguments, tool_result.metadata, content=tool_result.content)
+        output = self._structured_tool_output(tool_result)
+        raw_metadata = dict(tool_result.metadata or {})
+        stored_metadata = agent.redact_artifact(raw_metadata)
+        archive_summary = agent.redact_text(str(raw_metadata.get("archive_summary", "")).strip())
+        stored_content = agent.redact_text(strip_tool_hints(str(tool_result.content)))
+        if call.name in {"read_file", "use_skill", "todo_write", "run_shell_bg", "task_output", "task_list", "task_stop"} and archive_summary:
+            stored_content = archive_summary
+        agent.record({
+            "role": "tool", "call_id": call.call_id or "invalid_call", "name": call.name or "unknown", "args": prepared.arguments,
+            "content": stored_content, "result": output, "created_at": now(), "metadata": stored_metadata,
+            **({"summary": archive_summary} if archive_summary else {}),
+        })
+        if prepared.rejection_error:
+            agent.emit_trace(
+                task_state,
+                "tool_rejected",
+                {"call_id": call.call_id or "invalid_call", "name": call.name or "unknown", "error": prepared.rejection_error},
+            )
+        if prepared.record_progress:
+            self._record_tool_progress(task_state, progress_state, call.name, prepared.arguments, tool_result.metadata)
+        agent.emit_trace(task_state, "tool_executed", {"call_id": call.call_id, "name": call.name, "args": prepared.arguments, "requested_args": prepared.requested_args, "result": clip(str(tool_result.content), 500), **dict(tool_result.metadata or {})})
+        return ToolResultMessage(call_id=call.call_id or "invalid_call", name=call.name or "unknown", output=output)
+
+    async def _execute_native_tool_calls(self, task_state, progress_state, calls):
+        agent = self.agent
+        calls = list(calls or [])
+        seen_signatures = set()
+        results = []
+        index = 0
+        while index < len(calls):
+            call = calls[index]
+            if not self._is_concurrency_safe(agent, call):
+                results.append(await self._execute_native_tool_call(task_state, progress_state, call, seen_signatures))
+                index += 1
+                continue
+            group = []
+            while index < len(calls) and self._is_concurrency_safe(agent, calls[index]):
+                group.append(calls[index])
+                index += 1
+            if len(group) == 1 or self._has_same_turn_duplicates(group):
+                results.append(await self._execute_native_tool_call(task_state, progress_state, group[0], seen_signatures))
+                for duplicate_call in group[1:]:
+                    results.append(await self._execute_native_tool_call(task_state, progress_state, duplicate_call, seen_signatures))
+                continue
+            agent.emit_trace(task_state, "tool_concurrency_batch", {"call_ids": [item.call_id for item in group], "names": [item.name for item in group]})
+            results.extend(await asyncio.gather(*(self._execute_native_tool_call(task_state, progress_state, item, seen_signatures) for item in group)))
+        reasons = {}
+        total_inline_chars = 0
+        candidates = []
+        for result in results:
+            size = agent.tool_result_output_chars(result.call.name, result.tool_result)
+            if size > TOOL_RESULT_INLINE_LIMIT_CHARS:
+                reasons[id(result)] = "per_result_limit"
+            elif size:
+                total_inline_chars += size
+                candidates.append((size, len(candidates), result))
+        if total_inline_chars > TOOL_RESULT_BATCH_LIMIT_CHARS:
+            for size, _index, result in sorted(candidates, key=lambda item: (-item[0], item[1])):
+                if total_inline_chars <= TOOL_RESULT_BATCH_LIMIT_CHARS:
+                    break
+                reasons[id(result)] = "message_budget"
+                total_inline_chars -= size
+        return [
+            self._commit_native_tool_result(
+                task_state,
+                progress_state,
+                result,
+                reasons.get(id(result), ""),
+            )
+            for result in results
+        ]
 
     @staticmethod
     def _tool_chain_key(name, args, metadata):
@@ -277,39 +350,30 @@ class AgentLoop:
         task_state.update_progress_state(chain=chain_key, cursor=cursor, stall_reason="")
         progress_state.last_chain_cursor_by_key[chain_key] = cursor
 
-    async def _request_final_answer(self, task_state, original_user_message):
-        completed = []
-        for item in list(task_state.todos or []):
-            if str(item.get("status", "")).strip() == "done":
-                completed.append(f"- [{item.get('id', '')}] {str(item.get('text', '')).strip()}")
-        prompt = "\n\n".join(
-            [
-                "The todo list for this task is complete.",
-                "Write the final user-facing answer now.",
-                "Do not return XML, <todo_update>, <display>, or <tool>.",
-                "Answer directly in the user's language.",
-                f"Original user request:\n{original_user_message}",
-                f"Rewritten request:\n{str(task_state.rewritten_request or original_user_message).strip()}",
-                "Completed todos:\n" + ("\n".join(completed) if completed else "- none"),
-                "Transcript:\n" + self.agent.history_text(),
-            ]
-        )
-        raw = await self.agent.complete_text_async(prompt, max_new_tokens=self.agent.max_new_tokens)
-        answer = self.agent.extract_answer_text(raw).strip()
-        if answer:
-            return answer
-        return str(raw or "").strip()
-
-    def _finalize_run(self, task_state, original_user_message, final_answer, run_started_at, *, stop_reason=None):
+    def _finalize_run(
+        self,
+        task_state,
+        original_user_message,
+        final_answer,
+        run_started_at,
+        *,
+        stop_reason=None,
+        success_reason=None,
+        completion_mode="",
+    ):
         agent = self.agent
         if final_answer:
             agent.record({"role": "assistant", "content": final_answer, "created_at": now()})
-        if stop_reason == STOP_REASON_TODO_BLOCKED_WAITING_FOR_USER:
+        if stop_reason:
             task_state.stop(stop_reason, final_answer=final_answer)
-        elif stop_reason == STOP_REASON_FINAL_ANSWER_CALL_FAILED:
-            task_state.stop(stop_reason, status="failed", final_answer=final_answer)
-        elif stop_reason:
-            task_state.stop(stop_reason, final_answer=final_answer)
+            if completion_mode:
+                task_state.completion_mode = str(completion_mode)
+        elif success_reason:
+            task_state.finish_success(
+                final_answer,
+                stop_reason=success_reason,
+                completion_mode=completion_mode or "native_text_answer",
+            )
         else:
             task_state.finish_success(final_answer)
         checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger=task_state.stop_reason or "run_finished")
@@ -333,337 +397,127 @@ class AgentLoop:
             },
         )
         agent.run_store.write_report(task_state, agent.redact_artifact(agent.build_report(task_state)))
+        agent.clear_task_skills(task_state, reason="run_finished")
         agent.clear_transient_todo_state()
+        agent.clear_transient_skill_route()
         return final_answer
 
     async def _run(self, user_message):
         agent = self.agent
         run_started_at = time.monotonic()
         original_user_message = str(user_message or "")
+        agent.shell_repair_artifacts = []
+        agent.tool_output_stats = {
+            "externalized": 0,
+            "per_result_limit": 0,
+            "message_budget": 0,
+            "persistence_failed": 0,
+            "original_bytes": 0,
+            "stored_bytes": 0,
+            "artifact_truncated": 0,
+        }
         agent.memory.set_task_summary(original_user_message)
         agent.record({"role": "user", "content": original_user_message, "created_at": now()})
-
-        task_state = TaskState.create(
-            run_id=agent.new_run_id(),
-            task_id=agent.new_task_id(),
-            user_request=original_user_message,
-        )
+        task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=original_user_message)
         task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)
         agent.current_task_state = task_state
         agent.current_run_dir = agent.run_store.start_run(task_state)
-        agent.emit_trace(
-            task_state,
-            "run_started",
-            {
-                "task_id": task_state.task_id,
-                "user_request": clip(original_user_message, 300),
-            },
-        )
+        agent.start_task_skills(task_state)
+        agent.emit_trace(task_state, "run_started", {"task_id": task_state.task_id, "user_request": clip(original_user_message, 300), "protocol": "native-v1"})
 
-        plan = await agent.rewrite_user_message_async(original_user_message)
-        plan = self._normalize_plan(plan, original_user_message)
-        task_state.update_todo_state(
-            rewritten_request=plan["rewritten_request"],
-            todos=plan["todos"],
-            active_todo_id=plan["active_todo_id"],
-            todo_version=1,
-            last_todo_update="",
-            blocked_todo_id="",
-        )
-        agent.set_transient_todo_state(
-            rewritten_request=plan["rewritten_request"],
-            todos=plan["todos"],
-            active_todo_id=plan["active_todo_id"],
-            blocked_todo_id="",
-        )
-        rewrite_metadata = dict(getattr(agent, "last_user_request_rewrite", {}) or {})
-        if rewrite_metadata.get("enabled"):
-            agent.emit_trace(
-                task_state,
-                "user_request_rewritten",
-                {
-                    **rewrite_metadata,
-                    "rewritten_request": clip(plan["rewritten_request"], 300),
-                    "todo_count": len(plan["todos"]),
-                    "active_todo_id": plan["active_todo_id"],
-                },
-            )
-
+        skill_catalog = agent.refresh_skill_catalog()
+        skill_categories = await agent.route_skill_categories_async(original_user_message, skill_catalog=skill_catalog)
+        task_state.update_todo_state(todos=[], active_todo_id="", todo_version=0, last_todo_update="", blocked_todo_id="", planning_mode="direct")
+        task_state.update_skill_routing(skill_categories)
+        agent.set_transient_todo_state(todos=[], active_todo_id="", blocked_todo_id="")
+        agent.set_transient_skill_route(skill_catalog, task_state.skill_categories)
+        agent.emit_trace(task_state, "skill_categories_routed", dict(getattr(agent, "last_skill_routing", {}) or {}))
         progress_state = ProgressState()
-        raw_tool_call_backstop = max(agent.max_steps * 8, agent.max_steps + 24)
         raw_attempt_backstop = max(agent.max_steps * 12, agent.max_steps + 36)
-        invalid_protocol_streak = 0
+        last_assistant_progress_message = ""
 
-        while True:
-            # if progress_state.logical_steps_used >= agent.max_steps:
-            #     final = "Stopped after reaching the logical step limit without completing the todo list."
-            #     return self._finalize_run(task_state, original_user_message, final, run_started_at, stop_reason="step_limit_reached")
-            # if progress_state.raw_tool_calls >= raw_tool_call_backstop:
-            #     final = "Stopped after too many tool calls without completing the todo list."
-            #     return self._finalize_run(task_state, original_user_message, final, run_started_at, stop_reason="retry_limit_reached")
-            if progress_state.raw_model_attempts >= raw_attempt_backstop:
-                final = "Stopped after too many model attempts without completing the todo list."
-                return self._finalize_run(task_state, original_user_message, final, run_started_at, stop_reason="retry_limit_reached")
-
+        while progress_state.raw_model_attempts < raw_attempt_backstop:
             progress_state.raw_model_attempts += 1
             task_state.record_attempt()
             agent.run_store.write_task_state(task_state)
-
             prompt_started_at = time.monotonic()
-            prompt, prompt_metadata = await agent._build_prompt_and_metadata_async(task_state.rewritten_request or original_user_message)
-            prompt_path = agent.run_store.write_prompt(task_state, progress_state.raw_model_attempts, agent.redact_text(prompt))
-            agent.emit_trace(
+            _prompt, prompt_metadata = await agent._build_prompt_and_metadata_async(original_user_message)
+            model_request = dict(agent.last_model_request or {})
+            request_path = agent.run_store.request_path(
                 task_state,
-                "prompt_built",
-                {
-                    "prompt_metadata": prompt_metadata,
-                    "prompt_path": str(prompt_path),
-                    "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
-                },
+                progress_state.raw_model_attempts,
             )
-            if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
-                checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="freshness_mismatch")
-                agent.run_store.write_task_state(task_state)
-                agent.emit_trace(task_state, "checkpoint_created", {"checkpoint_id": checkpoint["checkpoint_id"], "trigger": "freshness_mismatch"})
-            elif prompt_metadata.get("resume_status") == CHECKPOINT_WORKSPACE_MISMATCH_STATUS:
-                checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="workspace_mismatch")
-                agent.run_store.write_task_state(task_state)
-                agent.emit_trace(task_state, "checkpoint_created", {"checkpoint_id": checkpoint["checkpoint_id"], "trigger": "workspace_mismatch"})
-            elif prompt_metadata.get("budget_reductions"):
-                checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="context_reduction")
-                agent.run_store.write_task_state(task_state)
-                agent.emit_trace(task_state, "checkpoint_created", {"checkpoint_id": checkpoint["checkpoint_id"], "trigger": "context_reduction"})
-
-            agent.emit_trace(
-                task_state,
-                "model_requested",
-                {
-                    "attempts": task_state.attempts,
-                    "tool_steps": task_state.tool_steps,
-                    "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
-                },
-            )
-
-            prompt_cache_key = None
-            prompt_cache_retention = None
-            if getattr(agent.model_client, "supports_prompt_cache", False):
-                prompt_cache_key = prompt_metadata.get("prompt_cache_key")
-                prompt_cache_retention = "in_memory"
-
+            for skill in agent.new_task_skill_injections(
+                [
+                    str(item.get("source_call_id", ""))
+                    for item in model_request.get("messages", [])
+                    if item.get("role") == "skill_context"
+                ]
+            ):
+                agent.emit_trace(task_state, "task_skill_injected", {**skill, "request_path": str(request_path)})
+            agent.emit_trace(task_state, "request_built", {"request_path": str(request_path), "message_count": len(model_request.get("messages", [])), "tool_count": len(model_request.get("tools", [])), "duration_ms": int((time.monotonic() - prompt_started_at) * 1000)})
+            prompt_cache_key = prompt_metadata.get("prompt_cache_key") if getattr(agent.model_client, "supports_prompt_cache", False) else None
             model_started_at = time.monotonic()
             try:
-                raw = await self._complete_model_async(
-                    prompt,
-                    prompt_cache_key=prompt_cache_key,
-                    prompt_cache_retention=prompt_cache_retention,
-                )
+                response = await self._complete_model_async(model_request, prompt_cache_key=prompt_cache_key, prompt_cache_retention="in_memory" if prompt_cache_key else None)
             except Exception as exc:
-                final = f"Model error: {exc}"
-                return self._finalize_run(task_state, original_user_message, final, run_started_at, stop_reason="model_error")
-
+                agent.run_store.write_request(
+                    task_state,
+                    progress_state.raw_model_attempts,
+                    agent.redact_artifact(
+                        {
+                            "provider_request": agent.redact_task_skill_artifact(
+                                dict(agent.last_provider_request or {})
+                            )
+                        }
+                    ),
+                )
+                return self._finalize_run(task_state, original_user_message, f"Model error: {exc}", run_started_at, stop_reason="model_error")
+            agent.run_store.write_request(
+                task_state,
+                progress_state.raw_model_attempts,
+                agent.redact_artifact(
+                    {
+                        "provider_request": agent.redact_task_skill_artifact(
+                            dict(agent.last_provider_request or {})
+                        )
+                    }
+                ),
+            )
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
-            if completion_metadata:
-                prompt_metadata.update(completion_metadata)
             agent.last_completion_metadata = completion_metadata
-            agent.last_prompt_metadata = prompt_metadata
-
-            kind, payload = agent.parse(raw)
-            agent.emit_trace(
+            agent.last_prompt_metadata = {**prompt_metadata, **completion_metadata}
+            response_path = agent.run_store.write_response(
                 task_state,
-                "model_parsed",
-                {
-                    "kind": kind,
-                    "completion_metadata": completion_metadata,
-                    "duration_ms": int((time.monotonic() - model_started_at) * 1000),
-                },
-            )
-
-            if kind == "retry":
-                invalid_protocol_streak += 1
-                agent.emit_trace(
-                    task_state,
-                    "invalid_todo_protocol_turn",
+                progress_state.raw_model_attempts,
+                agent.redact_artifact(
                     {
-                        "problem": str((payload or {}).get("problem", "")),
-                        "raw_excerpt": clip(str((payload or {}).get("raw_text", "")), 300),
-                        "streak": invalid_protocol_streak,
-                    },
-                )
-                if invalid_protocol_streak >= 2:
-                    final = "Stopped because the model failed to follow the todo_update protocol."
-                    return self._finalize_run(
-                        task_state,
-                        original_user_message,
-                        final,
-                        run_started_at,
-                        stop_reason=STOP_REASON_INVALID_TODO_PROTOCOL,
-                    )
-                continue
-
-            invalid_protocol_streak = 0
-            todo_update = (payload or {}).get("todo_update", {}) if isinstance(payload, dict) else {}
-            todo_result = self._apply_todo_update(task_state, todo_update)
-            if not todo_result.get("valid"):
-                agent.emit_trace(
-                    task_state,
-                    "invalid_todo_protocol_turn",
-                    {
-                        "problem": str(todo_result.get("error", "")),
-                        "raw_excerpt": clip(str(raw), 300),
-                        "streak": 2,
-                    },
-                )
-                final = "Stopped because the model returned an invalid todo update."
-                return self._finalize_run(
-                    task_state,
-                    original_user_message,
-                    final,
-                    run_started_at,
-                    stop_reason=STOP_REASON_INVALID_TODO_PROTOCOL,
-                )
-
-            agent.emit_trace(
-                task_state,
-                "todo_state_updated",
-                {
-                    "todo_version": task_state.todo_version,
-                    "active_todo_id": task_state.active_todo_id,
-                    "blocked_todo_id": task_state.blocked_todo_id,
-                    "todos": list(task_state.todos or []),
-                    "changed": bool(todo_result.get("changed")),
-                },
+                        "provider_response": dict(
+                            agent.last_provider_response or response.raw_response or {}
+                        )
+                    }
+                ),
             )
+            agent.emit_trace(task_state, "model_responded", {"response_path": str(response_path), "call_ids": [call.call_id for call in response.tool_calls], "tool_calls": len(response.tool_calls), "text_chars": len(response.text), "parse_errors": list(response.parse_errors), "duration_ms": int((time.monotonic() - model_started_at) * 1000)})
 
-            if kind == "tool":
-                name = str(payload.get("name", "")).strip()
-                args = payload.get("args", {}) if isinstance(payload.get("args", {}), dict) else {}
-                original_args = dict(args)
-                auto_read_decision = None
-                if name == "read_file":
-                    auto_read_decision = agent.auto_continue_read_file_args(args)
-                    if auto_read_decision.get("status") == "continued":
-                        args = dict(auto_read_decision.get("args", {}))
-
-                tool_started_at = time.monotonic()
-                agent.report_tool_call(name, args)
-                if name == "read_file" and auto_read_decision and auto_read_decision.get("status") == "fully_read":
-                    tool_result = agent.synthetic_fully_read_result(
-                        path=original_args.get("path", ""),
-                        requested_offset=auto_read_decision.get("requested_offset", 1),
-                        limit=auto_read_decision.get("limit", 1),
-                        coverage=auto_read_decision.get("coverage", {}),
-                    )
-                else:
-                    tool_result = agent.execute_tool(name, args, execution_context={})
-                if name == "read_file":
-                    agent.report_tool_result(name, args, tool_result.metadata, content=tool_result.content)
-
-                result = tool_result.content
-                archive_summary = str((tool_result.metadata or {}).get("archive_summary", "")).strip()
-                stored_content = result
-                if name in {"read_file", "run_shell_bg", "task_output", "task_list", "task_stop"} and archive_summary:
-                    stored_content = archive_summary
-                elif name in {"git_status", "git_diff"}:
-                    stored_content = strip_tool_hints(result)
-
-                tool_record = {
-                    "role": "tool",
-                    "name": name,
-                    "args": args,
-                    "content": stored_content,
-                    "created_at": now(),
-                    "metadata": dict(tool_result.metadata or {}),
+            if response.tool_calls:
+                assistant_record = {
+                    "role": "assistant", "content": response.text, "tool_calls": [call.to_dict() for call in response.tool_calls],
+                    "provider_output_items": list(response.provider_output_items), "created_at": now(),
                 }
-                if archive_summary:
-                    tool_record["summary"] = archive_summary
-                agent.record(tool_record)
-                self._record_tool_progress(task_state, progress_state, name, args, tool_result.metadata)
-                agent.run_store.write_task_state(task_state)
-                agent.emit_trace(
-                    task_state,
-                    "tool_executed",
-                    {
-                        "name": name,
-                        "args": args,
-                        "requested_args": original_args if name == "read_file" and auto_read_decision else args,
-                        "result": clip(result, 500),
-                        "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
-                        **dict(tool_result.metadata or {}),
-                    },
-                )
+                agent.record(assistant_record)
+                if response.text:
+                    last_assistant_progress_message = self._report_assistant_progress(task_state, response.text, "assistant_text", last_assistant_progress_message)
+                await self._execute_native_tool_calls(task_state, progress_state, response.tool_calls)
                 checkpoint = agent.create_checkpoint(task_state, original_user_message, trigger="tool_executed")
                 agent.run_store.write_task_state(task_state)
-                agent.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "tool_executed",
-                    },
-                )
+                agent.emit_trace(task_state, "checkpoint_created", {"checkpoint_id": checkpoint["checkpoint_id"], "trigger": "tool_executed"})
                 continue
 
-            answer_text = str((payload or {}).get("text", "")).strip() if isinstance(payload, dict) else ""
-            raw_text = str((payload or {}).get("raw_text", "")).strip() if isinstance(payload, dict) else str(raw or "").strip()
-            display_text = str((payload or {}).get("display_text", "")).strip() if isinstance(payload, dict) else ""
+            final_text = str(response.text or response.refusal or "").strip()
+            if not final_text:
+                final_text = "Model returned neither text nor a native tool call."
+                return self._finalize_run(task_state, original_user_message, final_text, run_started_at, stop_reason=STOP_REASON_INVALID_NATIVE_RESPONSE)
+            return self._finalize_run(task_state, original_user_message, final_text, run_started_at, success_reason=STOP_REASON_FINAL_ANSWER_RETURNED, completion_mode="native_text_answer")
 
-            if kind == "todo_only":
-                if str(task_state.blocked_todo_id or "").strip():
-                    final = "Current todo is blocked and waiting for user input."
-                    return self._finalize_run(
-                        task_state,
-                        original_user_message,
-                        final,
-                        run_started_at,
-                        stop_reason=STOP_REASON_TODO_BLOCKED_WAITING_FOR_USER,
-                    )
-                if todo_result.get("all_done"):
-                    final = (await self._request_final_answer(task_state, original_user_message)).strip()
-                    if not final:
-                        final = "Failed to produce a final answer after the todo list was completed."
-                        return self._finalize_run(
-                            task_state,
-                            original_user_message,
-                            final,
-                            run_started_at,
-                            stop_reason=STOP_REASON_FINAL_ANSWER_CALL_FAILED,
-                        )
-                    return self._finalize_run(task_state, original_user_message, final, run_started_at)
-                if display_text:
-                    agent.report_assistant_message(display_text, compact=False)
-                agent.run_store.write_task_state(task_state)
-                continue
-
-            if str(task_state.blocked_todo_id or "").strip():
-                final = answer_text or raw_text or "Current todo is blocked and waiting for user input."
-                return self._finalize_run(
-                    task_state,
-                    original_user_message,
-                    final,
-                    run_started_at,
-                    stop_reason=STOP_REASON_TODO_BLOCKED_WAITING_FOR_USER,
-                )
-
-            if todo_result.get("all_done"):
-                final = answer_text or raw_text
-                if not final:
-                    final = (await self._request_final_answer(task_state, original_user_message)).strip()
-                    if not final:
-                        final = "Failed to produce a final answer after the todo list was completed."
-                        return self._finalize_run(
-                            task_state,
-                            original_user_message,
-                            final,
-                            run_started_at,
-                            stop_reason=STOP_REASON_FINAL_ANSWER_CALL_FAILED,
-                        )
-                return self._finalize_run(task_state, original_user_message, final, run_started_at)
-
-            if answer_text:
-                if display_text:
-                    agent.report_assistant_message(display_text, compact=False)
-                else:
-                    agent.report_assistant_message(answer_text)
-                agent.record_history_item({"role": "assistant", "content": answer_text, "created_at": now()})
-                agent.run_store.write_task_state(task_state)
-                continue
+        return self._finalize_run(task_state, original_user_message, "Stopped after too many model attempts.", run_started_at, stop_reason="retry_limit_reached")

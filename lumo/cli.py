@@ -17,6 +17,7 @@ from pathlib import Path
 from .config import load_project_env, provider_env
 from .providers.clients import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import Pico, SessionStore
+from . import skills as skilllib
 from .workspace import AGENT_STATE_DIR, WorkspaceContext
 
 DEFAULT_SECRET_ENV_NAMES = (
@@ -67,6 +68,7 @@ HELP_DETAILS = textwrap.dedent(
     Commands:
     /help    Show this help message.
     /memory  Show durable memory loaded from .lumo/memory.
+    /skills  List workspace skills grouped by category.
     /session Show the path to the saved session file.
     /reset   Clear the current session history and memory.
     /exit    Exit the agent.
@@ -82,6 +84,7 @@ DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
+OPENAI_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 SECRET_ENV_NAMES_VARS = ("LUMO_SECRET_ENV_NAMES", "PICO_SECRET_ENV_NAMES")
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 ANSI_RESET = "\x1b[0m"
@@ -197,6 +200,27 @@ def _effective_model(args, provider):
     return DEFAULT_OLLAMA_MODEL
 
 
+def _openai_reasoning_effort():
+    effort = provider_env("LUMO_OPENAI_MODEL_EFFORT").strip().lower()
+    if effort and effort not in OPENAI_REASONING_EFFORTS:
+        allowed = ", ".join(sorted(OPENAI_REASONING_EFFORTS))
+        raise ValueError(f"LUMO_OPENAI_MODEL_EFFORT must be one of: {allowed}")
+    return effort or None
+
+
+def _openai_temperature():
+    value = provider_env("LUMO_OPENAI_TEMPERATURE").strip()
+    if not value:
+        return None
+    try:
+        temperature = float(value)
+    except ValueError as exc:
+        raise ValueError("LUMO_OPENAI_TEMPERATURE must be a number between 0 and 2") from exc
+    if not 0 <= temperature <= 2:
+        raise ValueError("LUMO_OPENAI_TEMPERATURE must be a number between 0 and 2")
+    return temperature
+
+
 def _configured_secret_names(args):
     configured_secret_names = set(DEFAULT_SECRET_ENV_NAMES)
     configured_secret_names.update(str(name).upper() for name in args.secret_env_names)
@@ -239,8 +263,9 @@ def _build_model_client(args):
             model=model,
             base_url=base_url,
             api_key=api_key,
-            temperature=args.temperature,
+            temperature=_openai_temperature(),
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
+            reasoning_effort=_openai_reasoning_effort(),
         )
     if provider == "anthropic":
         model = _effective_model(args, provider)
@@ -405,7 +430,6 @@ def build_agent(args):
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
-            feature_flags={"request_rewrite": True},
             tool_call_reporter=_stderr_tool_call_reporter,
             assistant_message_reporter=_stderr_assistant_message_reporter,
         )
@@ -417,7 +441,6 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
-        feature_flags={"request_rewrite": True},
         tool_call_reporter=_stderr_tool_call_reporter,
         assistant_message_reporter=_stderr_assistant_message_reporter,
     )
@@ -510,6 +533,9 @@ def main(argv=None):
             continue
         if user_input == "/memory":
             print(agent.memory_text())
+            continue
+        if user_input == "/skills":
+            print(skilllib.render_skill_catalog(agent.refresh_skill_catalog()))
             continue
         if user_input == "/session":
             print(agent.session_path)

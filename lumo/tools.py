@@ -5,15 +5,20 @@
 """
 
 import fnmatch
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import textwrap
 import time
 from functools import partial
+from pathlib import Path
 
 from . import git_tools as gitlib
+from . import skills as skilllib
 from .workspace import IGNORED_PATH_NAMES
+from .tool_output import ShellOutputCapture
 
 READ_FILE_MAX_LIMIT = 2000
 READ_FILE_DEFAULT_LIMIT = 200
@@ -21,8 +26,13 @@ READ_FILE_DEFAULT_UNSPECIFIED_LIMIT = READ_FILE_MAX_LIMIT
 READ_FILE_ARCHIVE_SUMMARY_LINES = 12
 GLOB_MAX_RESULTS = 200
 GREP_DEFAULT_HEAD_LIMIT = 200
+GREP_MAX_HEAD_LIMIT = 2000
+GREP_MAX_CONTEXT_LINES = 200
 GREP_OUTPUT_MODES = {"content", "files", "count"}
 GREP_TIMEOUT_SECONDS = 20
+GREP_MAX_TIMEOUT_SECONDS = 120
+RUN_SHELL_DEFAULT_TIMEOUT = 20
+RUN_SHELL_MAX_TIMEOUT = 300
 RUN_SHELL_BG_DEFAULT_TIMEOUT = 3600
 RUN_SHELL_BG_MAX_TIMEOUT = 86400
 TASK_OUTPUT_DEFAULT_LIMIT = 4000
@@ -31,167 +41,247 @@ TASK_OUTPUT_STREAMS = {"stdout", "stderr", "both"}
 TASK_LIST_DEFAULT_LIMIT = 20
 TASK_LIST_MAX_LIMIT = 100
 TASK_LIST_STATUSES = {"all", "running", "exited", "failed", "stopped"}
+TODO_WRITE_MAX_ITEMS = 50
+DELEGATE_DEFAULT_MAX_STEPS = 3
+DELEGATE_MAX_STEPS = 12
+TODO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+TODO_STATUSES = {"pending", "active", "done", "blocked"}
+BASH_HEREDOC_PATTERN = re.compile(r"(?:^|\s)<<-?\s*(?:['\"]?[A-Za-z_][A-Za-z0-9_]*['\"]?)")
 GIT_STATUS_DEFAULT_LIMIT = gitlib.GIT_STATUS_DEFAULT_LIMIT
 GIT_STATUS_MAX_LIMIT = gitlib.GIT_STATUS_MAX_LIMIT
 GIT_DIFF_DEFAULT_LIMIT = gitlib.GIT_DIFF_DEFAULT_LIMIT
 GIT_DIFF_MAX_LIMIT = gitlib.GIT_DIFF_MAX_LIMIT
 GIT_DIFF_MODES = gitlib.GIT_DIFF_MODES
 
+
+def _nullable_integer(*, minimum=None, maximum=None, description=""):
+    definition = {"type": ["integer", "null"]}
+    if minimum is not None:
+        definition["minimum"] = int(minimum)
+    if maximum is not None:
+        definition["maximum"] = int(maximum)
+    if description:
+        definition["description"] = str(description)
+    return definition
+
+
+class UnsupportedShellSyntaxError(ValueError):
+    tool_error_code = "unsupported_shell_syntax"
+
+
+def _uses_windows_shell():
+    return os.name == "nt"
+
+
+def validate_shell_command_syntax(command):
+    text = str(command or "")
+    if _uses_windows_shell() and BASH_HEREDOC_PATTERN.search(text):
+        raise UnsupportedShellSyntaxError(
+            "Bash here-documents such as <<'PY' or <<EOF are unsupported by the Windows shell. "
+            "Use python -c only for compact code, or write a script file and run it."
+        )
+
 BASE_TOOL_SPECS = {
     "list_files": {
-        "schema": {"path": "str='.'"},
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": ["string", "null"], "description": "Workspace directory."}},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+        "concurrency_safe": True,
         "risky": False,
         "description": "List files in the workspace.",
     },
     "glob": {
-        "schema": {"pattern": "str", "path": "str='.'"},
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": ["string", "null"]},
+            },
+            "required": ["pattern", "path"],
+            "additionalProperties": False,
+        },
+        "concurrency_safe": True,
         "risky": False,
-        "description": (
-            "Find files by glob pattern under a directory. Use this to discover candidate files before "
-            "calling read_file or grep. If results are truncated, narrow the pattern or path and retry."
-        ),
+        "description": "Find paths by glob pattern. Use it to discover candidate files; narrow pattern or path if results are truncated.",
     },
     "read_file": {
-        "schema": {"path": "str", "offset": "int=1", "limit": "int|None=None"},
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "offset": _nullable_integer(minimum=1, description="One-based line offset."),
+                "limit": _nullable_integer(minimum=1, maximum=READ_FILE_MAX_LIMIT, description="Maximum lines to return."),
+            },
+            "required": ["path", "offset", "limit"],
+            "additionalProperties": False,
+        },
+        "concurrency_safe": True,
         "risky": False,
         "description": (
-            "Read a UTF-8 file by line window. Use this for whole-file reading, targeted follow-up after grep, raw artifact or log inspection, "
-            "and explicit user requests to read a known file itself. By default, omit limit when read_file is already the right tool so you can read the whole file when it fits within the safe per-read cap. "
-            "Only pass offset/limit when you already know the target range or when continuing from next_offset. "
-            'If has_more is true, continue with next_offset or a targeted window like {"offset":8600,"limit":300}. '
-            "After each chunk, summarize the relevant facts before deciding whether to read more."
+            "Read a UTF-8 file by line range. Use it for known files, raw artifacts/logs, or context after search. "
+            "When a tool result gives an externalized output path, read that artifact before rerunning the tool. "
+            "Omit limit to read as much as fits; use offset/limit for targeted or next_offset reads."
         ),
     },
     "grep": {
-        "schema": {
-            "pattern": "str",
-            "path": "str='.'",
-            "output_mode": "str='content'",
-            "head_limit": f"int={GREP_DEFAULT_HEAD_LIMIT}",
-            "offset": "int=0",
-            "glob": "str|None=None",
-            "-A": "int|None=None",
-            "-B": "int|None=None",
-            "-C": "int|None=None",
-            "timeout": f"int={GREP_TIMEOUT_SECONDS}",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"}, "path": {"type": ["string", "null"]},
+                "output_mode": {"type": ["string", "null"], "enum": ["content", "files", "count", None]},
+                "head_limit": _nullable_integer(minimum=1, maximum=GREP_MAX_HEAD_LIMIT, description="Maximum matching entries."),
+                "offset": _nullable_integer(minimum=0, description="Zero-based result offset."),
+                "glob": {"type": ["string", "null"]},
+                "-A": _nullable_integer(minimum=0, maximum=GREP_MAX_CONTEXT_LINES, description="Context lines after each match."),
+                "-B": _nullable_integer(minimum=0, maximum=GREP_MAX_CONTEXT_LINES, description="Context lines before each match."),
+                "-C": _nullable_integer(minimum=0, maximum=GREP_MAX_CONTEXT_LINES, description="Context lines before and after each match."),
+                "timeout": _nullable_integer(minimum=1, maximum=GREP_MAX_TIMEOUT_SECONDS, description="Search timeout in seconds."),
+            },
+            "required": ["pattern", "path", "output_mode", "head_limit", "offset", "glob", "-A", "-B", "-C", "timeout"],
+            "additionalProperties": False,
         },
+        "concurrency_safe": True,
         "risky": False,
         "description": (
-            "Search file contents with rg or a simple fallback. Use this first when you can name what to search for, "
-            "such as a symbol name, config key, error text, path fragment, function or class name, or an exact quoted phrase from the user. "
-            "Prefer output_mode='content' with a small -C window for the first pass so you can inspect local context before opening full files. "
-            "Use output_mode='files' to list matching files, "
-            "output_mode='count' for per-file match counts, glob to narrow file candidates, head_limit+offset to page "
-            "results, -A/-B/-C for surrounding lines in content mode, and timeout to bound slow searches. "
-            "When you need deeper code or config context around a match, prefer content mode with a small -C window first, "
-            "then follow up with read_file on the best candidate if needed. "
-            "If grep times out, treat it as incomplete search rather than proof of no matches."
+            "Search file contents by a reliable pattern such as a symbol, config key, error, path fragment, or exact phrase. "
+            "Prefer content mode with a small -C window before read_file; use files/count for discovery or totals. "
+            "Do not guess a pattern: use glob, list_files, or read_file when it is unclear."
         ),
     },
     "git_status": {
-        "schema": {
-            "path": "str='.'",
-            "offset": "int=0",
-            "limit": f"int={GIT_STATUS_DEFAULT_LIMIT}",
+        "parameters": {
+            "type": "object", "properties": {
+                "path": {"type": ["string", "null"]},
+                "offset": _nullable_integer(minimum=0, description="Zero-based result offset."),
+                "limit": _nullable_integer(minimum=1, maximum=GIT_STATUS_MAX_LIMIT, description="Maximum changed paths to return."),
+            }, "required": ["path", "offset", "limit"], "additionalProperties": False,
         },
+        "concurrency_safe": True,
         "risky": False,
         "description": (
-            "Inspect the current Git working tree to see which files changed. "
-            "Use this after edits to confirm the change scope, detect unexpected files, "
-            "and review staged, unstaged, untracked, or deleted paths before concluding the task. "
-            "Prefer this before git_diff when you first need a lightweight changed-file overview."
+            "Show changed-file scope in the current Git working tree, including staged, unstaged, untracked, and deleted paths. "
+            "Use after edits before git_diff to confirm the expected file set."
         ),
     },
     "git_diff": {
-        "schema": {
-            "path": "str='.'",
-            "mode": "str='workspace'",
-            "offset": "int=1",
-            "limit": f"int={GIT_DIFF_DEFAULT_LIMIT}",
+        "parameters": {
+            "type": "object", "properties": {
+                "path": {"type": ["string", "null"]},
+                "mode": {"type": ["string", "null"], "enum": ["workspace", "staged", "unstaged", None]},
+                "offset": _nullable_integer(minimum=1, description="One-based patch line offset."),
+                "limit": _nullable_integer(minimum=1, maximum=GIT_DIFF_MAX_LIMIT, description="Maximum patch lines to return."),
+            }, "required": ["path", "mode", "offset", "limit"], "additionalProperties": False,
         },
+        "concurrency_safe": False,
         "risky": False,
         "description": (
-            "Inspect the actual Git patch for the current workspace or a specific path. "
-            "Use mode='workspace' after edits to review the final patch, confirm the exact code changes, "
-            "and prepare a patch candidate for benchmark-style tasks such as SWE-bench Lite. "
-            "Prefer this when the user asks what changed, asks for a diff or patch, or when git_status already told you which files changed. "
-            "If the patch is large, runtime may externalize it to a run artifact path; then use read_file on that path to inspect the full raw patch."
+            "Show the Git patch for the workspace or a path. Use it after edits or when the user asks for changes or a patch. "
+            "Large patches may be externalized; read the returned artifact path for raw patch text."
+        ),
+    },
+    "use_skill": {
+        "parameters": {
+            "type": "object", "properties": {
+                "name": {"type": "string"}, "args": {"type": ["string", "null"]},
+            }, "required": ["name", "args"], "additionalProperties": False,
+        },
+        "concurrency_safe": False,
+        "risky": False,
+        "description": (
+            "Load a routed reusable workflow from .lumo/skills/<category>/<name>/SKILL.md. Pass the qualified "
+            "category/name shown in Skills. Use when an available skill matches the task; "
+            "its full instructions apply only to the current task after this tool result."
+        ),
+    },
+    "todo_write": {
+        "parameters": {
+            "type": "object", "properties": {
+                "todos": {"type": "array", "items": {"type": "object", "properties": {
+                    "id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "active", "done", "blocked"]},
+                }, "required": ["id", "text", "status"], "additionalProperties": False}, "maxItems": TODO_WRITE_MAX_ITEMS},
+            }, "required": ["todos"], "additionalProperties": False,
+        },
+        "concurrency_safe": False,
+        "risky": False,
+        "description": (
+            "Create or replace the task todo list for genuinely multi-step work. Each item needs id, text, and "
+            "status=pending|active|done|blocked; use one active item at most. Do not use for simple questions or one-step work."
         ),
     },
     "run_shell": {
-        "schema": {"command": "str", "timeout": "int=20"},
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": _nullable_integer(minimum=1, maximum=RUN_SHELL_MAX_TIMEOUT, description="Foreground timeout in seconds.")}, "required": ["command", "timeout"], "additionalProperties": False},
+        "concurrency_safe": False,
         "risky": True,
         "description": (
-            "Run a short foreground shell command in the repo root and use the result immediately in the current turn. "
-            "Prefer this for quick inspection, git, one-shot scripts, short tests, and short lint commands that should finish soon."
+            "Run a short foreground command in the repo root and use its result immediately. "
+            f"Use for quick inspection, one-shot scripts, tests, or lint; timeout is 1-{RUN_SHELL_MAX_TIMEOUT} seconds. "
+            "Use run_shell_bg for longer work. On Windows this is not a Bash shell: do not use <<'PY' or <<EOF. "
+            "Bare Python commands use .lumo/python-env; "
+            "after one failure runtime may perform one restricted environment repair and retry."
         ),
     },
     "run_shell_bg": {
-        "schema": {"command": "str", "timeout": f"int={RUN_SHELL_BG_DEFAULT_TIMEOUT}"},
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": _nullable_integer(minimum=1, maximum=RUN_SHELL_BG_MAX_TIMEOUT, description="Background timeout in seconds.")}, "required": ["command", "timeout"], "additionalProperties": False},
+        "concurrency_safe": False,
         "risky": True,
         "description": (
-            "Start a long-running background shell command and return a task_id for later inspection. "
-            "Prefer this for full test suites, builds, servers, benchmarks, watch mode, and other commands that may take a while. "
-            "Use task_output to inspect progress later and task_stop if you need to stop it."
+            f"Start a long-running command and return a task_id; timeout is 1-{RUN_SHELL_BG_MAX_TIMEOUT} seconds. "
+            "Use for builds, full tests, servers, or benchmarks. On Windows this is not a Bash shell: do not use <<'PY' or <<EOF; "
+            "inspect it with task_output and stop it with task_stop. Bare Python commands use .lumo/python-env; "
+            "a failed task may be repaired and restarted once when task_output observes the failure."
         ),
     },
     "task_output": {
-        "schema": {
-            "task_id": "str",
-            "offset": "int=0",
-            "limit": f"int={TASK_OUTPUT_DEFAULT_LIMIT}",
-            "stream": "str='stdout'",
-        },
+        "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}, "offset": _nullable_integer(minimum=0, description="Zero-based output offset."), "limit": _nullable_integer(minimum=1, maximum=TASK_OUTPUT_MAX_LIMIT, description="Maximum output characters to return."), "stream": {"type": ["string", "null"], "enum": ["stdout", "stderr", "both", None]}}, "required": ["task_id", "offset", "limit", "stream"], "additionalProperties": False},
+        "concurrency_safe": False,
         "risky": False,
         "description": (
-            "Read paginated stdout or stderr from a background shell task started by run_shell_bg. "
-            "Use this only after you already have a task_id, and use next_offset to continue without replaying the same page."
+            "Read paginated stdout or stderr from a run_shell_bg task. Use next_offset to continue without replaying output."
         ),
     },
     "task_list": {
-        "schema": {
-            "offset": "int=0",
-            "limit": f"int={TASK_LIST_DEFAULT_LIMIT}",
-            "status": "str='all'",
-        },
+        "parameters": {"type": "object", "properties": {"offset": _nullable_integer(minimum=0, description="Zero-based task offset."), "limit": _nullable_integer(minimum=1, maximum=TASK_LIST_MAX_LIMIT, description="Maximum tasks to return."), "status": {"type": ["string", "null"], "enum": ["all", "running", "exited", "failed", "stopped", None]}}, "required": ["offset", "limit", "status"], "additionalProperties": False},
+        "concurrency_safe": False,
         "risky": False,
         "description": (
-            "List current-run background tasks started by run_shell_bg. "
-            "Use this to discover recent task_id values before calling task_output or task_stop."
+            "List current-run background tasks. Use it to discover task_id values for task_output or task_stop."
         ),
     },
     "task_stop": {
-        "schema": {"task_id": "str"},
+        "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"], "additionalProperties": False},
+        "concurrency_safe": False,
         "risky": True,
-        "description": "Stop a background shell task by task_id. Use this only for tasks previously started with run_shell_bg.",
+        "description": "Stop a background task previously started with run_shell_bg.",
     },
     "write_file": {
-        "schema": {"path": "str", "content": "str"},
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False},
+        "concurrency_safe": False,
         "risky": True,
         "description": (
-            "Write a text file. Use this to create a new file or completely overwrite an existing file when a full rewrite is intended. "
-            "Prefer patch_file for small, targeted changes to an existing file."
+            "Create a text file or intentionally replace an entire existing file. Use patch_file for small changes."
         ),
     },
     "patch_file": {
-        "schema": {"path": "str", "old_text": "str", "new_text": "str", "replace_all": "bool=False"},
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "replace_all": {"type": ["boolean", "null"]}}, "required": ["path", "old_text", "new_text", "replace_all"], "additionalProperties": False},
+        "concurrency_safe": False,
         "risky": True,
         "description": (
-            "Replace exact text in an existing file for small, targeted edits. By default old_text must uniquely identify one match. "
-            "Prefer this over write_file when you only need to modify part of an existing file without rewriting the whole file. "
-            "Use replace_all=true to replace all exact matches. If multiple matches exist and replace_all=false, "
-            "provide more surrounding context in old_text to make the target unique."
+            "Replace exact text for a small edit in an existing file. old_text must be unique unless replace_all=true; "
+            "otherwise add context to make the target unique."
         ),
     },
 }
 
 DELEGATE_TOOL_SPEC = {
-    "schema": {"task": "str", "max_steps": "int=3", "inherit_context": "bool=True"},
+    "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "max_steps": _nullable_integer(minimum=1, maximum=DELEGATE_MAX_STEPS, description="Maximum child-agent steps."), "inherit_context": {"type": ["boolean", "null"]}}, "required": ["task", "max_steps", "inherit_context"], "additionalProperties": False},
+    "concurrency_safe": False,
     "risky": False,
     "description": (
-        "Ask a bounded child agent to work on a subtask. With inherit_context=true, "
-        "the child receives the parent's compressed history; use this when the subtask depends on prior conversation, files, or decisions. "
-        "With inherit_context=false, the child starts without parent history; use this for independent subtasks unrelated to the main agent's context."
+        "Ask a bounded child agent to handle a subtask. Set inherit_context=true when it needs parent context; "
+        "false for independent work."
     ),
 }
 
@@ -199,22 +289,42 @@ DELEGATE_TOOL_SPEC = {
 def legal_tool_names():
     return set(BASE_TOOL_SPECS) | {"delegate"}
 
-TOOL_EXAMPLES = {
-    "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-    "glob": '<tool>{"name":"glob","args":{"pattern":"**/*.py","path":"lumo"}}</tool>',
-    "grep": '<tool>{"name":"grep","args":{"pattern":"binary_search","path":"lumo","output_mode":"content","head_limit":20,"offset":0,"-C":3,"timeout":20}}</tool>',
-    "read_file": '<tool>{"name":"read_file","args":{"path":"README.md"}}</tool>',
-    "git_status": '<tool>{"name":"git_status","args":{"path":".","offset":0,"limit":200}}</tool>',
-    "git_diff": '<tool>{"name":"git_diff","args":{"path":".","mode":"workspace","offset":1,"limit":300}}</tool>',
-    "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-    "run_shell_bg": '<tool>{"name":"run_shell_bg","args":{"command":"uv run pytest -q","timeout":3600}}</tool>',
-    "task_output": '<tool>{"name":"task_output","args":{"task_id":"task_20260630-120000_ab12cd","offset":0,"limit":4000,"stream":"stdout"}}</tool>',
-    "task_list": '<tool>{"name":"task_list","args":{"offset":0,"limit":20,"status":"all"}}</tool>',
-    "task_stop": '<tool>{"name":"task_stop","args":{"task_id":"task_20260630-120000_ab12cd"}}</tool>',
-    "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-    "patch_file": '<tool name="patch_file" path="binary_search.py" replace_all="false"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-    "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3,"inherit_context":true}}</tool>',
-}
+
+def normalize_tool_arguments(name, args):
+    """Clamp only valid integer arguments that exceed a declared tool maximum.
+
+    Lower-bound violations and incorrect JSON types remain validation errors: silently
+    changing those values could turn a malformed model call into a different action.
+    """
+    if not isinstance(args, dict):
+        return args, []
+    spec = BASE_TOOL_SPECS.get(name, DELEGATE_TOOL_SPEC if name == "delegate" else {})
+    schema = spec.get("parameters", {}) if isinstance(spec, dict) else {}
+    properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    normalized = {key: value for key, value in args.items() if value is not None}
+    changes = []
+    for key, definition in properties.items():
+        if key not in normalized or not isinstance(definition, dict):
+            continue
+        value = normalized[key]
+        maximum = definition.get("maximum")
+        if (
+            maximum is not None
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > int(maximum)
+        ):
+            effective = int(maximum)
+            normalized[key] = effective
+            changes.append(
+                {
+                    "argument": key,
+                    "requested": value,
+                    "effective": effective,
+                    "reason": "above_maximum",
+                }
+            )
+    return normalized, changes
 
 
 def _read_window_request(args):
@@ -341,6 +451,8 @@ def _grep_head_limit(args):
     value = int(args.get("head_limit", GREP_DEFAULT_HEAD_LIMIT))
     if value < 1:
         raise ValueError("head_limit must be >= 1")
+    if value > GREP_MAX_HEAD_LIMIT:
+        raise ValueError(f"head_limit must be <= {GREP_MAX_HEAD_LIMIT}")
     return value
 
 
@@ -355,8 +467,8 @@ def _grep_timeout_seconds(args):
     value = int(args.get("timeout", GREP_TIMEOUT_SECONDS))
     if value < 1:
         raise ValueError("timeout must be >= 1")
-    if value > 120:
-        raise ValueError("timeout must be <= 120")
+    if value > GREP_MAX_TIMEOUT_SECONDS:
+        raise ValueError(f"timeout must be <= {GREP_MAX_TIMEOUT_SECONDS}")
     return value
 
 
@@ -423,6 +535,8 @@ def _grep_optional_nonnegative_int(args, key):
     value = int(value)
     if value < 0:
         raise ValueError(f"{key} must be >= 0")
+    if value > GREP_MAX_CONTEXT_LINES:
+        raise ValueError(f"{key} must be <= {GREP_MAX_CONTEXT_LINES}")
     return value
 
 
@@ -945,12 +1059,81 @@ def build_tool_registry(context):
     return tools
 
 
-def tool_example(name):
-    return TOOL_EXAMPLES.get(name, "")
+def _schema_types(definition):
+    expected = definition.get("type") if isinstance(definition, dict) else None
+    return expected if isinstance(expected, list) else [expected]
+
+
+def _validate_native_schema_value(value, definition, label, *, allow_omitted_nullable=True):
+    allowed_types = _schema_types(definition)
+    if value is None and "null" in allowed_types:
+        return
+    valid = (
+        ("string" in allowed_types and isinstance(value, str))
+        or ("integer" in allowed_types and isinstance(value, int) and not isinstance(value, bool))
+        or ("boolean" in allowed_types and isinstance(value, bool))
+        or ("array" in allowed_types and isinstance(value, list))
+        or ("object" in allowed_types and isinstance(value, dict))
+    )
+    if not valid:
+        raise ValueError(f"argument '{label}' has an invalid JSON type")
+    if isinstance(value, int) and not isinstance(value, bool):
+        minimum = definition.get("minimum") if isinstance(definition, dict) else None
+        maximum = definition.get("maximum") if isinstance(definition, dict) else None
+        if minimum is not None and value < int(minimum):
+            raise ValueError(f"argument '{label}' must be >= {int(minimum)}")
+        if maximum is not None and value > int(maximum):
+            raise ValueError(f"argument '{label}' must be <= {int(maximum)}")
+    if isinstance(value, list):
+        item_definition = definition.get("items", {}) if isinstance(definition, dict) else {}
+        max_items = definition.get("maxItems") if isinstance(definition, dict) else None
+        if max_items is not None and len(value) > int(max_items):
+            raise ValueError(f"argument '{label}' must contain at most {int(max_items)} items")
+        for index, item in enumerate(value):
+            _validate_native_schema_value(item, item_definition, f"{label}[{index}]", allow_omitted_nullable=False)
+    elif isinstance(value, dict):
+        _validate_native_schema_object(value, definition, label, allow_omitted_nullable=allow_omitted_nullable)
+
+
+def _validate_native_schema_object(args, schema, label="arguments", *, allow_omitted_nullable=True):
+    properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    if not isinstance(args, dict):
+        raise ValueError(f"{label} must be an object")
+    unknown = sorted(set(args) - set(properties))
+    if unknown:
+        if label == "arguments":
+            raise ValueError(f"unknown argument(s): {', '.join(unknown)}")
+        raise ValueError(f"unknown {label} field(s): {', '.join(unknown)}")
+    required = set(schema.get("required", []) or [])
+    missing = sorted(
+        key
+        for key in required
+        if key not in args
+        and not (allow_omitted_nullable and "null" in _schema_types(properties.get(key, {})))
+    )
+    if missing:
+        raise ValueError(f"missing required {label} field(s): {', '.join(missing)}")
+    for key, value in args.items():
+        _validate_native_schema_value(
+            value,
+            properties.get(key, {}),
+            f"{label}.{key}" if label != "arguments" else key,
+            allow_omitted_nullable=allow_omitted_nullable,
+        )
+
+
+def _validate_native_schema(name, args):
+    spec = BASE_TOOL_SPECS.get(name, DELEGATE_TOOL_SPEC if name == "delegate" else {})
+    schema = spec.get("parameters", {}) if isinstance(spec, dict) else {}
+    # Strict provider schemas require every property, while nullable properties
+    # encode Lumo defaults. The loop removes nulls before local execution.
+    _validate_native_schema_object(args, schema)
 
 
 def validate_tool(context, name, args):
-    args = args or {}
+    if not isinstance(args, dict):
+        raise ValueError("tool arguments must be an object")
+    _validate_native_schema(name, args)
 
     if name == "list_files":
         path = context.path(args.get("path", "."))
@@ -1007,19 +1190,36 @@ def validate_tool(context, name, args):
         _git_diff_limit(args)
         return
 
+    if name == "use_skill":
+        skill_name = str(args.get("name", "")).strip()
+        if not skill_name:
+            raise ValueError("name must not be empty")
+        catalog = context.skill_catalog()
+        try:
+            skilllib.load_skill_content(context.root, skill_name, catalog=catalog)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return
+
+    if name == "todo_write":
+        normalize_todo_items(args)
+        return
+
     if name == "run_shell":
         command = str(args.get("command", "")).strip()
         if not command:
             raise ValueError("command must not be empty")
-        timeout = int(args.get("timeout", 20))
-        if timeout < 1 or timeout > 120:
-            raise ValueError("timeout must be in [1, 120]")
+        validate_shell_command_syntax(command)
+        timeout = int(args.get("timeout", RUN_SHELL_DEFAULT_TIMEOUT))
+        if timeout < 1 or timeout > RUN_SHELL_MAX_TIMEOUT:
+            raise ValueError(f"timeout must be in [1, {RUN_SHELL_MAX_TIMEOUT}]")
         return
 
     if name == "run_shell_bg":
         command = str(args.get("command", "")).strip()
         if not command:
             raise ValueError("command must not be empty")
+        validate_shell_command_syntax(command)
         _run_shell_bg_timeout(args)
         return
 
@@ -1226,38 +1426,127 @@ def tool_git_diff(context, args):
     )
 
 
+def tool_use_skill(context, args):
+    return context.load_skill(args)
+
+
+def normalize_todo_items(args):
+    raw_items = (args or {}).get("todos")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ValueError("todos must be a non-empty list")
+    if len(raw_items) > TODO_WRITE_MAX_ITEMS:
+        raise ValueError(f"todos must contain at most {TODO_WRITE_MAX_ITEMS} items")
+
+    normalized = []
+    seen_ids = set()
+    active_count = 0
+    blocked_count = 0
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            raise ValueError("each todo must be an object")
+        todo_id = str(raw_item.get("id", "")).strip()
+        text = str(raw_item.get("text", "")).strip()
+        status = str(raw_item.get("status", "")).strip().lower()
+        if not TODO_ID_PATTERN.fullmatch(todo_id):
+            raise ValueError("todo id must be 1-32 letters, numbers, underscores, or hyphens")
+        if todo_id in seen_ids:
+            raise ValueError(f"duplicate todo id: {todo_id}")
+        if not text:
+            raise ValueError(f"todo text must not be empty: {todo_id}")
+        if status not in TODO_STATUSES:
+            raise ValueError(f"invalid todo status for {todo_id}: {status}")
+        seen_ids.add(todo_id)
+        active_count += int(status == "active")
+        blocked_count += int(status == "blocked")
+        normalized.append({"id": todo_id, "text": text, "status": status})
+
+    if active_count > 1:
+        raise ValueError("todo list may contain at most one active item")
+    if blocked_count > 1:
+        raise ValueError("todo list may contain at most one blocked item")
+    if active_count and blocked_count:
+        raise ValueError("todo list cannot contain both active and blocked items")
+    if not active_count and not blocked_count:
+        for item in normalized:
+            if item["status"] == "pending":
+                item["status"] = "active"
+                break
+    return normalized
+
+
+def tool_todo_write(context, args):
+    return context.write_todos(args)
+
+
 def tool_run_shell(context, args):
     command = str(args.get("command", "")).strip()
     if not command:
         raise ValueError("command must not be empty")
-    timeout = int(args.get("timeout", 20))
-    if timeout < 1 or timeout > 120:
-        raise ValueError("timeout must be in [1, 120]")
-    result = subprocess.run(
-        command,
-        cwd=context.root,
-        shell=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-
-
-        env=context.shell_env(),
-    )
-    return textwrap.dedent(
-        f"""\
-        exit_code: {result.returncode}
-        stdout:
-        {result.stdout.strip() or "(empty)"}
-        stderr:
-        {result.stderr.strip() or "(empty)"}
-        """
-    ).strip()
+    validate_shell_command_syntax(command)
+    timeout = int(args.get("timeout", RUN_SHELL_DEFAULT_TIMEOUT))
+    if timeout < 1 or timeout > RUN_SHELL_MAX_TIMEOUT:
+        raise ValueError(f"timeout must be in [1, {RUN_SHELL_MAX_TIMEOUT}]")
+    try:
+        prepared = context.prepare_shell_command(command)
+    except Exception as exc:
+        return textwrap.dedent(
+            f"""\
+            python_env_used: true
+            python_env_error: {exc}
+            exit_code: 1
+            stdout:
+            (empty)
+            stderr:
+            {exc}
+            """
+        ).strip()
+    environment_lines = [f"python_env_used: {'true' if prepared.get('python_env_used') else 'false'}"]
+    if prepared.get("python_env_used"):
+        environment_lines.extend(
+            [
+                f"python_env_path: {prepared.get('python_env_path', '')}",
+                f"python_executable: {prepared.get('python_executable', '')}",
+                f"python_env_status: {prepared.get('environment_status', '')}",
+                f"executed_command: {prepared.get('command', '')}",
+            ]
+        )
+    stdout_fd, stdout_path = tempfile.mkstemp(prefix="lumo-shell-", suffix=".stdout.log")
+    stderr_fd, stderr_path = tempfile.mkstemp(prefix="lumo-shell-", suffix=".stderr.log")
+    timed_out = False
+    try:
+        with os.fdopen(stdout_fd, "wb") as stdout_handle, os.fdopen(stderr_fd, "wb") as stderr_handle:
+            try:
+                result = subprocess.run(
+                    prepared["command"],
+                    cwd=context.root,
+                    shell=True,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    timeout=timeout,
+                    env=prepared["env"],
+                )
+                returncode = result.returncode
+            except subprocess.TimeoutExpired:
+                returncode = 124
+                timed_out = True
+        return ShellOutputCapture(
+            stdout_path=Path(stdout_path),
+            stderr_path=Path(stderr_path),
+            environment_lines=tuple(environment_lines),
+            returncode=returncode,
+            timed_out=timed_out,
+        )
+    except Exception:
+        for path in (stdout_path, stderr_path):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def tool_run_shell_bg(context, args):
+    validate_shell_command_syntax(args.get("command", ""))
     return context.start_background_task(args)
 
 
@@ -1326,6 +1615,8 @@ _TOOL_RUNNERS = {
     "grep": tool_grep,
     "git_status": tool_git_status,
     "git_diff": tool_git_diff,
+    "use_skill": tool_use_skill,
+    "todo_write": tool_todo_write,
     "run_shell": tool_run_shell,
     "run_shell_bg": tool_run_shell_bg,
     "task_output": tool_task_output,
