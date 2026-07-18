@@ -1,4 +1,4 @@
-"""Background shell task management for long-running tool execution."""
+
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Agent control loop extracted from the runtime facade."""
+
 
 import asyncio
 import json
@@ -6,6 +6,13 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from .archive_context import (
+    ARCHIVE_MIN_VISIBLE_CHARS,
+    archive_payload,
+    normalize_archive_payload,
+    partition_archive_calls,
+    render_archive_summary,
+)
 from .checkpoint import CHECKPOINT_NONE_STATUS
 from .task_state import (
     STOP_REASON_FINAL_ANSWER_RETURNED,
@@ -57,6 +64,141 @@ class AgentLoop:
             },
         )
         return reported_message
+
+    def _downgrade_previous_task_archives(self, task_state):
+        agent = self.agent
+        changed = False
+        for item in list(agent.session.get("history", []) or []):
+            archive = item.get("archive") if isinstance(item.get("archive"), dict) else None
+            if not archive or archive.get("status") != "pending":
+                continue
+            if str(archive.get("task_id", "")) == str(task_state.task_id):
+                continue
+            archive["status"] = "passthrough"
+            archive["reason"] = "previous_task"
+            archive["resolved_at"] = now()
+            changed = True
+        if changed:
+            agent.session_path = agent.session_store.save(agent.session)
+
+    def _settle_archive_events(self, task_state, model_request, response):
+        agent = self.agent
+        defensive_calls, defensive_events = partition_archive_calls(response.tool_calls)
+        response.tool_calls = defensive_calls
+        response.archive_events.extend(defensive_events)
+        target_ids = [
+            str(item.get("source_call_id", ""))
+            for item in list(model_request.get("archive_targets", []) or [])
+            if str(item.get("source_call_id", ""))
+        ]
+        if not target_ids:
+            for event in response.archive_events:
+                agent.emit_trace(
+                    task_state,
+                    "tool_archive_event_rejected",
+                    {"event_call_id": event.event_call_id, "source_call_id": event.source_call_id, "error": "no_pending_target"},
+                )
+            return {"archived": 0, "passthrough": 0}
+
+        target_set = set(target_ids)
+        source_items = {}
+        for item in reversed(list(agent.session.get("history", []) or [])):
+            call_id = str(item.get("call_id", ""))
+            archive = item.get("archive") if isinstance(item.get("archive"), dict) else {}
+            if (
+                call_id in target_set
+                and call_id not in source_items
+                and item.get("role") == "tool"
+                and archive.get("status") == "pending"
+                and str(archive.get("task_id", "")) == str(task_state.task_id)
+            ):
+                source_items[call_id] = item
+
+        accepted = {}
+        invalid_targets = set()
+        for event in response.archive_events:
+            source_call_id = str(event.source_call_id)
+            if source_call_id not in target_set or source_call_id not in source_items:
+                agent.emit_trace(
+                    task_state,
+                    "tool_archive_event_rejected",
+                    {"event_call_id": event.event_call_id, "source_call_id": source_call_id, "error": "unknown_source_call_id"},
+                )
+                continue
+            if event.error:
+                invalid_targets.add(source_call_id)
+                agent.emit_trace(
+                    task_state,
+                    "tool_archive_event_rejected",
+                    {"event_call_id": event.event_call_id, "source_call_id": source_call_id, "error": event.error},
+                )
+                continue
+            if source_call_id in accepted:
+                agent.emit_trace(
+                    task_state,
+                    "tool_archive_event_rejected",
+                    {"event_call_id": event.event_call_id, "source_call_id": source_call_id, "error": "duplicate_archive_event"},
+                )
+                continue
+            accepted[source_call_id] = event
+
+        archived = 0
+        passthrough = 0
+        changed = False
+        for source_call_id in target_ids:
+            item = source_items.get(source_call_id)
+            if item is None:
+                continue
+            archive = item["archive"]
+            event = accepted.get(source_call_id)
+            if event is not None:
+                payload, post_redaction_normalizations = normalize_archive_payload(
+                    agent.redact_artifact(archive_payload(event))
+                )
+                normalizations = list(dict.fromkeys([*event.normalizations, *post_redaction_normalizations]))
+                rendered_summary = render_archive_summary(payload)
+                archive.update(
+                    {
+                        "status": "archived",
+                        "payload": payload,
+                        "resolved_at": now(),
+                    }
+                )
+                item["summary"] = rendered_summary
+                metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                metadata = dict(metadata)
+                metadata["archive_summary"] = rendered_summary
+                item["metadata"] = metadata
+                archived += 1
+                agent.archive_stats["archived"] += 1
+                agent.emit_trace(
+                    task_state,
+                    "tool_archive_resolved",
+                    {
+                        "event_call_id": event.event_call_id,
+                        "source_call_id": source_call_id,
+                        "normalizations": normalizations,
+                    },
+                )
+            else:
+                archive.update(
+                    {
+                        "status": "passthrough",
+                        "reason": "invalid_event" if source_call_id in invalid_targets else "missing_event",
+                        "resolved_at": now(),
+                    }
+                )
+                passthrough += 1
+                agent.archive_stats["passthrough"] += 1
+                agent.emit_trace(
+                    task_state,
+                    "tool_archive_passthrough",
+                    {"source_call_id": source_call_id, "reason": archive["reason"]},
+                )
+            changed = True
+        if changed:
+            agent.session_path = agent.session_store.save(agent.session)
+        return {"archived": archived, "passthrough": passthrough}
 
     def run(self, user_message):
         try:
@@ -196,15 +338,10 @@ class AgentLoop:
             tool_result=tool_result,
         )
 
-    def _commit_native_tool_result(self, task_state, progress_state, prepared, externalization_reason=""):
+    def _commit_native_tool_result(self, task_state, progress_state, prepared):
         agent = self.agent
         call = prepared.call
-        tool_result = agent.externalize_tool_result(
-            call.call_id or "invalid_call",
-            call.name or "unknown",
-            prepared.tool_result,
-            externalization_reason,
-        )
+        tool_result = prepared.tool_result
         if call.name == "use_skill" and str((tool_result.metadata or {}).get("tool_status", "")) == "ok":
             agent.register_pending_task_skill(call.call_id, task_state)
         if call.name == "read_file":
@@ -216,9 +353,23 @@ class AgentLoop:
         stored_content = agent.redact_text(strip_tool_hints(str(tool_result.content)))
         if call.name in {"read_file", "use_skill", "todo_write", "run_shell_bg", "task_output", "task_list", "task_stop"} and archive_summary:
             stored_content = archive_summary
+        visible_chars = len(str(output.get("content", "")))
+        externalized = bool(stored_metadata.get("externalized_output_path"))
+        archive_status = "pending" if visible_chars >= ARCHIVE_MIN_VISIBLE_CHARS and not externalized else "not_required"
+        archive_reason = "over_threshold" if archive_status == "pending" else ("externalized" if externalized else "below_threshold")
+        if externalized:
+            agent.archive_stats["externalized"] += 1
         agent.record({
             "role": "tool", "call_id": call.call_id or "invalid_call", "name": call.name or "unknown", "args": prepared.arguments,
             "content": stored_content, "result": output, "created_at": now(), "metadata": stored_metadata,
+            "archive": {
+                "status": archive_status,
+                "reason": archive_reason,
+                "visible_chars": visible_chars,
+                "task_id": str(getattr(task_state, "task_id", "")),
+                "payload": None,
+                "resolved_at": "",
+            },
             **({"summary": archive_summary} if archive_summary else {}),
         })
         if prepared.rejection_error:
@@ -255,28 +406,46 @@ class AgentLoop:
                 continue
             agent.emit_trace(task_state, "tool_concurrency_batch", {"call_ids": [item.call_id for item in group], "names": [item.name for item in group]})
             results.extend(await asyncio.gather(*(self._execute_native_tool_call(task_state, progress_state, item, seen_signatures) for item in group)))
-        reasons = {}
         total_inline_chars = 0
         candidates = []
+        materialized_results = set()
+
+        def externalize(result, reason):
+            result.tool_result = agent.externalize_tool_result(
+                result.call.call_id or "invalid_call",
+                result.call.name or "unknown",
+                result.tool_result,
+                reason,
+            )
+            materialized_results.add(id(result))
+            return agent.tool_result_model_visible_chars(result.tool_result)
+
         for result in results:
-            size = agent.tool_result_output_chars(result.call.name, result.tool_result)
-            if size > TOOL_RESULT_INLINE_LIMIT_CHARS:
-                reasons[id(result)] = "per_result_limit"
+            size = agent.tool_result_model_visible_chars(result.tool_result)
+            exempt = agent.tool_result_is_externalization_exempt(
+                result.call.name,
+                getattr(result.tool_result, "metadata", {}),
+            )
+            if size > TOOL_RESULT_INLINE_LIMIT_CHARS and not exempt:
+                total_inline_chars += externalize(result, "per_result_limit")
             elif size:
                 total_inline_chars += size
                 candidates.append((size, len(candidates), result))
         if total_inline_chars > TOOL_RESULT_BATCH_LIMIT_CHARS:
-            for size, _index, result in sorted(candidates, key=lambda item: (-item[0], item[1])):
+            for _size, _index, result in sorted(candidates, key=lambda item: (-item[0], item[1])):
                 if total_inline_chars <= TOOL_RESULT_BATCH_LIMIT_CHARS:
                     break
-                reasons[id(result)] = "message_budget"
-                total_inline_chars -= size
+                before_chars = agent.tool_result_model_visible_chars(result.tool_result)
+                after_chars = externalize(result, "message_budget")
+                total_inline_chars += after_chars - before_chars
+        for result in results:
+            if id(result) not in materialized_results:
+                externalize(result, "")
         return [
             self._commit_native_tool_result(
                 task_state,
                 progress_state,
                 result,
-                reasons.get(id(result), ""),
             )
             for result in results
         ]
@@ -416,12 +585,19 @@ class AgentLoop:
             "stored_bytes": 0,
             "artifact_truncated": 0,
         }
+        agent.archive_stats = {
+            "requested": 0,
+            "archived": 0,
+            "passthrough": 0,
+            "externalized": 0,
+        }
         agent.memory.set_task_summary(original_user_message)
         agent.record({"role": "user", "content": original_user_message, "created_at": now()})
         task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=original_user_message)
         task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)
         agent.current_task_state = task_state
         agent.current_run_dir = agent.run_store.start_run(task_state)
+        self._downgrade_previous_task_archives(task_state)
         agent.start_task_skills(task_state)
         agent.emit_trace(task_state, "run_started", {"task_id": task_state.task_id, "user_request": clip(original_user_message, 300), "protocol": "native-v1"})
 
@@ -443,6 +619,14 @@ class AgentLoop:
             prompt_started_at = time.monotonic()
             _prompt, prompt_metadata = await agent._build_prompt_and_metadata_async(original_user_message)
             model_request = dict(agent.last_model_request or {})
+            archive_targets = list(model_request.get("archive_targets", []) or [])
+            if archive_targets:
+                agent.archive_stats["requested"] += len(archive_targets)
+                agent.emit_trace(
+                    task_state,
+                    "tool_archive_requested",
+                    {"targets": [dict(item) for item in archive_targets]},
+                )
             request_path = agent.run_store.request_path(
                 task_state,
                 progress_state.raw_model_attempts,
@@ -498,7 +682,8 @@ class AgentLoop:
                     }
                 ),
             )
-            agent.emit_trace(task_state, "model_responded", {"response_path": str(response_path), "call_ids": [call.call_id for call in response.tool_calls], "tool_calls": len(response.tool_calls), "text_chars": len(response.text), "parse_errors": list(response.parse_errors), "duration_ms": int((time.monotonic() - model_started_at) * 1000)})
+            archive_settlement = self._settle_archive_events(task_state, model_request, response)
+            agent.emit_trace(task_state, "model_responded", {"response_path": str(response_path), "call_ids": [call.call_id for call in response.tool_calls], "tool_calls": len(response.tool_calls), "archive_events": len(response.archive_events), "text_chars": len(response.text), "parse_errors": list(response.parse_errors), "duration_ms": int((time.monotonic() - model_started_at) * 1000)})
 
             if response.tool_calls:
                 assistant_record = {
@@ -516,6 +701,8 @@ class AgentLoop:
 
             final_text = str(response.text or response.refusal or "").strip()
             if not final_text:
+                if archive_settlement.get("archived", 0) > 0:
+                    continue
                 final_text = "Model returned neither text nor a native tool call."
                 return self._finalize_run(task_state, original_user_message, final_text, run_started_at, stop_reason=STOP_REASON_INVALID_NATIVE_RESPONSE)
             return self._finalize_run(task_state, original_user_message, final_text, run_started_at, success_reason=STOP_REASON_FINAL_ANSWER_RETURNED, completion_mode="native_text_answer")

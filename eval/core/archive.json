@@ -1,0 +1,50 @@
+{
+  "schema_version": "2.0",
+  "suite": "core",
+  "category": "archive",
+  "description": "长结果事实保留、并行结算边界和无效事件退化。",
+  "tasks": [
+    {
+      "id": "core.archive.long-result-common.v1",
+      "title": "单个长结果事实保留",
+      "objective": "验证不可过滤的长结果被归档后，精确事实仍能与后续文件信息合并。",
+      "difficulty": "hard",
+      "status": "requires_feature",
+      "benchmark_inspiration": ["gaia", "terminal_bench", "tau_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["run_shell", "read_file", "write_file"], "supporting_tools": [], "scenario_class": "common", "mechanisms": [{"name": "archive_tool_result", "scenario": "common"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 18, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization", "large_fixture_generator", "trace_assertions", "request_artifact_assertions"]},
+      "model_input": {"allowed_tools": ["run_shell", "read_file", "write_file"], "turns": [{"id": "main", "session_policy": "new", "prompt": "为保留审计原始记录，请原样运行一次 python emit-inventory.py，不要添加参数、管道或重定向。记录输出中标记为 FINAL 的仓库 17、42、88 库存；命令结束后读取它生成的 policy.md，再把四个整数写入 answer.json，字段依次为 warehouse-17、warehouse-42、warehouse-88 和 reorder_threshold。"}]},
+      "setup": {"workspace_files": [{"path": "emit-inventory.py", "content": "from pathlib import Path\nfinal={17:4811,42:9923,88:12007}\nfor i in range(1,181):\n value=final.get(i,i*13+7)\n stage='FINAL' if i in final else 'AUDIT'\n print(f'warehouse-{i:03d} stage={stage} inventory={value} note='+('x'*72))\nPath('policy.md').write_text('当前补货阈值为 5000 件。\\n',encoding='utf-8')\n"}, {"path": "policy.example.md", "content": "历史示例：补货阈值为 3000 件，此文件不适用于当前审计。\n"}], "private_files": [], "directories": [], "actions": []},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "w17", "type": "json_value_equals", "required": true, "spec": {"path": "answer.json", "json_path": "$.warehouse-17", "value": 4811}}, {"id": "w42", "type": "json_value_equals", "required": true, "spec": {"path": "answer.json", "json_path": "$.warehouse-42", "value": 9923}}, {"id": "w88", "type": "json_value_equals", "required": true, "spec": {"path": "answer.json", "json_path": "$.warehouse-88", "value": 12007}}, {"id": "threshold", "type": "json_value_equals", "required": true, "spec": {"path": "answer.json", "json_path": "$.reorder_threshold", "value": 5000}}, {"id": "exact_run", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "run_shell", "command_equals": "python emit-inventory.py", "count": 1}}, {"id": "policy_read", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "read_file", "path": "policy.md", "min_count": 1}}, {"id": "requested", "type": "trace_event", "required": true, "spec": {"event": "tool_archive_requested", "min_count": 1}}, {"id": "saved", "type": "trace_event", "required": true, "spec": {"event": "tool_archive_resolved", "min_count": 1}}, {"id": "facts_saved", "type": "history_state", "required": true, "spec": {"archive_payload_contains": ["4811", "9923", "12007"]}}, {"id": "not_executed", "type": "trace_event_absent", "required": true, "spec": {"event": "tool_executed", "tool_name": "archive_tool_result"}}]},
+      "failure_labels": ["archive_missing", "context_loss", "incomplete_goal"]
+    },
+    {
+      "id": "core.archive.parallel-budget-boundary.v1",
+      "title": "并行长结果与总量边界",
+      "objective": "验证多个新长结果独立关联并在总量超限时按规则外置。",
+      "difficulty": "hard",
+      "status": "requires_feature",
+      "benchmark_inspiration": ["tau_bench", "agent_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["read_file", "grep", "write_file"], "supporting_tools": [], "scenario_class": "boundary", "mechanisms": [{"name": "archive_tool_result", "scenario": "boundary"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "scripted_probe", "repetitions": 1, "max_steps": 8, "timeout_seconds": 180, "required_harness_features": ["scripted_provider", "synthetic_parallel_tool_results", "aggregate_output_budget", "history_state_assertions"], "scripted_model": {"scenario": "Return three parallel long results with distinct source call IDs; total visible output exceeds 200000 chars; emit valid summaries for the two inline targets."}},
+      "model_input": {"allowed_tools": ["read_file", "grep", "write_file"], "turns": [{"id": "main", "session_policy": "new", "prompt": "请对比 north.log、south.log、west.log，找出每个区域最后一次成功同步的时间，并把结果按 north、south、west 三个字段写入 sync-summary.json。"}]},
+      "setup": {"workspace_files": [{"path": "north.log", "content": "fixture:north-long-log\n"}, {"path": "south.log", "content": "fixture:south-long-log\n"}, {"path": "west.log", "content": "fixture:west-long-log\n"}], "private_files": [], "directories": [], "actions": [{"type": "run_command", "spec": {"fixture_generator": "parallel_logs_over_batch_budget"}}]},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "north", "type": "json_value_equals", "required": true, "spec": {"path": "sync-summary.json", "json_path": "$.north", "value": "2026-07-15T10:01:00Z"}}, {"id": "south", "type": "json_value_equals", "required": true, "spec": {"path": "sync-summary.json", "json_path": "$.south", "value": "2026-07-15T10:02:00Z"}}, {"id": "west", "type": "json_value_equals", "required": true, "spec": {"path": "sync-summary.json", "json_path": "$.west", "value": "2026-07-15T10:03:00Z"}}, {"id": "independent", "type": "history_state", "required": true, "spec": {"archive_partition_source_call_ids": ["north", "south", "west"], "archived_count": 2, "externalized_count": 1}}, {"id": "requested", "type": "trace_event", "required": true, "spec": {"event": "tool_archive_requested", "min_count": 1}}, {"id": "resolved", "type": "trace_event", "required": true, "spec": {"event": "tool_archive_resolved", "min_count": 2}}, {"id": "budget", "type": "trace_event", "required": true, "spec": {"event": "tool_output_externalized", "reason": "message_budget", "min_count": 1}}, {"id": "not_executed", "type": "trace_event_absent", "required": true, "spec": {"event": "tool_executed", "tool_name": "archive_tool_result"}}]},
+      "failure_labels": ["archive_missing", "context_loss", "environment_error"]
+    },
+    {
+      "id": "core.archive.invalid-event-recovery.v1",
+      "title": "无效摘要后的继续执行",
+      "objective": "验证缺失、空值和重复内部事件不会修改错误历史项且任务继续完成。",
+      "difficulty": "hard",
+      "status": "requires_feature",
+      "benchmark_inspiration": ["tau_bench", "agent_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["run_shell", "read_file", "patch_file"], "supporting_tools": [], "scenario_class": "recovery", "mechanisms": [{"name": "archive_tool_result", "scenario": "recovery"}, {"name": "security_redaction", "scenario": "recovery"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "scripted_probe", "repetitions": 1, "max_steps": 8, "timeout_seconds": 180, "required_harness_features": ["scripted_provider", "synthetic_tool_results", "history_state_assertions", "secret_env"], "scripted_model": {"scenario": "Create pending results A/B/C; return one valid event, one empty-summary event, omit one event, duplicate A, then continue with a real patch call."}},
+      "model_input": {"allowed_tools": ["run_shell", "read_file", "patch_file"], "turns": [{"id": "main", "session_policy": "new", "prompt": "运行 python inspect-services.py，结合 policy.ini 核对三个服务的超时设置，把不符合标准的值修正后再确认结果。"}]},
+      "setup": {"workspace_files": [{"path": "inspect-services.py", "content": "print('fixture:three-long-service-results')\n"}, {"path": "policy.ini", "content": "required_timeout=45\nservice_a=45\nservice_b=30\nservice_c=45\n"}], "private_files": [], "directories": [], "actions": [{"type": "set_env", "spec": {"name": "SERVICE_TOKEN", "value": "secret-service-552"}}]},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "fixed", "type": "file_content_equals", "required": true, "spec": {"path": "policy.ini", "content": "required_timeout=45\nservice_a=45\nservice_b=45\nservice_c=45\n"}}, {"id": "a_archived", "type": "history_state", "required": true, "spec": {"source_call_id": "A", "archive.status": "archived"}}, {"id": "b_passthrough", "type": "history_state", "required": true, "spec": {"source_call_id": "B", "archive.status": "passthrough", "archive.reason": "invalid_event"}}, {"id": "c_passthrough", "type": "history_state", "required": true, "spec": {"source_call_id": "C", "archive.status": "passthrough", "archive.reason": "missing_event"}}, {"id": "secret_absent", "type": "file_content_excludes", "required": true, "spec": {"artifact_scope": "workspace_and_run", "text": "secret-service-552"}}, {"id": "patched", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "patch_file", "count": 1}}, {"id": "not_executed", "type": "trace_event_absent", "required": true, "spec": {"event": "tool_executed", "tool_name": "archive_tool_result"}}]},
+      "failure_labels": ["archive_missing", "memory_leak", "wrong_tool_arguments", "environment_error"]
+    }
+  ]
+}

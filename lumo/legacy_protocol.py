@@ -1,4 +1,4 @@
-"""One-way migration helpers for sessions written before native tool calls."""
+
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ _JSON_TOOL = re.compile(r"<tool>\s*(\{.*?\})\s*</tool>", re.DOTALL)
 
 
 def migrate_history(history):
-    """Convert unambiguous legacy XML tool records; never execute or recover them."""
+
     items = [dict(item) if isinstance(item, dict) else {"role": "assistant", "content": str(item)} for item in list(history or [])]
     migrated = []
     pending_calls = []

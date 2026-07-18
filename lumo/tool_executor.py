@@ -1,4 +1,4 @@
-"""Structured tool execution for the agent runtime."""
+
 
 from dataclasses import dataclass
 import re
@@ -365,26 +365,7 @@ def _build_followup_metadata(
 class ToolExecutor:
     def __init__(self, agent):
         self.agent = agent
-    """
-    |-- 1. allowed_tools 白名单检查
-    |-- 2. 工具是否存在检查
-    |-- 3. 参数合法性检查
-    |-- 4. 重复调用检查
-    |-- 5. 高风险工具审批
-    |-- 6. 执行前 workspace 快照
-    |-- 7. 真正运行工具
-    |-- 8. 执行后 workspace 快照
-    |-- 9. 判断是否改动文件、是否 partial success
-    diff_summary = [
-        "created:new_file.py",
-        "modified:pico/tools.py",
-    ]
-    |-- 10. 更新 memory / process note 工具执行成功后，会把少量信息写进工作记忆。
-    |-- 11. 返回 ToolExecutionResult
 
-    最近两次工具事件如果和当前调用完全一样，直接拒绝:
-
-    """
     def execute(self, name, args, execution_context=None):
         agent = self.agent
         execution_context = execution_context if isinstance(execution_context, dict) else {}

@@ -1,4 +1,4 @@
-"""Narrow context passed from runtime into tool functions."""
+
 
 from dataclasses import dataclass
 from pathlib import Path

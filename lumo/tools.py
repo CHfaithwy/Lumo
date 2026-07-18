@@ -1,8 +1,4 @@
-"""工具定义与执行辅助逻辑。
 
-可以把这个文件看成 agent 的能力白名单：模型能申请哪些动作、这些动作
-如何做参数校验，以及最终如何执行，都是在这里定义的。
-"""
 
 import fnmatch
 import os
@@ -291,11 +287,7 @@ def legal_tool_names():
 
 
 def normalize_tool_arguments(name, args):
-    """Clamp only valid integer arguments that exceed a declared tool maximum.
 
-    Lower-bound violations and incorrect JSON types remain validation errors: silently
-    changing those values could turn a malformed model call into a different action.
-    """
     if not isinstance(args, dict):
         return args, []
     spec = BASE_TOOL_SPECS.get(name, DELEGATE_TOOL_SPEC if name == "delegate" else {})
@@ -328,7 +320,7 @@ def normalize_tool_arguments(name, args):
 
 
 def _read_window_request(args):
-    """Return one-based offset, effective line limit, and whether limit/end was explicit."""
+
     args = args or {}
     offset = int(args.get("offset", args.get("start", 1)))
     limit_explicit = "limit" in args or "end" in args
@@ -351,7 +343,7 @@ def _read_window_request(args):
 
 
 def _read_window_args(args):
-    """Return one-based offset and effective line limit, accepting legacy start/end."""
+
     offset, limit, _limit_explicit = _read_window_request(args)
     return offset, limit
 
@@ -1125,8 +1117,8 @@ def _validate_native_schema_object(args, schema, label="arguments", *, allow_omi
 def _validate_native_schema(name, args):
     spec = BASE_TOOL_SPECS.get(name, DELEGATE_TOOL_SPEC if name == "delegate" else {})
     schema = spec.get("parameters", {}) if isinstance(spec, dict) else {}
-    # Strict provider schemas require every property, while nullable properties
-    # encode Lumo defaults. The loop removes nulls before local execution.
+
+
     _validate_native_schema_object(args, schema)
 
 

@@ -35,6 +35,27 @@ lumo --help
 pip install -e .
 ```
 
+## 测试
+
+检查评测数据、fixture、公开测试与隐藏回归测试的定义：
+
+```bash
+python -m pytest eval/test_eval_dataset.py
+python eval/validate.py
+```
+
+使用 Lumo 完成全部 78 道评测任务的单轮首跑：
+
+```bash
+python eval/run_suite.py --output eval/results/latest --fresh-output --provider openai --repetitions 1 --timeout 420
+```
+
+使用 Claude Code 完成 45 道 workflow 任务的单轮首跑：
+
+```bash
+python eval/run_suite_claude.py --output eval/results/claude-workflows-latest --fresh-output --timeout 420
+```
+
 ## 分层 Skill
 
 可复用工作流放在当前工作区的以下目录中：

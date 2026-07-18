@@ -1,8 +1,4 @@
-"""Agent 运行时核心逻辑。
 
-Pico 就是包在模型外面的控制循环：负责组 prompt、解析模型输出、
-校验并执行工具、写 trace、更新工作记忆，以及在合适的时候停下来。
-"""
 
 import json
 import asyncio
@@ -214,6 +210,12 @@ class Pico:
             "stored_bytes": 0,
             "artifact_truncated": 0,
         }
+        self.archive_stats = {
+            "requested": 0,
+            "archived": 0,
+            "passthrough": 0,
+            "externalized": 0,
+        }
         self._auxiliary_call_counts = {}
 
     @classmethod
@@ -248,8 +250,8 @@ class Pico:
         durable_memory_evolution = self.session.setdefault("durable_memory_evolution", {})
         if not isinstance(durable_memory_evolution, dict):
             self.session["durable_memory_evolution"] = {}
-        # Native-v1 skills are task-scoped. Old sessions may contain full SKILL.md
-        # bodies here; remove them rather than accidentally re-injecting them.
+
+
         self.session.pop("active_skills", None)
 
     def current_runtime_identity(self):
@@ -691,7 +693,7 @@ class Pico:
             self.emit_trace(task_state, "task_skills_cleared", {"reason": reason, "loaded_skills": loaded})
 
     def redact_task_skill_artifact(self, value):
-        """Keep full task skill bodies out of persisted request artifacts."""
+
         contexts = [
             str(item.get("content", ""))
             for item in self.task_skill_contexts().values()
@@ -746,21 +748,8 @@ class Pico:
         self.prefix_state = prefix_state
         self.prefix = prefix_state.text
 
-    """
-    prefix 是 prompt 前面那段比较稳定的内容，主要包括：
-    系统规则 Rules
-    工具说明 Tools
-    示例 Valid response examples
-    工作区摘要 Workspace
-    """
-    """
-    refresh_prefix() 的职责就是：
-    看看上一次的 prefix 指纹是什么
-    重新读取当前工作区信息
-    判断工作区是否变了
-    如果变了，重建 prefix
-    记录这次刷新结果
-    """
+
+
     def refresh_prefix(self, force=False):
         previous_hash = getattr(getattr(self, "prefix_state", None), "hash", None)
         previous_workspace_fingerprint = getattr(self, "_workspace_fingerprint", "")
@@ -1454,11 +1443,16 @@ class Pico:
         client_method = getattr(self.model_client, "complete_turn_async", None)
         if client_method is None:
             raise RuntimeError("native_tool_calling_unsupported: model client does not implement complete_turn_async")
-        response = await client_method(
-            request,
-            prompt_cache_key=prompt_cache_key,
-            prompt_cache_retention=prompt_cache_retention,
-        )
+        try:
+            response = await client_method(
+                request,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
+            )
+        except Exception:
+            self.last_provider_request = dict(getattr(self.model_client, "last_request_payload", {}) or {})
+            self.last_provider_response = {}
+            raise
         self.last_provider_request = dict(getattr(self.model_client, "last_request_payload", {}) or {})
         self.last_provider_response = dict(getattr(self.model_client, "last_response_payload", {}) or {})
         return response
@@ -2056,7 +2050,7 @@ class Pico:
             return []
 
     def skill_routing_recent_context(self, current_request):
-        """Keep only enough preceding dialogue to resolve short follow-up requests."""
+
         current_request = str(current_request or "")
         history = list(self.session.get("history", []) or [])
         lines = []
@@ -2124,27 +2118,9 @@ class Pico:
         return result.get("value")
 
     async def _build_prompt_and_metadata_async(self, user_message):
-        """
-        {
-            "workspace_changed": True/False,
-            "prefix_changed": True/False,
-        }"""
+
         refresh = self.refresh_prefix()
-        """
-        先让 memory 里过期的 file summaries 失效
-        取当前 checkpoint
-        如果有 checkpoint：
-            检查 schema version 是否匹配
-            检查 key files 的 freshness 是否还一致
-            检查 runtime identity 是否变化
-        最后给出一个 resume_state
-        {
-            "status": "partial-stale",
-            "stale_paths": ["pico/cli.py"],
-            "runtime_identity_mismatch_fields": [],
-            "stale_summary_invalidations": 1
-        }
-        """
+
         self.resume_state = self.evaluate_resume_state()
         prompt, metadata = await self.context_manager.build_async(user_message)
         model_request = self.context_manager.model_request()
@@ -2231,13 +2207,7 @@ class Pico:
         return checkpointlib.infer_next_step(task_state)
 
     def update_memory_after_tool(self, name, args, result, metadata=None):
-        """Compatibility hook.
 
-        Short-term tool facts now live in session history. Durable cross-session
-        facts are promoted by the durable-memory evolution flow, so this method
-        intentionally no longer mirrors read_file summaries or process events
-        into session memory.
-        """
         return None
 
     def note_tool(self, name, args, result):
@@ -2322,24 +2292,7 @@ class Pico:
         return result
 
     def run_tool(self, name, args):
-        """执行一次工具调用，并在执行前后套上完整护栏。
 
-        为什么存在：
-        在 agent 系统里，真正危险的不是“模型会不会想调用工具”，而是
-        “平台有没有在执行前把边界守住”。这个函数就是工具层的总闸口：
-        所有工具调用都必须先经过它，不能让模型直接碰到底层函数。
-
-        输入 / 输出：
-        - 输入：工具名 `name`，参数字典 `args`
-        - 输出：字符串结果。无论是成功结果还是错误信息，都会统一返回文本，
-          这样模型下一轮都能继续消费这份反馈。
-
-        在 agent 链路里的位置：
-        它位于 `ask()` 的“模型决定要调用工具”之后，是控制循环里真正把模型
-        意图落到外部世界的一步。因此这里串起了几乎所有安全与可控设计：
-        工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
-        是否需要回写记忆。
-        """
         return self.execute_tool(name, args).content
 
     def repeated_tool_call(self, name, args):
@@ -2457,6 +2410,7 @@ class Pico:
                 "artifacts": list(self.shell_repair_artifacts),
             },
             "tool_output": dict(self.tool_output_stats),
+            "tool_archive": dict(self.archive_stats),
             "redacted_env": self.detected_secret_env_summary(),
         }
 
@@ -2483,20 +2437,19 @@ class Pico:
             return capture.diagnostic_text()
         return strip_tool_hints(str(getattr(tool_result, "content", "")))
 
-    def tool_result_output_chars(self, name, tool_result):
-        if self.tool_result_is_externalization_exempt(name, getattr(tool_result, "metadata", {})):
-            return 0
+    def tool_result_model_visible_chars(self, tool_result):
         capture = getattr(tool_result, "output_capture", None)
         if capture is not None:
             return capture.total_chars()
-        return len(self.tool_result_visible_text(tool_result))
+        return len(self.redact_text(self.tool_result_visible_text(tool_result)))
 
     def externalize_tool_result(self, call_id, name, tool_result, reason):
-        """Replace oversized model-visible output with a stable run artifact reference."""
+
         metadata = dict(getattr(tool_result, "metadata", {}) or {})
         capture = getattr(tool_result, "output_capture", None)
         content = self.tool_result_visible_text(tool_result)
-        if not reason or self.tool_result_is_externalization_exempt(name, metadata):
+        exempt = self.tool_result_is_externalization_exempt(name, metadata)
+        if not reason or (exempt and reason == "per_result_limit"):
             if capture is not None:
                 try:
                     content = capture.full_text()
@@ -2518,7 +2471,8 @@ class Pico:
                 display_path = artifact_path.resolve().relative_to(self.root.resolve()).as_posix()
             except ValueError:
                 display_path = str(artifact_path)
-            visible_preview = self.redact_text(preview_text(content, TOOL_RESULT_PREVIEW_LIMIT_CHARS))
+            preview_limit = 0 if reason == "message_budget" else TOOL_RESULT_PREVIEW_LIMIT_CHARS
+            visible_preview = self.redact_text(preview_text(content, preview_limit))
             metadata.update(
                 {
                     "externalized_output_path": display_path,
@@ -2591,7 +2545,7 @@ class Pico:
                 capture.cleanup()
 
     def validate_tool(self, name, args):
-        """把通用工具校验和 runtime 级额外约束串起来。"""
+
         toolkit.validate_tool(self.tool_context(), name, args)
 
     def normalize_tool_arguments(self, name, args):

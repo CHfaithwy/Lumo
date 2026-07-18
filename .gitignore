@@ -18,6 +18,15 @@
 !assets/
 !assets/**
 
+# Keep agent evaluation datasets and their validator.
+!eval/
+!eval/**
+
+# Ignore local evaluation drafts and generated results.
+eval/description.md
+eval/description1.md
+eval/results/
+
 # Ignore generated Python artifacts even inside allowed directories.
 __pycache__/
 *.py[cod]

@@ -1,0 +1,75 @@
+{
+  "schema_version": "2.0",
+  "name": "Lumo Agent Evaluation Suite",
+  "primary_metric": "exact_task_success",
+  "reliability_metric": "pass^k",
+  "task_count": 78,
+  "core_coverage": {
+    "core_task_count": 33,
+    "tool_matrix_task_count": 18,
+    "mechanism_task_count": 15,
+    "primary_tools_per_task": {"minimum": 2, "maximum": 3},
+    "required_tool_scenarios": ["common", "boundary", "recovery"],
+    "required_mechanisms": [
+      "hierarchical_skills",
+      "task_planning",
+      "background_tasks",
+      "delegation",
+      "tool_output_lifecycle",
+      "approval_workspace_safety",
+      "managed_python_environment",
+      "security_redaction",
+      "durable_memory",
+      "checkpoint_resume",
+      "archive_tool_result",
+      "context_compression",
+      "tool_call_control"
+    ]
+  },
+  "workflow_coverage": {
+    "workflow_task_count": 45,
+    "required_categories": {
+      "state": {"task_count": 15, "difficulty_counts": {"easy": 5, "medium": 5, "hard": 5}},
+      "code": {"task_count": 15, "difficulty_counts": {"easy": 5, "medium": 5, "hard": 5}},
+      "subjective": {"task_count": 15, "difficulty_counts": {"easy": 5, "medium": 5, "hard": 5}}
+    }
+  },
+  "prompt_policy": {
+    "language": "zh-CN",
+    "scan_environment_notes": true,
+    "forbidden_internal_terms": [
+      "tool",
+      "skill",
+      "memory",
+      "checkpoint",
+      "resume",
+      "archive",
+      "harness",
+      "trace",
+      "provider",
+      "scripted",
+      "call_id",
+      "function_call",
+      "model_input",
+      "工具",
+      "技能",
+      "长期记忆",
+      "持久记忆",
+      "检查点",
+      "归档",
+      "评测框架",
+      "调用编号"
+    ]
+  },
+  "datasets": [
+    {"path": "core/tools.json", "suite": "core", "category": "tools", "task_count": 18},
+    {"path": "core/memory.json", "suite": "core", "category": "memory", "task_count": 3},
+    {"path": "core/checkpoint.json", "suite": "core", "category": "checkpoint", "task_count": 3},
+    {"path": "core/archive.json", "suite": "core", "category": "archive", "task_count": 3},
+    {"path": "core/context.json", "suite": "core", "category": "context", "task_count": 3},
+    {"path": "core/protocol.json", "suite": "core", "category": "protocol", "task_count": 3},
+    {"path": "workflows/state.json", "suite": "workflows", "category": "state", "task_count": 15},
+    {"path": "workflows/code.json", "suite": "workflows", "category": "code", "task_count": 15},
+    {"path": "workflows/subjective.json", "suite": "workflows", "category": "subjective", "task_count": 15}
+  ]
+}

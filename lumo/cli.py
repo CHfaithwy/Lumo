@@ -1,9 +1,4 @@
-"""命令行入口。
 
-这个模块负责把“用户怎么启动 Lumo”翻译成 runtime 能理解的对象：
-解析参数、挑模型后端、构建工作区快照、恢复或新建 session，
-最后进入 one-shot 或交互式循环。
-"""
 
 import argparse
 import os
@@ -111,6 +106,10 @@ def _stderr_tool_call_reporter(name, summary):
 
 def _stderr_assistant_message_reporter(message):
     print(f"[assistant] {message}", file=sys.stderr)
+
+
+def _stderr_retry_reporter(message):
+    print(f"[retry] {message}", file=sys.stderr)
 
 
 def _gradient_text(text, start_rgb=WELCOME_GRADIENT_START, end_rgb=WELCOME_GRADIENT_END):
@@ -235,7 +234,7 @@ def _configured_secret_names(args):
     return sorted(configured_secret_names)
 
 
-def _build_model_client(args):
+def _build_model_client(args, retry_reporter=None):
     provider = getattr(args, "provider", "deepseek")
 
 
@@ -266,6 +265,7 @@ def _build_model_client(args):
             temperature=_openai_temperature(),
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
             reasoning_effort=_openai_reasoning_effort(),
+            retry_reporter=retry_reporter,
         )
     if provider == "anthropic":
         model = _effective_model(args, provider)
@@ -293,6 +293,7 @@ def _build_model_client(args):
             api_key=api_key,
             temperature=args.temperature,
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
+            retry_reporter=retry_reporter,
         )
     if provider == "deepseek":
         model = _effective_model(args, provider)
@@ -308,6 +309,7 @@ def _build_model_client(args):
             api_key=api_key,
             temperature=args.temperature,
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
+            retry_reporter=retry_reporter,
         )
 
     model = _effective_model(args, provider)
@@ -318,6 +320,7 @@ def _build_model_client(args):
         temperature=args.temperature,
         top_p=args.top_p,
         timeout=args.ollama_timeout,
+        retry_reporter=retry_reporter,
     )
 
 
@@ -391,21 +394,7 @@ def build_welcome(agent, model, host):
 
 
 def build_agent(args):
-    """根据 CLI 参数装配出一个可运行的 Pico 实例。
 
-    为什么存在：
-    命令行参数只是字符串和开关，runtime 需要的是已经装配好的对象图：
-    model client、workspace snapshot、session store、secret 配置等。
-    这个函数负责把“启动参数”翻译成“agent 运行现场”。
-
-    输入 / 输出：
-    - 输入：`argparse` 解析后的 `args`
-    - 输出：一个新的 `Pico`，或一个从旧 session 恢复出来的 `Pico`
-
-    在 agent 链路里的位置：
-    它是整个程序启动链路里最靠近 runtime 的装配点。`main()` 先调它，
-    得到 agent 后，后面无论是 one-shot 还是 REPL 模式，都会落到 `ask()`。
-    """
 
 
     workspace = WorkspaceContext.build(args.cwd)
@@ -416,7 +405,7 @@ def build_agent(args):
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(Path(workspace.repo_root) / AGENT_STATE_DIR / "sessions")
 
-    model = _build_model_client(args)
+    model = _build_model_client(args, retry_reporter=_stderr_retry_reporter)
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()

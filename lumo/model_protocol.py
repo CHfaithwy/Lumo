@@ -1,4 +1,4 @@
-"""Provider-neutral native model and tool-call protocol."""
+
 
 from __future__ import annotations
 
@@ -6,9 +6,23 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class ProviderRequestError(RuntimeError):
+
+
+    def __init__(self, message, *, status_code=None, response_body="", retry_after_seconds=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_body = str(response_body or "")
+        self.retry_after_seconds = retry_after_seconds
+
+
+class ContextWindowExceededError(ProviderRequestError):
+    pass
+
+
 @dataclass(frozen=True)
 class AssistantToolCall:
-    """One model-requested function invocation with a stable provider call ID."""
+
 
     call_id: str
     name: str
@@ -38,8 +52,47 @@ class AssistantToolCall:
 
 
 @dataclass(frozen=True)
+class ArchiveSummaryEvent:
+
+
+    event_call_id: str
+    source_call_id: str
+    summary: str = ""
+    key_facts: list[str] = field(default_factory=list)
+    unresolved: list[str] = field(default_factory=list)
+    revisit_hints: list[str] = field(default_factory=list)
+    error: str = ""
+    normalizations: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_call_id": self.event_call_id,
+            "source_call_id": self.source_call_id,
+            "summary": self.summary,
+            "key_facts": list(self.key_facts),
+            "unresolved": list(self.unresolved),
+            "revisit_hints": list(self.revisit_hints),
+            "error": self.error,
+            "normalizations": list(self.normalizations),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ArchiveSummaryEvent":
+        return cls(
+            event_call_id=str(value.get("event_call_id", "")),
+            source_call_id=str(value.get("source_call_id", "")),
+            summary=str(value.get("summary", "")),
+            key_facts=[str(item) for item in list(value.get("key_facts", []) or [])],
+            unresolved=[str(item) for item in list(value.get("unresolved", []) or [])],
+            revisit_hints=[str(item) for item in list(value.get("revisit_hints", []) or [])],
+            error=str(value.get("error", "")),
+            normalizations=[str(item) for item in list(value.get("normalizations", []) or [])],
+        )
+
+
+@dataclass(frozen=True)
 class ToolResultMessage:
-    """A local tool result that must be returned to the matching model call."""
+
 
     call_id: str
     name: str
@@ -56,7 +109,7 @@ class ToolResultMessage:
 
 @dataclass
 class ModelTurnRequest:
-    """Canonical request consumed by all provider adapters."""
+
 
     instructions: str
     messages: list[dict[str, Any]]
@@ -101,10 +154,11 @@ class ModelTurnRequest:
 
 @dataclass
 class ModelTurnResponse:
-    """Normalized provider response used by the agent loop."""
+
 
     text: str = ""
     tool_calls: list[AssistantToolCall] = field(default_factory=list)
+    archive_events: list[ArchiveSummaryEvent] = field(default_factory=list)
     provider_output_items: list[dict[str, Any]] = field(default_factory=list)
     raw_response: dict[str, Any] = field(default_factory=dict)
     usage: dict[str, Any] = field(default_factory=dict)
@@ -116,6 +170,7 @@ class ModelTurnResponse:
         return {
             "text": self.text,
             "tool_calls": [call.to_dict() for call in self.tool_calls],
+            "archive_events": [event.to_dict() for event in self.archive_events],
             "provider_output_items": list(self.provider_output_items),
             "raw_response": dict(self.raw_response),
             "usage": dict(self.usage),
@@ -126,4 +181,4 @@ class ModelTurnResponse:
 
 
 class NativeToolCallingUnsupportedError(RuntimeError):
-    """Raised when a configured provider cannot satisfy the native contract."""
+    pass

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lumo.local/eval/judge-output.schema.json",
+  "title": "Lumo Rubric Judge Output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "criteria", "normalized_score", "pass", "unsupported_claims", "judge_notes"],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "score", "evidence", "reason"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "score": {"type": "integer", "minimum": 0, "maximum": 4},
+          "evidence": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "reason": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "normalized_score": {"type": "number", "minimum": 0, "maximum": 100},
+    "pass": {"type": "boolean"},
+    "unsupported_claims": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "judge_notes": {"type": "string"}
+  }
+}

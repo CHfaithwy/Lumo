@@ -23,5 +23,8 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["lumo*"]
 
+[tool.setuptools.package-data]
+lumo = ["prompt/*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

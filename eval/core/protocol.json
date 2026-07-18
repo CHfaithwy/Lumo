@@ -1,0 +1,50 @@
+{
+  "schema_version": "2.0",
+  "suite": "core",
+  "category": "protocol",
+  "description": "调用关联、严格参数边界以及重复调用恢复。",
+  "tasks": [
+    {
+      "id": "core.protocol.parallel-correlation-common.v1",
+      "title": "并行读取结果正确关联",
+      "objective": "验证并行只读调用的编号、结果和顺序保持一致。",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["agent_bench", "tau_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["glob", "read_file", "grep"], "supporting_tools": [], "scenario_class": "common", "mechanisms": [{"name": "tool_call_control", "scenario": "common"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "scripted_probe", "repetitions": 1, "max_steps": 6, "timeout_seconds": 120, "required_harness_features": ["scripted_provider", "parallel_tool_calls", "provider_request_assertions"], "scripted_model": {"scenario": "Emit three concurrency-safe calls with distinct call IDs, then consume their results in a different textual order."}},
+      "model_input": {"allowed_tools": ["glob", "read_file", "grep"], "turns": [{"id": "main", "session_policy": "new", "prompt": "请找出 config 目录中的三个服务文件，分别核对 owner 字段，再搜索这些负责人是否出现在 CODEOWNERS 中，最后按服务名列出对应关系。"}]},
+      "setup": {"workspace_files": [{"path": "config/a.toml", "content": "service='a'\nowner='team-alpha'\n"}, {"path": "config/b.toml", "content": "service='b'\nowner='team-beta'\n"}, {"path": "config/c.toml", "content": "service='c'\nowner='team-gamma'\n"}, {"path": "CODEOWNERS", "content": "config/a.toml @team-alpha\nconfig/b.toml @team-beta\nconfig/c.toml @team-gamma\n"}], "private_files": [], "directories": [], "actions": []},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "answer", "type": "final_answer_contains", "required": true, "spec": {"all": ["a", "team-alpha", "b", "team-beta", "c", "team-gamma"]}}, {"id": "distinct_ids", "type": "history_state", "required": true, "spec": {"distinct_call_ids": 3, "all_results_match_source": true}}, {"id": "call_mapping", "type": "history_state", "required": true, "spec": {"call_id_to_tool": {"call-glob": "glob", "call-owners": "grep", "call-codeowners": "read_file"}}}, {"id": "ordered", "type": "history_state", "required": true, "spec": {"provider_output_replay_order_valid": true}}, {"id": "glob", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "glob", "min_count": 1}}, {"id": "read", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "read_file", "min_count": 1}}, {"id": "grep", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "grep", "min_count": 1}}]},
+      "failure_labels": ["wrong_tool_arguments", "incomplete_goal", "environment_error"]
+    },
+    {
+      "id": "core.protocol.strict-arguments-boundary.v1",
+      "title": "严格参数与数值上限",
+      "objective": "验证未知字段被拒绝、超大合法数值被归一化并审计。",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["agent_bench", "terminal_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["grep", "read_file"], "supporting_tools": [], "scenario_class": "boundary", "mechanisms": [{"name": "tool_call_control", "scenario": "boundary"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "scripted_probe", "repetitions": 1, "max_steps": 7, "timeout_seconds": 120, "required_harness_features": ["scripted_provider", "argument_validation_assertions", "trace_assertions"], "scripted_model": {"scenario": "First emit an unknown argument, then retry with a legal but oversized numeric limit and read the matched file."}},
+      "model_input": {"allowed_tools": ["grep", "read_file"], "turns": [{"id": "main", "session_policy": "new", "prompt": "请在源码中定位错误码 E_CONN_42 的定义和首次使用位置，并引用两处附近的相关代码。"}]},
+      "setup": {"workspace_files": [{"path": "src/errors.py", "content": "E_CONN_42 = 'connection exhausted'\n"}, {"path": "src/service.py", "content": "from .errors import E_CONN_42\n\ndef connect():\n    raise RuntimeError(E_CONN_42)\n"}], "private_files": [], "directories": [], "actions": [{"type": "run_command", "spec": {"fixture_generator": "long_source_decoys"}}]},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "answer", "type": "final_answer_contains", "required": true, "spec": {"all": ["errors.py", "E_CONN_42", "connection exhausted", "service.py", "RuntimeError"]}}, {"id": "invalid_rejected", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "grep", "include_rejected": true, "tool_status": "rejected", "tool_error_code": "invalid_arguments", "min_count": 1}}, {"id": "clamped", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "grep", "normalization_argument": "head_limit", "normalization_reason": "above_maximum", "min_count": 1}}, {"id": "grep", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "grep", "min_count": 1}}, {"id": "read", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "read_file", "min_count": 1}}]},
+      "failure_labels": ["wrong_tool_arguments", "incomplete_goal", "environment_error"]
+    },
+    {
+      "id": "core.protocol.duplicate-call-recovery.v1",
+      "title": "重复副作用调用拦截",
+      "objective": "验证同轮重复调用只执行一次且后续真实工作继续。",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["tau_bench", "terminal_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["run_shell", "write_file"], "supporting_tools": [], "scenario_class": "recovery", "mechanisms": [{"name": "tool_call_control", "scenario": "recovery"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "scripted_probe", "repetitions": 1, "max_steps": 6, "timeout_seconds": 120, "required_harness_features": ["scripted_provider", "duplicate_call_injection", "trace_assertions"], "scripted_model": {"scenario": "Emit the same side-effecting command twice with different call IDs, then emit one result-file write and a final answer."}},
+      "model_input": {"allowed_tools": ["run_shell", "write_file"], "turns": [{"id": "main", "session_policy": "new", "prompt": "运行 python allocate.py 一次，并把程序返回的编号写入 allocation.json。该程序每次运行都会占用一个新编号，不能重复执行。"}]},
+      "setup": {"workspace_files": [{"path": "counter.txt", "content": "0\n"}, {"path": "allocate.py", "content": "from pathlib import Path\np=Path('counter.txt')\nn=int(p.read_text())+1\np.write_text(str(n)+'\\n')\nprint(f'AL-{n}')\n"}], "private_files": [], "directories": [], "actions": []},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "once", "type": "file_content_equals", "required": true, "spec": {"path": "counter.txt", "content": "1\n"}}, {"id": "result", "type": "json_value_equals", "required": true, "spec": {"path": "allocation.json", "json_path": "$.allocation", "value": "AL-1"}}, {"id": "single_run", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "run_shell", "count": 1}}, {"id": "duplicate", "type": "trace_event", "required": true, "spec": {"event": "tool_rejected", "reason": "duplicate_same_turn_call", "count": 1}}, {"id": "write", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "write_file", "count": 1}}]},
+      "failure_labels": ["wrong_tool_arguments", "collateral_change", "incomplete_goal"]
+    }
+  ]
+}

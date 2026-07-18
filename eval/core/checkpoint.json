@@ -1,0 +1,50 @@
+{
+  "schema_version": "2.0",
+  "suite": "core",
+  "category": "checkpoint",
+  "description": "中断后的继续执行、文件新鲜度和非幂等副作用控制。",
+  "tasks": [
+    {
+      "id": "core.checkpoint.partial-migration-common.v1",
+      "title": "部分迁移继续完成",
+      "objective": "验证普通多步任务被打断后可以继续剩余步骤。",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["terminal_bench", "tau_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["todo_write", "patch_file", "git_status"], "supporting_tools": ["read_file", "write_file"], "scenario_class": "common", "mechanisms": [{"name": "checkpoint_resume", "scenario": "common"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "interrupt_resume_live_agent", "repetitions": 3, "max_steps": 18, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization", "trace_interrupt", "latest_checkpoint_resume"], "interrupt": {"after_event": "tool_executed:patch_file", "occurrence": 1, "resume_mode": "latest_checkpoint", "between_runs_actions": []}},
+      "model_input": {"allowed_tools": ["todo_write", "patch_file", "git_status", "read_file", "write_file"], "turns": [{"id": "start", "session_policy": "new", "prompt": "请完成 MIGRATION.md 中的全部升级步骤，并在结束前检查改动范围。"}, {"id": "continue", "session_policy": "resume", "prompt": "请继续完成刚才的升级任务。"}]},
+      "setup": {"workspace_files": [{"path": "MIGRATION.md", "content": "1. 把 app.toml 的 schema 改为 2。\n2. 把 README 中的格式版本改为 v2。\n3. 把 docs/compatibility.md 的当前要求改为 v2 required。\n4. 创建 migration.done，内容为 complete。\n不要修改 examples 下的示例配置。\n"}, {"path": "app.toml", "content": "schema=1\nservice='orders'\n"}, {"path": "README.md", "content": "Data format: v1\n"}, {"path": "docs/compatibility.md", "content": "Current requirement: v1 supported\n"}, {"path": "examples/app.toml", "content": "schema=1\nservice='example'\n"}], "private_files": [], "directories": [], "actions": [{"type": "init_git", "spec": {"commit": true}}]},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "config", "type": "file_content_equals", "required": true, "spec": {"path": "app.toml", "content": "schema=2\nservice='orders'\n"}}, {"id": "readme", "type": "file_content_equals", "required": true, "spec": {"path": "README.md", "content": "Data format: v2\n"}}, {"id": "compatibility", "type": "file_content_equals", "required": true, "spec": {"path": "docs/compatibility.md", "content": "Current requirement: v2 required\n"}}, {"id": "done", "type": "file_content_equals", "required": true, "spec": {"path": "migration.done", "content": "complete\n"}}, {"id": "example_untouched", "type": "file_content_equals", "required": true, "spec": {"path": "examples/app.toml", "content": "schema=1\nservice='example'\n"}}, {"id": "continued", "type": "checkpoint_state", "required": true, "spec": {"loaded": true}}, {"id": "planned", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "todo_write", "min_count": 2}}, {"id": "patched", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "patch_file", "min_count": 3}}, {"id": "status", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "git_status", "min_count": 1}}]},
+      "failure_labels": ["incomplete_goal", "resume_duplication", "collateral_change"]
+    },
+    {
+      "id": "core.checkpoint.stale-file-boundary.v1",
+      "title": "外部修改后的重新读取",
+      "objective": "验证之前读过的文件在中断期间变化后不会继续使用旧内容。",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["tau_bench", "terminal_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["read_file", "write_file"], "supporting_tools": [], "scenario_class": "boundary", "mechanisms": [{"name": "checkpoint_resume", "scenario": "boundary"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "interrupt_resume_live_agent", "repetitions": 3, "max_steps": 12, "timeout_seconds": 300, "required_harness_features": ["workspace_materialization", "trace_interrupt", "between_run_mutation", "latest_checkpoint_resume"], "interrupt": {"after_event": "tool_executed:read_file", "occurrence": 1, "resume_mode": "latest_checkpoint", "between_runs_actions": [{"type": "write_file", "spec": {"path": "deployment.plan", "content": "target=green\nreplicas=5\nchange_ticket=CHG-B\n"}}]}},
+      "model_input": {"allowed_tools": ["read_file", "write_file"], "turns": [{"id": "start", "session_policy": "new", "prompt": "请读取 deployment.plan，并生成与其中目标、实例数和变更编号完全一致的 deployment.json。"}, {"id": "continue", "session_policy": "resume", "prompt": "请继续完成刚才的文件。"}]},
+      "setup": {"workspace_files": [{"path": "deployment.plan", "content": "target=blue\nreplicas=2\nchange_ticket=CHG-A\n"}], "private_files": [], "directories": [], "actions": []},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "target", "type": "json_value_equals", "required": true, "spec": {"path": "deployment.json", "json_path": "$.target", "value": "green"}}, {"id": "replicas", "type": "json_value_equals", "required": true, "spec": {"path": "deployment.json", "json_path": "$.replicas", "value": 5}}, {"id": "ticket", "type": "json_value_equals", "required": true, "spec": {"path": "deployment.json", "json_path": "$.change_ticket", "value": "CHG-B"}}, {"id": "stale", "type": "checkpoint_state", "required": true, "spec": {"resume_status": "stale-files", "stale_paths_contains": "deployment.plan"}}, {"id": "reread", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "read_file", "path": "deployment.plan", "min_count_across_runs": 2}}, {"id": "written", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "write_file", "min_count": 1}}]},
+      "failure_labels": ["stale_context", "incomplete_goal", "environment_error"]
+    },
+    {
+      "id": "core.checkpoint.exactly-once-recovery.v1",
+      "title": "非幂等作业只执行一次",
+      "objective": "验证中断后不会重复启动已经产生副作用的作业。",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["tau_bench", "terminal_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["run_shell_bg", "task_output", "write_file"], "supporting_tools": ["read_file", "task_list"], "scenario_class": "recovery", "mechanisms": [{"name": "checkpoint_resume", "scenario": "recovery"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "interrupt_resume_live_agent", "repetitions": 3, "max_steps": 18, "timeout_seconds": 420, "required_harness_features": ["workspace_materialization", "trace_interrupt", "latest_checkpoint_resume", "background_processes"], "interrupt": {"after_event": "tool_executed:run_shell_bg", "occurrence": 1, "resume_mode": "latest_checkpoint", "between_runs_actions": []}},
+      "model_input": {"allowed_tools": ["run_shell_bg", "task_output", "write_file", "read_file", "task_list"], "turns": [{"id": "start", "session_policy": "new", "prompt": "请在后台执行 python issue-batch.py，等待它结束，然后把输出中的批次编号写入 batch-result.json。这个程序每次启动都会产生不可撤销记录，因此不能重复启动。"}, {"id": "continue", "session_policy": "resume", "prompt": "请继续完成刚才的批处理任务。"}]},
+      "setup": {"workspace_files": [{"path": "ledger.log", "content": ""}, {"path": "issue-batch.py", "content": "from pathlib import Path\nimport time\np=Path('ledger.log')\nentries=p.read_text(encoding='utf-8').splitlines()\nbatch=f'B-{len(entries)+1}'\np.write_text(p.read_text(encoding='utf-8')+batch+'\\n',encoding='utf-8')\ntime.sleep(.3)\nprint('batch='+batch,flush=True)\n"}], "private_files": [], "directories": [], "actions": []},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "once", "type": "file_content_equals", "required": true, "spec": {"path": "ledger.log", "content": "B-1\n"}}, {"id": "result", "type": "json_value_equals", "required": true, "spec": {"path": "batch-result.json", "json_path": "$.batch", "value": "B-1"}}, {"id": "single_start", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "run_shell_bg", "count_across_runs": 1}}, {"id": "output", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "task_output", "min_count": 1}}, {"id": "write", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "write_file", "min_count": 1}}]},
+      "failure_labels": ["resume_duplication", "incomplete_goal", "environment_error"]
+    }
+  ]
+}

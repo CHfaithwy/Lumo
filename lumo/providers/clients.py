@@ -1,24 +1,121 @@
-"""模型后端适配层。
 
-runtime 只关心一件事：给我一个 prompt，我拿回一段文本。
-不同 provider 在 HTTP 接口、响应结构、是否支持 prompt cache 上都有差异，
-这些差异都在这里被抹平成统一的 complete() 接口。
-"""
 
 import asyncio
 import json
+import random
 import time
+from email.utils import parsedate_to_datetime
 
 import httpx
 
-from ..model_protocol import AssistantToolCall, ModelTurnRequest, ModelTurnResponse, NativeToolCallingUnsupportedError
+from ..archive_context import ARCHIVE_TOOL_NAME, partition_archive_calls
+from ..model_protocol import (
+    ArchiveSummaryEvent,
+    AssistantToolCall,
+    ContextWindowExceededError,
+    ModelTurnRequest,
+    ModelTurnResponse,
+    NativeToolCallingUnsupportedError,
+    ProviderRequestError,
+)
 
 OPENAI_COMPATIBLE_USER_AGENT = "lumo/0.1"
-PROMPT_CACHE_COMPATIBLE_HOSTS = ("openai.com", "right.codes", "codex2api.com")
+MAX_RETRY_AFTER_SECONDS = 120.0
+MAX_LOCAL_RETRY_DELAY_SECONDS = 30.0
+LOCAL_RETRY_JITTER_RATIO = 0.25
 
 
-def _retry_delay(attempt):
-    return 0.5 * (attempt + 1)
+def _retry_delay(attempt, retry_after_seconds=None):
+    if retry_after_seconds is not None:
+        return min(MAX_RETRY_AFTER_SECONDS, max(0.0, float(retry_after_seconds)))
+    base_delay = min(MAX_LOCAL_RETRY_DELAY_SECONDS, float(2**attempt))
+    return min(MAX_LOCAL_RETRY_DELAY_SECONDS, base_delay * (1.0 + random.random() * LOCAL_RETRY_JITTER_RATIO))
+
+
+def _format_retry_delay(delay_seconds):
+    delay_seconds = float(delay_seconds)
+    if delay_seconds >= 10 or delay_seconds.is_integer():
+        return f"{round(delay_seconds)}s"
+    return f"{delay_seconds:.1f}s"
+
+
+def _report_retry(retry_reporter, status_code, attempt, attempts, delay_seconds):
+    if retry_reporter is None:
+        return
+    if status_code is None:
+        reason = "connection error"
+    elif status_code == 429:
+        reason = "HTTP 429 (rate limited)"
+    else:
+        reason = f"HTTP {status_code}"
+    try:
+        retry_reporter(f"{reason}; retry {attempt + 1}/{attempts - 1} in {_format_retry_delay(delay_seconds)}")
+    except Exception:
+        pass
+
+
+def _parse_retry_after(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(text)
+            if parsed.tzinfo is None:
+                return None
+            seconds = parsed.timestamp() - time.time()
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+    return max(0.0, seconds) if seconds >= 0 else None
+
+
+def _retry_after_from_body(body):
+    try:
+        payload = json.loads(str(body or ""))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("retry_after")
+    if value is None and isinstance(payload.get("error"), dict):
+        value = payload["error"].get("retry_after")
+    return _parse_retry_after(value)
+
+
+def _response_retry_after(response):
+    if response is None:
+        return None
+    header_delay = _parse_retry_after(response.headers.get("Retry-After"))
+    return header_delay if header_delay is not None else _retry_after_from_body(response.text)
+
+
+def _is_context_window_error(status_code, body):
+    if status_code not in {400, 413}:
+        return False
+    text = str(body or "").lower()
+    if any(
+        marker in text
+        for marker in (
+            "prompt-too-long",
+            "prompt too long",
+            "context_length_exceeded",
+            "context_window_exceeded",
+            "model_context_window_exceeded",
+        )
+    ):
+        return True
+    overflow_terms = ("too long", "too large", "exceed", "exceeded", "maximum", "limit", "window", "length")
+    if ("context" in text or "prompt" in text) and any(term in text for term in overflow_terms):
+        return True
+    return "input" in text and "token" in text and any(term in text for term in overflow_terms)
+
+
+def _is_retryable_status(status_code):
+    return status_code == 429 or status_code >= 500
 
 
 def _http_status_error_message(prefix, exc):
@@ -28,12 +125,44 @@ def _http_status_error_message(prefix, exc):
     return f"{prefix} failed with HTTP {status_code}: {body}"
 
 
+def _provider_http_error(prefix, exc):
+    response = exc.response
+    body = response.text if response is not None else str(exc)
+    status_code = response.status_code if response is not None else None
+    error_type = ContextWindowExceededError if _is_context_window_error(status_code, body) else ProviderRequestError
+    return error_type(
+        _http_status_error_message(prefix, exc),
+        status_code=status_code,
+        response_body=body,
+        retry_after_seconds=_response_retry_after(response),
+    )
+
+
+def _provider_connection_error(message):
+    return ProviderRequestError(message, status_code=None, response_body="", retry_after_seconds=None)
+
+
 def _is_native_tool_capability_error(error):
     text = str(error).lower()
     return any(token in text for token in ("tool", "function", "strict", "schema", "responses"))
 
 
-def _post_json_with_retries(url, payload, headers, timeout, http_error_prefix, connection_error_message, attempts=3):
+def _optional_reasoning_effort(value):
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
+def _post_json_with_retries(
+    url,
+    payload,
+    headers,
+    timeout,
+    http_error_prefix,
+    connection_error_message,
+    attempts=3,
+    retry_reporter=None,
+):
     with httpx.Client(timeout=timeout) as client:
         for attempt in range(attempts):
             try:
@@ -42,18 +171,31 @@ def _post_json_with_retries(url, payload, headers, timeout, http_error_prefix, c
                 return response.text, response.headers.get("Content-Type", "")
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
-                if status_code >= 500 and attempt < attempts - 1:
-                    time.sleep(_retry_delay(attempt))
+                if _is_retryable_status(status_code) and attempt < attempts - 1:
+                    delay_seconds = _retry_delay(attempt, _response_retry_after(exc.response))
+                    _report_retry(retry_reporter, status_code, attempt, attempts, delay_seconds)
+                    time.sleep(delay_seconds)
                     continue
-                raise RuntimeError(_http_status_error_message(http_error_prefix, exc)) from exc
+                raise _provider_http_error(http_error_prefix, exc) from exc
             except httpx.RequestError as exc:
                 if attempt < attempts - 1:
-                    time.sleep(_retry_delay(attempt))
+                    delay_seconds = _retry_delay(attempt)
+                    _report_retry(retry_reporter, None, attempt, attempts, delay_seconds)
+                    time.sleep(delay_seconds)
                     continue
-                raise RuntimeError(connection_error_message) from exc
+                raise _provider_connection_error(connection_error_message) from exc
 
 
-async def _post_json_with_retries_async(url, payload, headers, timeout, http_error_prefix, connection_error_message, attempts=3):
+async def _post_json_with_retries_async(
+    url,
+    payload,
+    headers,
+    timeout,
+    http_error_prefix,
+    connection_error_message,
+    attempts=3,
+    retry_reporter=None,
+):
     async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(attempts):
             try:
@@ -62,15 +204,19 @@ async def _post_json_with_retries_async(url, payload, headers, timeout, http_err
                 return response.text, response.headers.get("Content-Type", "")
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
-                if status_code >= 500 and attempt < attempts - 1:
-                    await asyncio.sleep(_retry_delay(attempt))
+                if _is_retryable_status(status_code) and attempt < attempts - 1:
+                    delay_seconds = _retry_delay(attempt, _response_retry_after(exc.response))
+                    _report_retry(retry_reporter, status_code, attempt, attempts, delay_seconds)
+                    await asyncio.sleep(delay_seconds)
                     continue
-                raise RuntimeError(_http_status_error_message(http_error_prefix, exc)) from exc
+                raise _provider_http_error(http_error_prefix, exc) from exc
             except httpx.RequestError as exc:
                 if attempt < attempts - 1:
-                    await asyncio.sleep(_retry_delay(attempt))
+                    delay_seconds = _retry_delay(attempt)
+                    _report_retry(retry_reporter, None, attempt, attempts, delay_seconds)
+                    await asyncio.sleep(delay_seconds)
                     continue
-                raise RuntimeError(connection_error_message) from exc
+                raise _provider_connection_error(connection_error_message) from exc
 
 
 class FakeModelClient:
@@ -113,9 +259,18 @@ class FakeModelClient:
         if isinstance(raw, ModelTurnResponse):
             response = raw
         elif isinstance(raw, dict):
+            real_calls, archive_events = partition_archive_calls(
+                [AssistantToolCall.from_dict(item) for item in list(raw.get("tool_calls", []) or [])]
+            )
+            archive_events.extend(
+                ArchiveSummaryEvent.from_dict(item)
+                for item in list(raw.get("archive_events", []) or [])
+                if isinstance(item, dict)
+            )
             response = ModelTurnResponse(
                 text=str(raw.get("text", "")),
-                tool_calls=[AssistantToolCall.from_dict(item) for item in list(raw.get("tool_calls", []) or [])],
+                tool_calls=real_calls,
+                archive_events=archive_events,
                 raw_response=dict(raw),
                 structured_output=(
                     dict(raw)
@@ -136,7 +291,7 @@ class FakeModelClient:
                 max_output_tokens=int(kwargs.get("max_new_tokens", 256)),
                 structured_schema=dict(schema),
                 force_structured=True,
-                reasoning_effort=(str(kwargs.get("reasoning_effort", "")).strip() or None),
+                reasoning_effort=_optional_reasoning_effort(kwargs.get("reasoning_effort")),
             )
         )
         try:
@@ -167,12 +322,13 @@ def _render_message_request(system, messages):
 
 
 class OllamaModelClient:
-    def __init__(self, model, host, temperature, top_p, timeout):
+    def __init__(self, model, host, temperature, top_p, timeout, retry_reporter=None):
         self.model = model
         self.host = host.rstrip("/")
         self.temperature = temperature
         self.top_p = top_p
         self.timeout = timeout
+        self.retry_reporter = retry_reporter
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
 
@@ -204,6 +360,7 @@ class OllamaModelClient:
                 f"Host: {self.host}\n"
                 f"Model: {self.model}"
             ),
+            retry_reporter=self.retry_reporter,
         )
         data = json.loads(body_text)
 
@@ -237,6 +394,7 @@ class OllamaModelClient:
                 f"Host: {self.host}\n"
                 f"Model: {self.model}"
             ),
+            retry_reporter=self.retry_reporter,
         )
         data = json.loads(body_text)
         if data.get("error"):
@@ -265,9 +423,14 @@ class OllamaModelClient:
             role = str(message.get("role", "user"))
             if role == "tool":
                 output = message.get("result", {}) if isinstance(message.get("result", {}), dict) else {}
+                output = dict(output)
+                output["source_call_id"] = str(message.get("call_id", ""))
                 messages.append({"role": "tool", "tool_name": str(message.get("name", "")), "content": json.dumps(output, ensure_ascii=False)})
                 continue
             if role == "skill_context":
+                messages.append({"role": "user", "content": str(message.get("content", ""))})
+                continue
+            if role == "archive_control":
                 messages.append({"role": "user", "content": str(message.get("content", ""))})
                 continue
             item = {"role": role if role in {"user", "assistant"} else "user", "content": str(message.get("content", ""))}
@@ -301,6 +464,7 @@ class OllamaModelClient:
         body_text, _ = await _post_json_with_retries_async(
             self.host + "/api/chat", payload, {"Content-Type": "application/json"}, self.timeout,
             "Ollama request", f"Could not reach Ollama.\nHost: {self.host}\nModel: {self.model}",
+            retry_reporter=self.retry_reporter,
         )
         try:
             data = json.loads(body_text)
@@ -314,8 +478,9 @@ class OllamaModelClient:
             function = raw_call.get("function", {}) if isinstance(raw_call, dict) else {}
             arguments = function.get("arguments", {}) if isinstance(function.get("arguments", {}), dict) else None
             calls.append(AssistantToolCall(call_id=f"ollama_{len(request.messages)}_{index}", name=str(function.get("name", "")), arguments=arguments, raw_arguments=json.dumps(function.get("arguments", {}), ensure_ascii=False), error="" if arguments is not None else "invalid_arguments"))
+        calls, archive_events = partition_archive_calls(calls)
         response = ModelTurnResponse(
-            text=str(message.get("content", "")), tool_calls=calls, raw_response=data,
+            text=str(message.get("content", "")), tool_calls=calls, archive_events=archive_events, raw_response=data,
             usage=dict(data.get("eval_count") and {"output_tokens": data.get("eval_count")} or {}),
         )
         if request.structured_schema and response.text:
@@ -344,6 +509,7 @@ class OllamaModelClient:
             self.timeout,
             "Ollama request",
             f"Could not reach Ollama.\nHost: {self.host}\nModel: {self.model}",
+            retry_reporter=self.retry_reporter,
         )
         data = json.loads(body_text)
         if data.get("error"):
@@ -360,6 +526,7 @@ class OllamaModelClient:
             self.timeout,
             "Ollama request",
             f"Could not reach Ollama.\nHost: {self.host}\nModel: {self.model}",
+            retry_reporter=self.retry_reporter,
         )
         data = json.loads(body_text)
         if data.get("error"):
@@ -510,16 +677,17 @@ def _extract_usage_cache_details(data):
 
 
 class OpenAICompatibleModelClient:
-    def __init__(self, model, base_url, api_key, temperature, timeout, reasoning_effort=None):
+    def __init__(self, model, base_url, api_key, temperature, timeout, reasoning_effort=None, retry_reporter=None):
         self.model = model
         self.base_url = _normalize_versioned_base_url(base_url)
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
         self.reasoning_effort = reasoning_effort
+        self.retry_reporter = retry_reporter
 
 
-        self.supports_prompt_cache = any(host in self.base_url for host in PROMPT_CACHE_COMPATIBLE_HOSTS)
+        self.supports_prompt_cache = True
         self.last_completion_metadata = {}
         self.last_request_payload = {}
         self.last_response_payload = {}
@@ -605,6 +773,14 @@ class OpenAICompatibleModelClient:
                 items.append(
                     {
                         "role": "user",
+                        "content": [{"type": "input_text", "text": str(message.get("content", ""))}],
+                    }
+                )
+                continue
+            if role == "archive_control":
+                items.append(
+                    {
+                        "role": "developer",
                         "content": [{"type": "input_text", "text": str(message.get("content", ""))}],
                     }
                 )
@@ -722,10 +898,17 @@ class OpenAICompatibleModelClient:
                     refusal = str(content.get("refusal", content.get("text", "")))
         if not text_parts and data.get("output_text"):
             text_parts.append(str(data["output_text"]))
+        calls, archive_events = partition_archive_calls(calls)
+        replay_output_items = [
+            item
+            for item in output_items
+            if not (item.get("type") == "function_call" and item.get("name") == ARCHIVE_TOOL_NAME)
+        ]
         return ModelTurnResponse(
             text="\n".join(text_parts).strip(),
             tool_calls=calls,
-            provider_output_items=output_items,
+            archive_events=archive_events,
+            provider_output_items=replay_output_items,
             raw_response=data,
             usage=_extract_usage_cache_details(data),
             refusal=refusal,
@@ -734,7 +917,7 @@ class OpenAICompatibleModelClient:
 
     @staticmethod
     def _openai_response_artifact(data):
-        """Keep the model output while omitting request configuration echoed by gateways."""
+
         return {
             "id": data.get("id"),
             "status": data.get("status"),
@@ -751,6 +934,7 @@ class OpenAICompatibleModelClient:
             body_text, content_type = await _post_json_with_retries_async(
                 self.base_url + "/responses", payload, self._headers(), self.timeout,
                 "OpenAI-compatible request", self._connection_error_message(),
+                retry_reporter=self.retry_reporter,
             )
         except RuntimeError as exc:
             if request.tools and _is_native_tool_capability_error(exc):
@@ -786,7 +970,7 @@ class OpenAICompatibleModelClient:
             structured_schema=dict(schema),
             structured_name=str(kwargs.get("name", "structured_output")),
             force_structured=True,
-            reasoning_effort=(str(kwargs.get("reasoning_effort", "")).strip() or None),
+            reasoning_effort=_optional_reasoning_effort(kwargs.get("reasoning_effort")),
         )
         response = await self.complete_turn_async(turn)
         return response.structured_output or {}
@@ -801,61 +985,14 @@ class OpenAICompatibleModelClient:
     def _parse_response(self, body_text, content_type, prompt_cache_key=None, prompt_cache_retention=None):
 
 
-        """
-        JSON：一次性返回一个完整 JSON 对象
-        SSE：按很多行 data: {...} 流式返回事件
 
-        {
-            "id": "resp_123",
-            "output": [
-                {
-                "type": "message",
-                "content": [
-                    {
-                    "type": "output_text",
-                    "text": "你好！有什么我可以帮你处理的？"
-                    }
-                ]
-                }
-            ],
-            "usage": {
-                "input_tokens": 1200,
-                "output_tokens": 20,
-                "total_tokens": 1220
-            }
-        }
-
-        SSE
-        data: {"type":"response.created","response":{"id":"resp_123"}}
-
-        data: {"type":"response.output_text.delta","delta":"你"}
-
-        data: {"type":"response.output_text.delta","delta":"好"}
-
-        data: {"type":"response.output_text.delta","delta":"！"}
-
-        data: {"type":"response.output_text.done","text":"你好！"}
-
-        data: {"type":"response.completed","response":{"id":"resp_123","output_text":"你好！","usage":{"input_tokens":1200,"output_tokens":20,"total_tokens":1220}}}
-
-        data: [DONE]
-        """
         if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
             text, response_data = _extract_openai_response_from_sse(body_text)
             metadata = {}
             if isinstance(response_data, dict) and response_data:
 
 
-                """
-                    _extract_usage_cache_details
-                    {
-                        "input_tokens": 1200,
-                        "output_tokens": 80,
-                        "total_tokens": 1280,
-                        "cached_tokens": 900,
-                        "cache_hit": True,
-                    }
-                    """
+
                 metadata = {
                     "prompt_cache_supported": self.supports_prompt_cache,
                     "prompt_cache_key": prompt_cache_key,
@@ -884,22 +1021,7 @@ class OpenAICompatibleModelClient:
         return _extract_openai_text(data), metadata
 
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
-        """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
 
-        为什么存在：
-        runtime 不应该知道 HTTP 细节、SSE 细节、usage 字段长什么样，
-        更不应该自己去判断 prompt cache 参数要不要带。这个函数把这些后端
-        细节都包起来，对上层暴露统一的 `complete()` 行为。
-
-        输入 / 输出：
-        - 输入：完整 prompt、最大输出 token，以及可选的 prompt cache 参数
-        - 输出：模型最终文本；同时把 usage / cached_tokens 等元数据写进
-          `self.last_completion_metadata`
-
-        在 agent 链路里的位置：
-        它位于 `Pico.ask()` 的模型调用阶段，是稳定前缀缓存复用链路真正
-        落到 provider API 的地方。
-        """
         self.last_completion_metadata = {}
         body_text, content_type = _post_json_with_retries(
             self.base_url + "/responses",
@@ -908,6 +1030,7 @@ class OpenAICompatibleModelClient:
             self.timeout,
             "OpenAI-compatible request",
             self._connection_error_message(),
+            retry_reporter=self.retry_reporter,
         )
         text, metadata = self._parse_response(body_text, content_type, prompt_cache_key, prompt_cache_retention)
         self.last_completion_metadata = metadata
@@ -922,6 +1045,7 @@ class OpenAICompatibleModelClient:
             self.timeout,
             "OpenAI-compatible request",
             self._connection_error_message(),
+            retry_reporter=self.retry_reporter,
         )
         text, metadata = self._parse_response(body_text, content_type, prompt_cache_key, prompt_cache_retention)
         self.last_completion_metadata = metadata
@@ -938,6 +1062,7 @@ class OpenAICompatibleModelClient:
             self.timeout,
             "OpenAI-compatible request",
             self._connection_error_message(),
+            retry_reporter=self.retry_reporter,
         )
         text, metadata = self._parse_response(body_text, content_type, prompt_cache_key, prompt_cache_retention)
         self.last_completion_metadata = metadata
@@ -954,6 +1079,7 @@ class OpenAICompatibleModelClient:
             self.timeout,
             "OpenAI-compatible request",
             self._connection_error_message(),
+            retry_reporter=self.retry_reporter,
         )
         text, metadata = self._parse_response(body_text, content_type, prompt_cache_key, prompt_cache_retention)
         self.last_completion_metadata = metadata
@@ -970,12 +1096,13 @@ def _extract_anthropic_text(data):
 
 
 class AnthropicCompatibleModelClient:
-    def __init__(self, model, base_url, api_key, temperature, timeout):
+    def __init__(self, model, base_url, api_key, temperature, timeout, retry_reporter=None):
         self.model = model
         self.base_url = _normalize_versioned_base_url(base_url)
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
+        self.retry_reporter = retry_reporter
         self.supports_prompt_cache = False
         self.last_completion_metadata = {}
         self.last_request_payload = {}
@@ -1053,6 +1180,13 @@ class AnthropicCompatibleModelClient:
                 else:
                     rendered.append({"role": "user", "content": [block]})
                 continue
+            if role == "archive_control":
+                block = {"type": "text", "text": str(message.get("content", ""))}
+                if pending_tool_blocks:
+                    pending_tool_blocks.append(block)
+                else:
+                    rendered.append({"role": "user", "content": [block]})
+                continue
             flush_tool_blocks()
             if role == "assistant" and message.get("tool_calls"):
                 content = []
@@ -1100,8 +1234,15 @@ class AnthropicCompatibleModelClient:
             elif item.get("type") == "tool_use":
                 arguments = item.get("input", {})
                 calls.append(AssistantToolCall(call_id=str(item.get("id", "")), name=str(item.get("name", "")), arguments=dict(arguments) if isinstance(arguments, dict) else None, raw_arguments=json.dumps(arguments, ensure_ascii=False), error="" if isinstance(arguments, dict) else "invalid_arguments"))
+        calls, archive_events = partition_archive_calls(calls)
+        provider_output_items = [
+            dict(item)
+            for item in data.get("content", [])
+            if isinstance(item, dict)
+            and not (item.get("type") == "tool_use" and item.get("name") == ARCHIVE_TOOL_NAME)
+        ]
         usage = data.get("usage", {}) if isinstance(data.get("usage", {}), dict) else {}
-        return ModelTurnResponse(text="\n".join(text_parts).strip(), tool_calls=calls, provider_output_items=[dict(item) for item in data.get("content", []) if isinstance(item, dict)], raw_response=data, usage={"input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens")})
+        return ModelTurnResponse(text="\n".join(text_parts).strip(), tool_calls=calls, archive_events=archive_events, provider_output_items=provider_output_items, raw_response=data, usage={"input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens")})
 
     async def complete_turn_async(self, turn_request, **kwargs):
         del kwargs
@@ -1109,7 +1250,15 @@ class AnthropicCompatibleModelClient:
         payload = self._build_turn_payload(request)
         self.last_request_payload = payload
         try:
-            body_text, _ = await _post_json_with_retries_async(self.base_url + "/messages", payload, self._headers(), self.timeout, "Anthropic-compatible request", self._connection_error_message())
+            body_text, _ = await _post_json_with_retries_async(
+                self.base_url + "/messages",
+                payload,
+                self._headers(),
+                self.timeout,
+                "Anthropic-compatible request",
+                self._connection_error_message(),
+                retry_reporter=self.retry_reporter,
+            )
         except RuntimeError as exc:
             if request.tools and _is_native_tool_capability_error(exc):
                 raise NativeToolCallingUnsupportedError(f"native_tool_calling_unsupported: {exc}") from exc
@@ -1169,6 +1318,7 @@ class AnthropicCompatibleModelClient:
             self.timeout,
             "Anthropic-compatible request",
             self._connection_error_message(),
+            retry_reporter=self.retry_reporter,
         )
         return self._parse_response(body_text)
 
@@ -1182,6 +1332,7 @@ class AnthropicCompatibleModelClient:
             self.timeout,
             "Anthropic-compatible request",
             self._connection_error_message(),
+            retry_reporter=self.retry_reporter,
         )
         return self._parse_response(body_text)
 
@@ -1195,6 +1346,7 @@ class AnthropicCompatibleModelClient:
             self.timeout,
             "Anthropic-compatible request",
             self._connection_error_message(),
+            retry_reporter=self.retry_reporter,
         )
         return self._parse_response(body_text)
 
@@ -1208,5 +1360,6 @@ class AnthropicCompatibleModelClient:
             self.timeout,
             "Anthropic-compatible request",
             self._connection_error_message(),
+            retry_reporter=self.retry_reporter,
         )
         return self._parse_response(body_text)

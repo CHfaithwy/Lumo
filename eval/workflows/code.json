@@ -1,0 +1,564 @@
+{
+  "schema_version": "2.0",
+  "suite": "workflows",
+  "category": "code",
+  "description": "Issue-style repository repair tasks with public baselines and private FAIL_TO_PASS/PASS_TO_PASS regression tests.",
+  "tasks": [
+    {
+      "id": "workflow.code.config-precedence.v1",
+      "title": "Fix environment configuration precedence",
+      "objective": "SWE-bench-style bug fix requiring a minimal patch and complete public/private test success.",
+      "difficulty": "easy",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench"],
+      "case_inspiration": {"repository": "pydantic/pydantic-settings", "url": "https://github.com/pydantic/pydantic-settings", "pattern": "多来源配置按明确优先级合并，环境变量覆盖文件值。"},
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["list_files", "glob", "read_file", "git_status", "git_diff"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {
+        "kind": "live_agent",
+        "repetitions": 3,
+        "max_steps": 16,
+        "timeout_seconds": 300,
+        "required_harness_features": ["workspace_materialization", "private_file_mount"]
+      },
+      "model_input": {
+        "allowed_tools": ["grep", "patch_file", "run_shell", "list_files", "glob", "read_file", "git_status", "git_diff"],
+        "turns": [
+          {
+            "id": "main",
+            "session_policy": "new",
+            "prompt": "问题：`load_config` 在环境变量之后应用文件配置，导致部署环境的覆盖值丢失。请把优先级修正为默认值 < 文件配置 < 环境变量，同时保持输入映射不被修改并保留现有行为；补充必要测试并运行完整测试。"
+          }
+        ]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/config_loader.py", "content": "def load_config(defaults, file_values, env_values):\n    config = dict(defaults)\n    config.update(env_values)\n    config.update(file_values)\n    return config\n"},
+          {"path": "tests/test_config_loader.py", "content": "from src.config_loader import load_config\n\ndef test_file_overrides_defaults():\n    assert load_config({'port': 80}, {'port': 8080}, {})['port'] == 8080\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_config_loader_hidden.py", "content": "from src.config_loader import load_config\n\ndef test_environment_overrides_file():\n    assert load_config({'port': 80}, {'port': 8080}, {'port': 9000})['port'] == 9000\n\ndef test_inputs_are_not_mutated():\n    defaults = {'a': 1}; file_values = {'b': 2}; env_values = {'c': 3}\n    load_config(defaults, file_values, env_values)\n    assert defaults == {'a': 1} and file_values == {'b': 2} and env_values == {'c': 3}\n"}
+        ],
+        "directories": ["src", "tests"],
+        "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests",
+        "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "no_unrelated_changes", "type": "file_content_equals", "required": true, "spec": {"path": "tests/test_config_loader.py", "allow_agent_additions": true, "must_preserve": "test_file_overrides_defaults"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change", "environment_error"]
+    },
+    {
+      "id": "workflow.code.retry-idempotency.v1",
+      "title": "Keep retry preparation idempotent",
+      "objective": "Verify a behavioral fix across retries without overfitting to the visible happy-path test.",
+      "difficulty": "medium",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench", "terminal_bench"],
+      "case_inspiration": {"repository": "stripe/stripe-python", "url": "https://github.com/stripe/stripe-python", "pattern": "重试必须复用一次性准备好的带幂等语义请求内容。"},
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["list_files", "read_file", "git_status", "git_diff"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {
+        "kind": "live_agent",
+        "repetitions": 3,
+        "max_steps": 18,
+        "timeout_seconds": 300,
+        "required_harness_features": ["workspace_materialization", "private_file_mount"]
+      },
+      "model_input": {
+        "allowed_tools": ["grep", "patch_file", "run_shell", "list_files", "read_file", "git_status", "git_diff"],
+        "turns": [
+          {
+            "id": "main",
+            "session_policy": "new",
+            "prompt": "问题：`deliver_with_retry` 每次重试都会调用 `prepare()`，而它会分配新的投递编号，整个发送过程只能执行一次准备，后续重试必须复用同一份内容。请在不改变公开接口的前提下修复，并运行全部测试。"
+          }
+        ]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/delivery.py", "content": "def deliver_with_retry(prepare, send, attempts=3):\n    last_error = None\n    for _ in range(attempts):\n        payload = prepare()\n        try:\n            return send(payload)\n        except RuntimeError as exc:\n            last_error = exc\n    raise last_error\n"},
+          {"path": "tests/test_delivery.py", "content": "from src.delivery import deliver_with_retry\n\ndef test_success_first_try():\n    assert deliver_with_retry(lambda: {'id': 1}, lambda payload: payload['id']) == 1\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_delivery_hidden.py", "content": "import pytest\nfrom src.delivery import deliver_with_retry\n\ndef test_prepare_once_and_same_payload_reused():\n    prepared = []\n    sent = []\n    def prepare():\n        payload = {'id': len(prepared) + 1}\n        prepared.append(payload)\n        return payload\n    def send(payload):\n        sent.append(payload)\n        if len(sent) < 3:\n            raise RuntimeError('temporary')\n        return payload['id']\n    assert deliver_with_retry(prepare, send, attempts=3) == 1\n    assert len(prepared) == 1\n    assert sent == [prepared[0], prepared[0], prepared[0]]\n\ndef test_last_error_is_raised():\n    with pytest.raises(RuntimeError, match='temporary'):\n        deliver_with_retry(lambda: {'id': 1}, lambda payload: (_ for _ in ()).throw(RuntimeError('temporary')), attempts=2)\n"}
+        ],
+        "directories": ["src", "tests"],
+        "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests",
+        "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "api_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/delivery.py", "all": ["def deliver_with_retry(prepare, send, attempts=3):"]}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change", "environment_error"]
+    },
+    {
+      "id": "workflow.code.path-filtering.v1",
+      "title": "Fix include and exclude glob filtering",
+      "objective": "Measure issue comprehension and edge-case test coverage for path matching semantics.",
+      "difficulty": "medium",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench"],
+      "case_inspiration": {"repository": "isaacs/minimatch", "url": "https://github.com/isaacs/minimatch", "pattern": "跨平台路径规范化后再应用包含与排除 glob。"},
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["list_files", "glob", "read_file", "git_status", "git_diff"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {
+        "kind": "live_agent",
+        "repetitions": 3,
+        "max_steps": 20,
+        "timeout_seconds": 360,
+        "required_harness_features": ["workspace_materialization", "private_file_mount"]
+      },
+      "model_input": {
+        "allowed_tools": ["grep", "patch_file", "run_shell", "list_files", "glob", "read_file", "git_status", "git_diff"],
+        "turns": [
+          {
+            "id": "main",
+            "session_policy": "new",
+            "prompt": "问题：`select_paths` 约定接收标准通配模式，但实现仍使用子串匹配，而且排除条件只检查文件名。请让包含和排除模式基于统一使用正斜杠的相对路径生效，保持输入顺序和现有接口。语义与 minimatch 一致：`*` 不跨路径分隔符，递归匹配必须使用 `**`。为兼容现有调用，不含通配符的模式继续按路径子串匹配。完成后运行测试。"
+          }
+        ]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/path_filter.py", "content": "from pathlib import Path\n\ndef select_paths(paths, include='*', exclude=None):\n    selected = [path for path in paths if include in path]\n    if exclude:\n        selected = [path for path in selected if exclude not in Path(path).name]\n    return selected\n"},
+          {"path": "tests/test_path_filter.py", "content": "from src.path_filter import select_paths\n\ndef test_preserves_order_for_simple_names():\n    assert select_paths(['a.py', 'b.py'], include='.py') == ['a.py', 'b.py']\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_path_filter_hidden.py", "content": "from src.path_filter import select_paths\n\ndef test_recursive_include_and_directory_exclude():\n    paths = ['src/a.py', 'vendor/lib.py', 'src/nested/b.py', 'README.md']\n    assert select_paths(paths, include='**/*.py', exclude='vendor/**') == ['src/a.py', 'src/nested/b.py']\n\ndef test_windows_separators_are_normalized():\n    paths = ['src\\\\a.py', 'vendor\\\\lib.py', 'src\\\\nested\\\\b.py']\n    assert select_paths(paths, include='**/*.py', exclude='vendor/**') == ['src\\\\a.py', 'src\\\\nested\\\\b.py']\n\ndef test_star_does_not_cross_a_path_separator():\n    assert select_paths(['a.py', 'nested/b.py'], include='*.py') == ['a.py']\n"}
+        ],
+        "directories": ["src", "tests"],
+        "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests",
+        "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "api_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/path_filter.py", "all": ["def select_paths(paths, include='*', exclude=None):"]}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change", "environment_error"]
+    },
+    {
+      "id": "workflow.code.pagination-boundary.v1",
+      "title": "Fix one-based pagination boundaries",
+      "objective": "Measure a small backend bug fix with boundary validation and regression preservation.",
+      "difficulty": "easy",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench"],
+      "case_inspiration": {"repository": "encode/django-rest-framework", "url": "https://github.com/encode/django-rest-framework", "pattern": "页码从 1 开始的边界和空页行为。"},
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "patch_file", "run_shell"], "supporting_tools": ["grep"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 14, "timeout_seconds": 240, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "分页接口文档规定 page 从 1 开始，但当前实现把第 1 页当成了第二段数据。请修复 src/pagination.py，并让 page 或 page_size 小于 1 时抛出 ValueError。保持返回类型和元素顺序不变，完成后运行现有测试。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/pagination.py", "content": "def paginate(items, page, page_size):\n    if page < 0 or page_size < 1:\n        raise ValueError('invalid pagination')\n    start = page * page_size\n    return items[start:start + page_size]\n"},
+          {"path": "tests/test_pagination.py", "content": "from src.pagination import paginate\n\ndef test_empty_input():\n    assert paginate([], 1, 10) == []\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_pagination_hidden.py", "content": "import pytest\nfrom src.pagination import paginate\n\ndef test_first_and_last_partial_pages():\n    items=list(range(7))\n    assert paginate(items, 1, 3)==[0,1,2]\n    assert paginate(items, 3, 3)==[6]\n\ndef test_page_after_end_is_empty():\n    assert paginate([1,2], 3, 2)==[]\n\n@pytest.mark.parametrize('page,size', [(0,2),(-1,2),(1,0),(1,-1)])\ndef test_invalid_boundaries(page,size):\n    with pytest.raises(ValueError):\n        paginate([1,2],page,size)\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "api_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/pagination.py", "text": "def paginate(items, page, page_size):"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change"]
+    },
+    {
+      "id": "workflow.code.cache-ttl-boundary.v1",
+      "title": "Expire cache entries at the TTL boundary",
+      "objective": "Measure clock-boundary reasoning in a deterministic cache implementation.",
+      "difficulty": "easy",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench"],
+      "case_inspiration": {"repository": "tkem/cachetools", "url": "https://github.com/tkem/cachetools", "pattern": "TTL 到期边界必须驱逐缓存项而非继续返回旧值。"},
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["read_file"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 12, "timeout_seconds": 240, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "TTL 缓存在恰好到达过期时间时仍会返回旧值，而且过期项没有被清掉。请修复 src/cache.py；未过期行为和可注入时钟的接口必须保持不变，并运行测试。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/cache.py", "content": "class TTLCache:\n    def __init__(self, now):\n        self._now = now\n        self._items = {}\n\n    def put(self, key, value, ttl):\n        self._items[key] = (value, self._now(), ttl)\n\n    def get(self, key):\n        item = self._items.get(key)\n        if item is None:\n            return None\n        value, created, ttl = item\n        if self._now() - created <= ttl:\n            return value\n        return None\n"},
+          {"path": "tests/test_cache.py", "content": "from src.cache import TTLCache\n\ndef test_returns_fresh_value():\n    now=[10]\n    cache=TTLCache(lambda:now[0])\n    cache.put('a',1,5)\n    now[0]=14\n    assert cache.get('a')==1\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_cache_hidden.py", "content": "from src.cache import TTLCache\n\ndef test_boundary_is_expired_and_removed():\n    now=[100]\n    cache=TTLCache(lambda:now[0])\n    cache.put('a','old',5)\n    now[0]=105\n    assert cache.get('a') is None\n    assert 'a' not in cache._items\n\ndef test_zero_ttl_never_reads_back():\n    cache=TTLCache(lambda:7)\n    cache.put('x',1,0)\n    assert cache.get('x') is None\n\ndef test_missing_key_stays_none():\n    assert TTLCache(lambda:0).get('missing') is None\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "class_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/cache.py", "all": ["class TTLCache:", "def put(self, key, value, ttl):", "def get(self, key):"]}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change"]
+    },
+    {
+      "id": "workflow.code.upload-size-validation.v1",
+      "title": "Validate streamed upload size by bytes",
+      "objective": "Measure a security-relevant validation fix for chunked request bodies.",
+      "difficulty": "easy",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench", "terminal_bench"],
+      "case_inspiration": {"repository": "pallets/werkzeug", "url": "https://github.com/pallets/werkzeug", "pattern": "流式上传必须按累计字节数而不是分块数实施上限。"},
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "patch_file", "run_shell"], "supporting_tools": ["grep"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 14, "timeout_seconds": 240, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "分块上传现在比较的是块数量，不是实际字节数，导致大文件绕过限制。请修复 src/uploads.py：总字节数超过 max_bytes 时抛出 ValueError，恰好等于上限应允许，成功时仍返回拼接后的 bytes。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/uploads.py", "content": "def accept_upload(chunks, max_bytes):\n    chunks = list(chunks)\n    if len(chunks) > max_bytes:\n        raise ValueError('upload too large')\n    return b''.join(chunks)\n"},
+          {"path": "tests/test_uploads.py", "content": "from src.uploads import accept_upload\n\ndef test_single_small_chunk():\n    assert accept_upload([b'ab'], 3)==b'ab'\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_uploads_hidden.py", "content": "import pytest\nfrom src.uploads import accept_upload\n\ndef test_multiple_chunks_count_bytes():\n    with pytest.raises(ValueError):\n        accept_upload([b'abc',b'def'],5)\n\ndef test_exact_boundary_allowed():\n    assert accept_upload(iter([b'ab',b'cde']),5)==b'abcde'\n\ndef test_empty_upload():\n    assert accept_upload([],0)==b''\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "api_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/uploads.py", "text": "def accept_upload(chunks, max_bytes):"}}
+        ]
+      },
+      "failure_labels": ["policy_violation", "incomplete_goal", "test_regression"]
+    },
+    {
+      "id": "workflow.code.cli-boolean-parsing.v1",
+      "title": "Parse explicit CLI boolean values correctly",
+      "objective": "Measure a common command-line configuration bug with compatibility cases.",
+      "difficulty": "easy",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench"],
+      "case_inspiration": {"repository": "pallets/click", "url": "https://github.com/pallets/click", "pattern": "命令行布尔配置需要兼容大小写、字面布尔值和非法输入。"},
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["read_file"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 12, "timeout_seconds": 240, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "命令行参数 --debug=false 现在会被解析成开启状态。请修复 src/options.py，使 true/1/yes/on 和 false/0/no/off 不区分大小写地解析，布尔值原样返回，其他输入抛出 ValueError。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/options.py", "content": "def parse_debug(value):\n    return bool(value)\n"},
+          {"path": "tests/test_options.py", "content": "from src.options import parse_debug\n\ndef test_true_string():\n    assert parse_debug('true') is True\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_options_hidden.py", "content": "import pytest\nfrom src.options import parse_debug\n\n@pytest.mark.parametrize('value', ['false','FALSE','0','no','Off'])\ndef test_false_values(value):\n    assert parse_debug(value) is False\n\n@pytest.mark.parametrize('value', ['TRUE','1','Yes','on',True])\ndef test_true_values(value):\n    assert parse_debug(value) is True\n\ndef test_false_bool_preserved():\n    assert parse_debug(False) is False\n\ndef test_unknown_rejected():\n    with pytest.raises(ValueError): parse_debug('sometimes')\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "api_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/options.py", "text": "def parse_debug(value):"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change"]
+    },
+    {
+      "id": "workflow.code.frontend-stale-state.v1",
+      "title": "Fix stale state in a batched frontend update",
+      "objective": "Measure a realistic frontend state bug using dependency-free JavaScript tests.",
+      "difficulty": "medium",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench", "terminal_bench"],
+      "case_inspiration": {"repository": "facebook/react", "url": "https://github.com/facebook/react", "pattern": "批量状态更新必须基于前一次计算结果。"},
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["read_file"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 16, "timeout_seconds": 300, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "前端计数器在同一批次连续点击多次时只增加 1，单次点击正常。请修复 src/counter.js 中的状态计算，使每次点击都基于上一次结果，同时保持零次点击和自定义初始值的行为。运行 npm test 验证。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "package.json", "content": "{\"type\":\"module\",\"scripts\":{\"test\":\"node --test\"}}\n"},
+          {"path": "src/counter.js", "content": "export function applyClicks(state, clicks) {\n  let next = state;\n  for (let i = 0; i < clicks; i += 1) {\n    next = state + 1;\n  }\n  return next;\n}\n"},
+          {"path": "tests/counter.test.mjs", "content": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { applyClicks } from '../src/counter.js';\ntest('one click', () => assert.equal(applyClicks(0, 1), 1));\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/counter.test.mjs", "content": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { applyClicks } from '../src/counter.js';\ntest('batched clicks', () => assert.equal(applyClicks(0, 4), 4));\ntest('custom start', () => assert.equal(applyClicks(7, 3), 10));\ntest('zero clicks', () => assert.equal(applyClicks(9, 0), 9));\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "npm test", "exit_code": 0}},
+          {"id": "export_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/counter.js", "text": "export function applyClicks(state, clicks)"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change", "environment_error"]
+    },
+    {
+      "id": "workflow.code.request-validation.v1",
+      "title": "Harden backend request validation",
+      "objective": "Measure a web-backend validation repair across whitespace and Python type edge cases.",
+      "difficulty": "medium",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench"],
+      "case_inspiration": {"repository": "pydantic/pydantic", "url": "https://github.com/pydantic/pydantic", "pattern": "输入规范化与 Python bool/int 类型边界验证。"},
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "patch_file", "run_shell"], "supporting_tools": ["grep"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 16, "timeout_seconds": 300, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "用户创建接口会接受全空格邮箱，也把布尔值当作年龄。请修复 src/api.py：邮箱去除首尾空白后必须包含 @ 且不能为空，年龄必须是非布尔整数并且不小于 18；返回值中的邮箱使用整理后的值。错误仍统一抛出 ValueError。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/api.py", "content": "def create_user(payload):\n    email = payload.get('email', '')\n    age = payload.get('age')\n    if '@' not in email:\n        raise ValueError('invalid email')\n    if not isinstance(age, int) or age < 18:\n        raise ValueError('invalid age')\n    return {'email': email, 'age': age}\n"},
+          {"path": "tests/test_api.py", "content": "from src.api import create_user\n\ndef test_valid_user():\n    assert create_user({'email':'a@example.com','age':20})=={'email':'a@example.com','age':20}\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_api_hidden.py", "content": "import pytest\nfrom src.api import create_user\n\ndef test_email_is_trimmed():\n    assert create_user({'email':'  a@example.com  ','age':18})['email']=='a@example.com'\n\n@pytest.mark.parametrize('email', ['', '   ', 'missing-at'])\ndef test_bad_email(email):\n    with pytest.raises(ValueError): create_user({'email':email,'age':20})\n\n@pytest.mark.parametrize('age', [True,False,17,18.0,'20',None])\ndef test_bad_age(age):\n    with pytest.raises(ValueError): create_user({'email':'a@example.com','age':age})\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "api_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/api.py", "text": "def create_user(payload):"}}
+        ]
+      },
+      "failure_labels": ["policy_violation", "incomplete_goal", "test_regression"]
+    },
+    {
+      "id": "workflow.code.async-handler-errors.v1",
+      "title": "Propagate synchronous and asynchronous handler errors",
+      "objective": "Measure an Express-style async wrapper repair without framework dependencies.",
+      "difficulty": "medium",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench"],
+      "case_inspiration": {"repository": "expressjs/express", "url": "https://github.com/expressjs/express", "pattern": "异步路由包装器必须统一传递同步抛错和 Promise 拒绝。"},
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["read_file"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 16, "timeout_seconds": 300, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "HTTP 处理器包装函数能转交被拒绝的 Promise，却漏掉了处理器同步抛出的异常，进程因此退出。请修复 src/handler.js，让两类错误都只调用一次 next，成功请求不调用 next，并保持 wrap 的导出接口。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "package.json", "content": "{\"type\":\"module\",\"scripts\":{\"test\":\"node --test\"}}\n"},
+          {"path": "src/handler.js", "content": "export const wrap = (handler) => (req, res, next) =>\n  Promise.resolve(handler(req, res)).catch(next);\n"},
+          {"path": "tests/handler.test.mjs", "content": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { wrap } from '../src/handler.js';\ntest('forwards rejected promise', async () => {\n  const error=new Error('async'); let seen;\n  await wrap(async()=>{throw error;})({}, {}, (value)=>{seen=value;});\n  assert.equal(seen,error);\n});\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/handler.test.mjs", "content": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { wrap } from '../src/handler.js';\ntest('forwards synchronous throw once', async () => {\n  const error=new Error('sync'); const seen=[];\n  await wrap(()=>{throw error;})({}, {}, (value)=>seen.push(value));\n  assert.deepEqual(seen,[error]);\n});\ntest('success does not call next', async () => {\n  let calls=0; await wrap(async()=>42)({}, {}, ()=>{calls+=1;});\n  assert.equal(calls,0);\n});\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "npm test", "exit_code": 0}},
+          {"id": "export_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/handler.js", "text": "export const wrap"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "environment_error"]
+    },
+    {
+      "id": "workflow.code.transaction-rollback.v1",
+      "title": "Make a balance transfer atomic",
+      "objective": "Measure transaction safety and rollback behavior in a real SQLite workflow.",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench", "agent_bench"],
+      "case_inspiration": {"repository": "sqlalchemy/sqlalchemy", "url": "https://github.com/sqlalchemy/sqlalchemy", "pattern": "跨多条 SQL 写入的失败路径必须保持原子性。"},
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["read_file", "todo_write"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 22, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "账户转账在收款方不存在时已经提交了扣款，造成余额丢失。请修复 src/transfers.py，使扣款和入账处于同一事务；账户不存在、金额非正数或余额不足时抛出 ValueError，并保证数据库完全不变。成功转账仍返回转账后的双方余额。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/transfers.py", "content": "def transfer(db, sender, recipient, amount):\n    db.execute('UPDATE accounts SET balance = balance - ? WHERE id = ?', (amount, sender))\n    db.commit()\n    row = db.execute('SELECT balance FROM accounts WHERE id = ?', (recipient,)).fetchone()\n    if row is None:\n        raise ValueError('recipient missing')\n    db.execute('UPDATE accounts SET balance = balance + ? WHERE id = ?', (amount, recipient))\n    db.commit()\n    return tuple(db.execute('SELECT balance FROM accounts WHERE id IN (?, ?) ORDER BY id', (sender, recipient)).fetchall())\n"},
+          {"path": "tests/test_transfers.py", "content": "import sqlite3\nfrom src.transfers import transfer\n\ndef test_successful_transfer():\n    db=sqlite3.connect(':memory:'); db.execute('CREATE TABLE accounts(id TEXT PRIMARY KEY,balance INTEGER)'); db.executemany('INSERT INTO accounts VALUES(?,?)',[('a',100),('b',20)])\n    assert transfer(db,'a','b',30)==((70,),(50,))\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_transfers_hidden.py", "content": "import sqlite3, pytest\nfrom src.transfers import transfer\n\ndef make_db():\n    db=sqlite3.connect(':memory:'); db.execute('CREATE TABLE accounts(id TEXT PRIMARY KEY,balance INTEGER)'); db.executemany('INSERT INTO accounts VALUES(?,?)',[('a',100),('b',20)]); db.commit(); return db\n\ndef balances(db): return db.execute('SELECT id,balance FROM accounts ORDER BY id').fetchall()\n\ndef test_missing_recipient_rolls_back():\n    db=make_db(); before=balances(db)\n    with pytest.raises(ValueError): transfer(db,'a','missing',10)\n    assert balances(db)==before\n\ndef test_insufficient_funds_rolls_back():\n    db=make_db(); before=balances(db)\n    with pytest.raises(ValueError): transfer(db,'a','b',101)\n    assert balances(db)==before\n\n@pytest.mark.parametrize('amount',[0,-1])\ndef test_non_positive_amount(amount):\n    db=make_db(); before=balances(db)\n    with pytest.raises(ValueError): transfer(db,'a','b',amount)\n    assert balances(db)==before\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "api_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/transfers.py", "text": "def transfer(db, sender, recipient, amount):"}}
+        ]
+      },
+      "failure_labels": ["policy_violation", "incomplete_goal", "test_regression", "collateral_change"]
+    },
+    {
+      "id": "workflow.code.async-retry-cancellation.v1",
+      "title": "Preserve cancellation through async retries",
+      "objective": "Measure correct exception taxonomy and retry limits in asynchronous code.",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench"],
+      "case_inspiration": {"repository": "python/cpython", "url": "https://github.com/python/cpython", "pattern": "asyncio 取消是控制流，不能作为普通可重试异常吞掉。"},
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "patch_file", "run_shell"], "supporting_tools": ["grep", "todo_write"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 20, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "异步重试函数会吞掉任务取消并继续调用外部操作，导致关停变慢。请修复 src/retry.py：普通异常仍最多尝试指定次数，取消必须立即向上传播且不得再次调用；attempts 小于 1 时抛出 ValueError。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/retry.py", "content": "async def retry(operation, attempts=3):\n    last_error = None\n    for _ in range(attempts):\n        try:\n            return await operation()\n        except BaseException as exc:\n            last_error = exc\n    raise last_error\n"},
+          {"path": "tests/test_retry.py", "content": "import asyncio\nfrom src.retry import retry\n\ndef test_transient_error_then_success():\n    calls=[]\n    async def operation():\n        calls.append(1)\n        if len(calls)==1: raise RuntimeError('temporary')\n        return 'ok'\n    assert asyncio.run(retry(operation,3))=='ok'\n    assert len(calls)==2\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_retry_hidden.py", "content": "import asyncio, pytest\nfrom src.retry import retry\n\ndef test_cancellation_is_not_retried():\n    calls=[]\n    async def operation():\n        calls.append(1); raise asyncio.CancelledError()\n    with pytest.raises(asyncio.CancelledError): asyncio.run(retry(operation,5))\n    assert len(calls)==1\n\ndef test_exhaustion_raises_last_error():\n    calls=[]\n    async def operation(): calls.append(1); raise RuntimeError(str(len(calls)))\n    with pytest.raises(RuntimeError,match='3'): asyncio.run(retry(operation,3))\n    assert len(calls)==3\n\ndef test_invalid_attempts():\n    async def operation(): return 1\n    with pytest.raises(ValueError): asyncio.run(retry(operation,0))\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "api_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/retry.py", "text": "async def retry(operation, attempts=3):"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change"]
+    },
+    {
+      "id": "workflow.code.websocket-reconnect.v1",
+      "title": "Prevent duplicate WebSocket listeners after reconnect",
+      "objective": "Measure lifecycle cleanup in a frontend real-time connection manager.",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench", "terminal_bench"],
+      "case_inspiration": {"repository": "socketio/socket.io-client", "url": "https://github.com/socketio/socket.io-client", "pattern": "重连与切换连接时监听器必须幂等注册并清理旧连接。"},
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["read_file", "todo_write"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 20, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "实时消息客户端每次重连都会再注册一个监听器，导致消息重复显示，旧连接也还能影响页面。请修复 src/socket-client.js：同一连接重复接入不能重复监听，切换连接后旧连接必须解除监听；onMessage 接口保持不变。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "package.json", "content": "{\"type\":\"module\",\"scripts\":{\"test\":\"node --test\"}}\n"},
+          {"path": "src/socket-client.js", "content": "export class SocketClient {\n  constructor(onMessage) {\n    this.onMessage = onMessage;\n    this.socket = null;\n    this.handleMessage = (value) => this.onMessage(value);\n  }\n  connect(socket) {\n    this.socket = socket;\n    socket.on('message', this.handleMessage);\n  }\n}\n"},
+          {"path": "tests/socket-client.test.mjs", "content": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { EventEmitter } from 'node:events';\nimport { SocketClient } from '../src/socket-client.js';\ntest('receives one message',()=>{const s=new EventEmitter();const values=[];new SocketClient(v=>values.push(v)).connect(s);s.emit('message','a');assert.deepEqual(values,['a']);});\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/socket-client.test.mjs", "content": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { EventEmitter } from 'node:events';\nimport { SocketClient } from '../src/socket-client.js';\ntest('same socket is not duplicated',()=>{const s=new EventEmitter();const values=[];const c=new SocketClient(v=>values.push(v));c.connect(s);c.connect(s);s.emit('message','a');assert.deepEqual(values,['a']);});\ntest('old socket is detached',()=>{const a=new EventEmitter(),b=new EventEmitter(),values=[];const c=new SocketClient(v=>values.push(v));c.connect(a);c.connect(b);a.emit('message','old');b.emit('message','new');assert.deepEqual(values,['new']);});\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "npm test", "exit_code": 0}},
+          {"id": "class_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/socket-client.js", "text": "export class SocketClient"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change", "environment_error"]
+    },
+    {
+      "id": "workflow.code.concurrent-memoization.v1",
+      "title": "Deduplicate concurrent memoized computation",
+      "objective": "Measure thread-safety while preserving caching and exception semantics.",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench"],
+      "case_inspiration": {"repository": "tkem/cachetools", "url": "https://github.com/tkem/cachetools", "pattern": "并发首次访问同一键应进行 single-flight 合并且异常不得缓存。"},
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "patch_file", "run_shell"], "supporting_tools": ["grep", "todo_write"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 22, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "memoize 在多个线程同时请求同一个未缓存键时会重复执行昂贵计算。请修复 src/memo.py，保证同一键的并发首次请求只计算一次；不同键不能被无关键的慢计算串行阻塞，后续命中和异常不缓存的行为也必须保持正确。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "src/memo.py", "content": "def memoize(function):\n    cache = {}\n    def wrapped(key):\n        if key not in cache:\n            cache[key] = function(key)\n        return cache[key]\n    return wrapped\n"},
+          {"path": "tests/test_memo.py", "content": "from src.memo import memoize\n\ndef test_sequential_cache_hit():\n    calls=[]\n    fn=memoize(lambda key:(calls.append(key),key*2)[1])\n    assert fn(2)==4 and fn(2)==4 and calls==[2]\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/test_memo_hidden.py", "content": "import threading, time, pytest\nfrom src.memo import memoize\n\ndef test_same_key_computed_once_concurrently():\n    calls=[]\n    def compute(key): calls.append(key); time.sleep(0.05); return key*2\n    fn=memoize(compute); results=[]\n    threads=[threading.Thread(target=lambda:results.append(fn(3))) for _ in range(4)]\n    [t.start() for t in threads]; [t.join() for t in threads]\n    assert results==[6,6,6,6] and calls==[3]\n\ndef test_different_keys_are_not_blocked_by_slow_owner():\n    started=threading.Event(); release=threading.Event(); second_done=threading.Event()\n    def compute(key):\n        if key == 'slow':\n            started.set(); release.wait(timeout=1)\n        return key\n    fn=memoize(compute)\n    first=threading.Thread(target=lambda:fn('slow')); first.start(); assert started.wait(timeout=1)\n    second=threading.Thread(target=lambda:(fn('fast'), second_done.set())); second.start()\n    assert second_done.wait(timeout=0.2)\n    release.set(); first.join(timeout=1); second.join(timeout=1)\n\ndef test_exception_is_not_cached():\n    calls=[]\n    def compute(key):\n        calls.append(key)\n        if len(calls)==1: raise RuntimeError('first')\n        return 9\n    fn=memoize(compute)\n    with pytest.raises(RuntimeError): fn('x')\n    assert fn('x')==9 and calls==['x','x']\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "python -m pytest -q tests private_tests", "exit_code": 0}},
+          {"id": "api_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/memo.py", "text": "def memoize(function):"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change"]
+    },
+    {
+      "id": "workflow.code.frontend-keyed-state.v1",
+      "title": "Preserve component state by stable list key",
+      "objective": "Measure a realistic frontend reconciliation bug across reorder and insertion cases.",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench"],
+      "case_inspiration": {"repository": "facebook/react", "url": "https://github.com/facebook/react", "pattern": "列表重排时以稳定 key 而非数组位置关联已有状态。"},
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["read_file", "todo_write"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 20, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization", "private_file_mount"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "patch_file", "run_shell", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "可编辑列表排序后，输入框状态会跟着数组位置跑到另一条记录上。请修复 src/reconcile.js，让已有状态按 item.id 保留，新 id 使用 createState(item) 初始化，删除项不再出现在结果中；不得改变输出顺序。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "package.json", "content": "{\"type\":\"module\",\"scripts\":{\"test\":\"node --test\"}}\n"},
+          {"path": "src/reconcile.js", "content": "export function reconcile(previous, items, createState) {\n  return items.map((item, index) => ({\n    ...item,\n    state: previous[index]?.state ?? createState(item),\n  }));\n}\n"},
+          {"path": "tests/reconcile.test.mjs", "content": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { reconcile } from '../src/reconcile.js';\ntest('same order keeps state',()=>{const prev=[{id:'a',state:'A'}];assert.deepEqual(reconcile(prev,[{id:'a'}],()=>'?'),[{id:'a',state:'A'}]);});\n"}
+        ],
+        "private_files": [
+          {"path": "private_tests/reconcile.test.mjs", "content": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { reconcile } from '../src/reconcile.js';\ntest('reorder follows id',()=>{const prev=[{id:'a',state:'A'},{id:'b',state:'B'}];assert.deepEqual(reconcile(prev,[{id:'b'},{id:'a'}],x=>'new-'+x.id),[{id:'b',state:'B'},{id:'a',state:'A'}]);});\ntest('insert initializes only new item',()=>{const calls=[];const prev=[{id:'a',state:'A'}];const out=reconcile(prev,[{id:'x'},{id:'a'}],x=>{calls.push(x.id);return 'new-'+x.id;});assert.deepEqual(out,[{id:'x',state:'new-x'},{id:'a',state:'A'}]);assert.deepEqual(calls,['x']);});\ntest('deleted item disappears',()=>{const prev=[{id:'a',state:'A'},{id:'b',state:'B'}];assert.deepEqual(reconcile(prev,[{id:'b'}],()=>'?'),[{id:'b',state:'B'}]);});\n"}
+        ],
+        "directories": ["src", "tests"], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "unit_tests", "pass_policy": "all_required",
+        "checks": [
+          {"id": "mount_hidden", "type": "command_exit_code", "required": true, "spec": {"action": "mount_private_files", "exit_code": 0}},
+          {"id": "all_tests", "type": "command_exit_code", "required": true, "spec": {"command": "npm test", "exit_code": 0}},
+          {"id": "export_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "src/reconcile.js", "text": "export function reconcile(previous, items, createState)"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change", "environment_error"]
+    }
+  ]
+}

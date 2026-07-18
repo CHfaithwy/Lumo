@@ -1,4 +1,4 @@
-"""Bounded model-facing tool output with durable run artifacts."""
+
 
 from __future__ import annotations
 

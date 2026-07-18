@@ -6,7 +6,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .archive_context import archive_tool_spec, render_archive_control
 from .features import memory as memorylib
+from .model_protocol import ContextWindowExceededError
 from .tool_executor import strip_tool_hints
 from .workspace import AGENT_STATE_DIR, now
 
@@ -19,7 +21,6 @@ CURRENT_REQUEST_OVERFLOW_FILE = "prompt.txt"
 CONTEXT_COMPRESSION_TEMPLATE = "lumo/prompt/context_compress.md"
 CONTEXT_SUMMARY_KIND = "context_summary"
 CONTEXT_SUMMARY_MAX_TOKENS = 10000
-CONTEXT_COMPRESSION_RETRY_DROP_CHARS = 10000
 SECTION_ORDER = (
     "prefix",
     "durable_memory",
@@ -145,6 +146,7 @@ class ContextManager:
 
     async def build_async(self, user_message):
         user_message = str(user_message)
+        self._resolve_stale_pending_archives()
         durable_memory_enabled = True
         context_reduction_enabled = True
         if hasattr(self.agent, "feature_enabled"):
@@ -180,13 +182,17 @@ class ContextManager:
 
     def model_request(self):
         request = dict(getattr(self, "_last_model_request", {}) or {})
-        return {
+        result = {
             "instructions": str(request.get("instructions", request.get("system", ""))),
             "messages": [dict(item) for item in list(request.get("messages", []) or [])],
             "tools": [dict(item) for item in list(request.get("tools", []) or [])],
             "tool_choice": request.get("tool_choice", "auto"),
             "parallel_tool_calls": bool(request.get("parallel_tool_calls", True)),
         }
+        archive_targets = [dict(item) for item in list(request.get("archive_targets", []) or [])]
+        if archive_targets:
+            result["archive_targets"] = archive_targets
+        return result
 
     def _durable_memory_reference(self, enabled):
         content = str(self.agent.memory_text()) if enabled else "Durable memory:\n- disabled"
@@ -281,9 +287,9 @@ class ContextManager:
 
     def _render_sections(self, section_texts):
         history = self._prompt_history()
-        history, latest_tool = self._split_latest_tool_result(history)
+        history, protected_history = self._split_protected_tool_history(history)
         history_raw = self._raw_history_text(history)
-        latest_tool_raw = self._latest_tool_result_text(latest_tool)
+        protected_raw = self._raw_history_text(protected_history) if protected_history else ""
         background_task_text = str(getattr(self.agent, "recent_background_tasks_text", lambda: "")() or "").strip()
         if background_task_text:
             history_raw = "\n".join([background_task_text, "", history_raw]).strip()
@@ -304,50 +310,65 @@ class ContextManager:
                 details={},
             ),
             LATEST_TOOL_RESULT_SECTION: SectionRender(
-                raw=latest_tool_raw,
+                raw=protected_raw,
                 budget=None,
-                rendered=latest_tool_raw,
-                details={"present": bool(latest_tool)},
+                rendered=protected_raw,
+                details={"present": bool(protected_history), "count": len(protected_history)},
             ),
         }
 
-    @staticmethod
-    def _split_latest_tool_result(history):
-        history = list(history or [])
-        latest_user_index = -1
-        for index, item in enumerate(history):
-            if isinstance(item, dict) and item.get("role") == "user":
-                latest_user_index = index
-        for index in range(len(history) - 1, latest_user_index, -1):
-            item = history[index]
-            if isinstance(item, dict) and item.get("role") == "tool":
-                return history[:index] + history[index + 1 :], item
-        return history, None
+    def _pending_archive_call_ids(self, history):
+        task_state = getattr(self.agent, "current_task_state", None)
+        task_id = str(getattr(task_state, "task_id", ""))
+        stale_indexes = self._stale_read_indexes(history)
+        return {
+            str(item.get("call_id", ""))
+            for index, item in enumerate(history)
+            if index not in stale_indexes
+            and item.get("role") == "tool"
+            and str((item.get("archive") or {}).get("status", "")) == "pending"
+            and str((item.get("archive") or {}).get("task_id", "")) == task_id
+            and str(item.get("call_id", ""))
+        }
 
-    def _latest_tool_result_text(self, item):
-        if not isinstance(item, dict):
-            return ""
-        name = str(item.get("name", "")).strip()
-        args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
-        content = ""
-        if name in {"git_status", "git_diff"}:
-            content = self._history_item_display_content(item)
-        elif name in {"read_file", "grep", "use_skill", "todo_write", "task_output", "task_list", "run_shell_bg", "task_stop"}:
-            content = str(item.get("summary", "")).strip()
-            if not content:
-                metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
-                content = str(metadata.get("archive_summary", "")).strip()
-        content = content or str(item.get("content", ""))
-        reminder = self._history_item_tool_reminder(item)
-        lines = [
-            "Latest tool result (authoritative execution evidence):",
-            "Use this result to decide the next action. Do not repeat the same plan or tool call unless the result explicitly requires it.",
-            f"[tool:{name}] {json.dumps(args, sort_keys=True, ensure_ascii=False)}",
-            content,
-        ]
-        if reminder:
-            lines.append(f"Reminder: {reminder}")
-        return "\n".join(line for line in lines if str(line).strip())
+    def _resolve_stale_pending_archives(self):
+        history = list(getattr(self.agent, "session", {}).get("history", []) or [])
+        stale_indexes = self._stale_read_indexes(history)
+        changed = False
+        for index in stale_indexes:
+            item = history[index]
+            archive = item.get("archive") if isinstance(item.get("archive"), dict) else None
+            if not archive or archive.get("status") != "pending":
+                continue
+            archive["status"] = "not_required"
+            archive["reason"] = "stale"
+            archive["resolved_at"] = now()
+            changed = True
+        if changed:
+            self.agent.session_path = self.agent.session_store.save(self.agent.session)
+
+    def _protected_history_start(self, history):
+        pending_call_ids = self._pending_archive_call_ids(history)
+        if not pending_call_ids:
+            return None
+        for index, item in enumerate(history):
+            if item.get("role") != "assistant":
+                continue
+            call_ids = {
+                str(call.get("call_id", ""))
+                for call in list(item.get("tool_calls", []) or [])
+                if isinstance(call, dict)
+            }
+            if call_ids & pending_call_ids:
+                return index
+        return None
+
+    def _split_protected_tool_history(self, history):
+        history = list(history or [])
+        start = self._protected_history_start(history)
+        if start is None:
+            return history, []
+        return history[:start], history[start:]
 
     def _model_history(self):
         history = list(getattr(self.agent, "session", {}).get("history", []) or [])
@@ -355,6 +376,72 @@ class ContextManager:
         if summary_index is not None:
             history = history[summary_index:]
         return list(getattr(self.agent, "_iter_history_items_for_prompt", lambda items: items)(history))
+
+    def _tool_result_for_model(self, item, stale=False):
+        result = item.get("result") if isinstance(item.get("result"), dict) else {
+            "status": str((item.get("metadata") or {}).get("tool_status", "ok")),
+            "content": str(item.get("content", "")),
+            "metadata": dict(item.get("metadata", {}) or {}),
+        }
+        result = dict(result)
+        if stale:
+            result["content"] = STALE_READ_MESSAGE
+            result["archive"] = {"status": "not_required", "reason": "stale"}
+            metadata = dict(result.get("metadata", {}) or {})
+            metadata.pop("archive_summary", None)
+            result["metadata"] = metadata
+            return result
+        archive = item.get("archive") if isinstance(item.get("archive"), dict) else None
+        if archive is None:
+            if item.get("name") in {"git_status", "git_diff"}:
+                result["content"] = self._history_item_display_content(item)
+            else:
+                summary = self._history_item_summary(item)
+                if summary:
+                    result["content"] = summary
+            return result
+        metadata = dict(result.get("metadata", {}) or {})
+        metadata.pop("archive_summary", None)
+        result["metadata"] = metadata
+        if archive.get("status") != "archived":
+            return result
+        payload = archive.get("payload") if isinstance(archive.get("payload"), dict) else {}
+        result["content"] = str(payload.get("summary", ""))
+        result["archive"] = {
+            "source_call_id": str(item.get("call_id", "")),
+            "tool": str(item.get("name", "")),
+            "arguments": dict(item.get("args", {}) or {}),
+            "summary": str(payload.get("summary", "")),
+            "key_facts": list(payload.get("key_facts", []) or []),
+            "unresolved": list(payload.get("unresolved", []) or []),
+            "revisit_hints": list(payload.get("revisit_hints", []) or []),
+        }
+        metadata["archive_status"] = "archived"
+        result["metadata"] = metadata
+        return result
+
+    def _pending_archive_targets(self, history):
+        task_state = getattr(self.agent, "current_task_state", None)
+        task_id = str(getattr(task_state, "task_id", ""))
+        stale_indexes = self._stale_read_indexes(history)
+        targets = []
+        for index, item in enumerate(history):
+            archive = item.get("archive") if isinstance(item.get("archive"), dict) else {}
+            if (
+                index in stale_indexes
+                or item.get("role") != "tool"
+                or archive.get("status") != "pending"
+                or str(archive.get("task_id", "")) != task_id
+            ):
+                continue
+            targets.append(
+                {
+                    "source_call_id": str(item.get("call_id", "")),
+                    "tool": str(item.get("name", "")),
+                    "visible_chars": int(archive.get("visible_chars", 0) or 0),
+                }
+            )
+        return [target for target in targets if target["source_call_id"]]
 
     def _build_model_request(self, rendered, user_message):
         system_sections = [
@@ -370,12 +457,8 @@ class ContextManager:
             if item.get("role") == "user" and str(item.get("content", "")) == current_text:
                 current_user_index = index
                 break
-        latest_tool_index = None
-        search_start = current_user_index if current_user_index is not None else -1
-        for index in range(len(history) - 1, search_start, -1):
-            if history[index].get("role") == "tool":
-                latest_tool_index = index
-                break
+        stale_indexes = self._stale_read_indexes(history)
+        archive_targets = self._pending_archive_targets(history)
 
         messages = []
         for reference in (rendered["durable_memory"].rendered, rendered["skills"].rendered):
@@ -400,16 +483,7 @@ class ContextManager:
                         }
                     )
                 return
-            result = item.get("result") if isinstance(item.get("result"), dict) else {
-                "status": str((item.get("metadata") or {}).get("tool_status", "ok")),
-                "content": str(item.get("content", "")),
-                "metadata": dict(item.get("metadata", {}) or {}),
-            }
-            if index != latest_tool_index:
-                summary = self._history_item_summary(item)
-                if summary:
-                    result = dict(result)
-                    result["content"] = summary
+            result = self._tool_result_for_model(item, stale=index in stale_indexes)
             messages.append(
                 {
                     "role": "tool",
@@ -486,6 +560,13 @@ class ContextManager:
                     "content": self._normalize_prompt_block(rendered[CURRENT_REQUEST_SECTION].rendered),
                 }
             )
+        if archive_targets:
+            messages.append(
+                {
+                    "role": "archive_control",
+                    "content": render_archive_control(archive_targets),
+                }
+            )
         tool_definitions = []
         for name, tool in sorted(self.agent.tools.items()):
             parameters = tool.get("parameters", {}) if isinstance(tool.get("parameters", {}), dict) else {}
@@ -493,13 +574,18 @@ class ContextManager:
                 tool_definitions.append(
                     {"name": name, "description": str(tool.get("description", "")), "parameters": parameters}
                 )
-        return {
+        if archive_targets:
+            tool_definitions.append(archive_tool_spec([item["source_call_id"] for item in archive_targets]))
+        result = {
             "instructions": instructions,
             "messages": messages,
             "tools": tool_definitions,
             "tool_choice": "auto",
             "parallel_tool_calls": True,
         }
+        if archive_targets:
+            result["archive_targets"] = archive_targets
+        return result
 
     def _history_details(self, history):
         stale_read_indexes = self._stale_read_indexes(history)
@@ -521,22 +607,23 @@ class ContextManager:
                 "before_history_units": rendered["history"].rendered_units,
                 "template_path": CONTEXT_COMPRESSION_TEMPLATE,
                 "max_summary_tokens": CONTEXT_SUMMARY_MAX_TOKENS,
-                "retry_drop_chars": CONTEXT_COMPRESSION_RETRY_DROP_CHARS,
             }
         )
         rounds = []
         total_retry_count = 0
         total_discarded_chars = 0
+        total_discarded_turns = 0
         failures = []
         while _context_units(prompt) > self.total_budget:
-            history_text = rendered["history"].rendered
-            if not history_text.strip() or history_text.strip() == "Transcript:\n- empty":
+            compression_history = self._compression_history()
+            if not compression_history:
                 raise RuntimeError("Prompt exceeds context budget, but there is no history to compress.")
             before_prompt_units = _context_units(prompt)
             before_history_units = rendered["history"].rendered_units
-            summary, attempt_metadata = await self._compress_history_with_retries(history_text)
+            summary, attempt_metadata = await self._compress_history_with_retries(compression_history)
             total_retry_count += int(attempt_metadata.get("retry_count", 0))
             total_discarded_chars += int(attempt_metadata.get("discarded_chars", 0))
+            total_discarded_turns += int(attempt_metadata.get("discarded_turns", 0))
             failures.extend(list(attempt_metadata.get("failures", [])))
             round_metadata = dict(metadata)
             round_metadata.update(attempt_metadata)
@@ -546,18 +633,20 @@ class ContextManager:
                     "before_history_units": before_history_units,
                 }
             )
-            summary_record = self._append_context_summary(summary, round_metadata)
+            summary_record, summary_history_index = self._append_context_summary(summary, round_metadata)
             rendered = self._render_sections(section_texts)
             prompt = self._assemble_prompt(rendered)
             rounds.append(
                 {
                     "round": len(rounds) + 1,
-                    "summary_history_index": len(getattr(self.agent, "session", {}).get("history", [])) - 1,
+                    "summary_history_index": summary_history_index,
                     "summary_created_at": summary_record.get("created_at", ""),
                     "summary_chars": len(summary),
                     "summary_units": _context_units(summary),
                     "retry_count": int(attempt_metadata.get("retry_count", 0)),
                     "discarded_chars": int(attempt_metadata.get("discarded_chars", 0)),
+                    "discarded_turns": int(attempt_metadata.get("discarded_turns", 0)),
+                    "reduction_reason": str(attempt_metadata.get("reduction_reason", "")),
                     "compression_input_chars": int(attempt_metadata.get("compression_input_chars", 0)),
                     "compression_input_units": int(attempt_metadata.get("compression_input_units", 0)),
                     "before_prompt_units": before_prompt_units,
@@ -575,6 +664,8 @@ class ContextManager:
                 "rounds": rounds,
                 "retry_count": total_retry_count,
                 "discarded_chars": total_discarded_chars,
+                "discarded_turns": total_discarded_turns,
+                "reduction_reason": "context_window_exceeded" if total_discarded_turns else "",
                 "failures": failures,
                 "summary_history_index": rounds[-1]["summary_history_index"] if rounds else None,
                 "summary_created_at": rounds[-1]["summary_created_at"] if rounds else "",
@@ -587,13 +678,37 @@ class ContextManager:
         )
         return rendered, prompt, metadata
 
-    async def _compress_history_with_retries(self, history_text):
+    def _compression_history(self):
+        history = self._prompt_history()
+        history, _protected_history = self._split_protected_tool_history(history)
+        return history
+
+    def _compression_history_text(self, history):
+        history_text = self._raw_history_text(history)
+        background_task_text = str(getattr(self.agent, "recent_background_tasks_text", lambda: "")() or "").strip()
+        return "\n".join([background_task_text, "", history_text]).strip() if background_task_text else history_text
+
+    def _drop_oldest_compression_turn(self, history):
+        history = list(history or [])
+        start = 1 if history and self._is_context_summary(history[0]) else 0
+        turn_start = next((index for index in range(start, len(history)) if history[index].get("role") == "user"), None)
+        if turn_start is None:
+            return None, []
+        turn_end = next(
+            (index for index in range(turn_start + 1, len(history)) if history[index].get("role") == "user"),
+            len(history),
+        )
+        return history[:turn_start] + history[turn_end:], history[turn_start:turn_end]
+
+    async def _compress_history_with_retries(self, history):
         template = self._load_compression_template()
-        remaining = str(history_text)
+        remaining_history = list(history or [])
         discarded_chars = 0
+        discarded_turns = 0
         retry_count = 0
         failures = []
-        while remaining:
+        while remaining_history:
+            remaining = self._compression_history_text(remaining_history)
             compression_prompt = self._render_compression_prompt(template, remaining)
             try:
                 summary = await self._complete_compression_prompt(compression_prompt)
@@ -604,22 +719,28 @@ class ContextManager:
                     "status": "ok",
                     "retry_count": retry_count,
                     "discarded_chars": discarded_chars,
+                    "discarded_turns": discarded_turns,
+                    "reduction_reason": "context_window_exceeded" if discarded_turns else "",
                     "compression_input_chars": len(remaining),
                     "compression_input_units": _context_units(remaining),
                     "compression_prompt_chars": len(compression_prompt),
                     "compression_prompt_units": _context_units(compression_prompt),
                     "failures": failures,
                 }
-            except Exception as exc:
+            except ContextWindowExceededError as exc:
                 failures.append(str(exc))
-                drop_chars = min(CONTEXT_COMPRESSION_RETRY_DROP_CHARS, len(remaining))
-                remaining = remaining[drop_chars:]
-                discarded_chars += drop_chars
+                reduced_history, _ = self._drop_oldest_compression_turn(remaining_history)
+                if reduced_history is None:
+                    raise RuntimeError(
+                        "Context compression failed: provider reported context window exceeded, "
+                        "but no complete older conversation turn can be removed."
+                    ) from exc
+                reduced_text = self._compression_history_text(reduced_history)
+                discarded_chars += max(0, len(remaining) - len(reduced_text))
+                remaining_history = reduced_history
+                discarded_turns += 1
                 retry_count += 1
-        raise RuntimeError(
-            "Context compression failed after discarding all retry input: "
-            + (failures[-1] if failures else "unknown compression error")
-        )
+        raise RuntimeError("Context compression failed: no history remained to summarize.")
 
     def _load_compression_template(self):
         path = Path(getattr(self.agent, "root", ".")) / CONTEXT_COMPRESSION_TEMPLATE
@@ -662,13 +783,22 @@ class ContextManager:
                 "max_summary_tokens": CONTEXT_SUMMARY_MAX_TOKENS,
                 "retry_count": int(compression_metadata.get("retry_count", 0)),
                 "discarded_chars": int(compression_metadata.get("discarded_chars", 0)),
+                "discarded_turns": int(compression_metadata.get("discarded_turns", 0)),
+                "reduction_reason": str(compression_metadata.get("reduction_reason", "")),
                 "before_prompt_units": int(compression_metadata.get("before_prompt_units", 0)),
                 "before_history_units": int(compression_metadata.get("before_history_units", 0)),
             },
         }
-        history.append(record)
+        protected_start = self._protected_history_start(history)
+        insert_at = len(history) if protected_start is None else int(protected_start)
+        if protected_start is not None:
+            for index in range(int(protected_start) - 1, -1, -1):
+                if history[index].get("role") == "user":
+                    insert_at = index
+                    break
+        history.insert(insert_at, record)
         self.agent.session_path = self.agent.session_store.save(self.agent.session)
-        return record
+        return record, insert_at
 
     def _empty_compression_metadata(self):
         return {
@@ -676,9 +806,10 @@ class ContextManager:
             "status": "skipped",
             "template_path": CONTEXT_COMPRESSION_TEMPLATE,
             "max_summary_tokens": CONTEXT_SUMMARY_MAX_TOKENS,
-            "retry_drop_chars": CONTEXT_COMPRESSION_RETRY_DROP_CHARS,
             "retry_count": 0,
             "discarded_chars": 0,
+            "discarded_turns": 0,
+            "reduction_reason": "",
             "failures": [],
         }
 
@@ -818,35 +949,16 @@ class ContextManager:
                     lines.extend(self._render_stale_read_history_item(item))
                     continue
                 lines.append(f"[tool:{item.get('name', '')}] {json.dumps(item.get('args', {}), sort_keys=True, ensure_ascii=False)}")
-                if item.get("name") == "read_file":
-                    summary = str(item.get("summary", "")).strip()
-                    if not summary:
-                        metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
-                        summary = str(metadata.get("archive_summary", "")).strip()
-                    lines.append(summary or str(item.get("content", "")))
-                    if latest_tool_reminders.get(self._tool_reminder_key(item)) == index:
-                        reminder = self._history_item_tool_reminder(item)
-                        if reminder:
-                            lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
+                result = self._tool_result_for_model(item)
+                archived = result.get("archive") if isinstance(result.get("archive"), dict) else None
+                if archived:
+                    lines.append(json.dumps(archived, ensure_ascii=False, sort_keys=True))
                 else:
-                    if item.get("name") in {"git_status", "git_diff"}:
-                        lines.append(self._history_item_display_content(item))
-                        if latest_tool_reminders.get(self._tool_reminder_key(item)) == index:
-                            reminder = self._history_item_tool_reminder(item)
-                            if reminder:
-                                lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
-                    elif item.get("name") in {"grep", "use_skill", "todo_write", "task_output", "task_list", "run_shell_bg", "task_stop"}:
-                        summary = str(item.get("summary", "")).strip()
-                        if not summary:
-                            metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
-                            summary = str(metadata.get("archive_summary", "")).strip()
-                        lines.append(summary or str(item.get("content", "")))
-                        if latest_tool_reminders.get(self._tool_reminder_key(item)) == index:
-                            reminder = self._history_item_tool_reminder(item)
-                            if reminder:
-                                lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
-                    else:
-                        lines.append(str(item.get("content", "")))
+                    lines.append(str(result.get("content", "")))
+                if latest_tool_reminders.get(self._tool_reminder_key(item)) == index:
+                    reminder = self._history_item_tool_reminder(item)
+                    if reminder:
+                        lines.append(f"<tool_reminder>{reminder}</tool_reminder>")
             else:
                 lines.append(f"[{item.get('role', 'unknown')}] {item.get('content', '')}")
         return "\n".join(["Transcript:", *lines])

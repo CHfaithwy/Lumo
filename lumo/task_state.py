@@ -1,8 +1,4 @@
-"""一次 ask() 运行过程中的状态机快照。
 
-它回答的是：这次用户请求当前进行到哪了、调了多少次工具、最后为什么停下。
-这个对象会被不断写入 task_state.json，供运行中观察和运行后复盘。
-"""
 
 from dataclasses import dataclass
 from datetime import datetime

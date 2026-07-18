@@ -1,4 +1,4 @@
-"""Stable prompt prefix construction."""
+
 
 import hashlib
 import json
@@ -47,7 +47,7 @@ def _is_cjk_char(char):
 
 
 def _truncate_lumo_instructions(content):
-    """Limit lumo.md by English words/CJK chars, with a hard char cap."""
+
     char_limit = min(len(content), MAX_LUMO_INSTRUCTIONS_CHARS)
     index = 0
     units = 0

@@ -1,4 +1,4 @@
-"""Read-only Git helpers for workspace inspection tools."""
+
 
 from pathlib import Path
 import subprocess

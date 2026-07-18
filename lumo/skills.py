@@ -1,4 +1,4 @@
-"""Workspace-local hierarchical skill discovery and rendering."""
+
 
 from __future__ import annotations
 
@@ -224,8 +224,8 @@ def _truncate_by_units(text: str, max_units: int) -> str:
         return ""
     if _context_units(text) <= max_units:
         return text
-    # Context units treat an ASCII word as one unit, so character-by-character
-    # counting would overestimate long words and skew an even skill split.
+
+
     low, high = 0, len(text)
     while low < high:
         midpoint = (low + high + 1) // 2
@@ -274,7 +274,7 @@ def render_category_catalog(catalog: SkillCatalog, budget_units: int = SKILL_CAT
 
 
 def render_skill_catalog(catalog: SkillCatalog) -> str:
-    """Render the complete hierarchical catalog for the interactive /skills command."""
+
     if not catalog.categories:
         return "Skills:\n- no valid categories found under .lumo/skills"
 
@@ -330,12 +330,7 @@ def load_skill_content(root: Path, qualified_name: str, catalog: SkillCatalog | 
 
 
 def render_task_skill_contexts(task_skills: list[dict]) -> dict[str, dict]:
-    """Render in-memory task skills without putting their bodies in persistent state.
 
-    Skill bodies are kept intact while their combined size fits the task-skill
-    budget. When it does not, every loaded skill receives the same content
-    budget so an early or unusually long skill cannot crowd out later ones.
-    """
     active = [item for item in task_skills or [] if isinstance(item, dict) and str(item.get("call_id", "")).strip()]
     if not active:
         return {}
@@ -363,8 +358,8 @@ def render_task_skill_contexts(task_skills: list[dict]) -> dict[str, dict]:
     if total_content_units <= TASK_SKILLS_CONTENT_BUDGET_UNITS:
         per_skill_budget = None
     else:
-        # Reserve the marker in every truncated entry so the rendered bodies
-        # themselves remain within the shared 5000-unit budget.
+
+
         marker_units = _context_units(truncation_marker)
         per_skill_budget = max(
             0,

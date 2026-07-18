@@ -1,0 +1,93 @@
+{
+  "schema_version": "2.0",
+  "references": [
+    {
+      "id": "swe_bench",
+      "name": "SWE-bench",
+      "url": "https://github.com/SWE-bench/SWE-bench",
+      "retrieved_on": "2026-07-15",
+      "evidence_reviewed": [
+        "Repository overview describing real-world GitHub issues against a codebase",
+        "Docker-based reproducible evaluation and SWE-bench Lite evaluation workflow"
+      ],
+      "ideas_adapted": [
+        "Issue-style prompts against fixed repository states",
+        "Container-like reproducibility",
+        "FAIL_TO_PASS and PASS_TO_PASS test gates",
+        "Binary resolution only when all required tests pass"
+      ]
+    },
+    {
+      "id": "terminal_bench",
+      "name": "Terminal-Bench",
+      "url": "https://github.com/harbor-framework/terminal-bench",
+      "retrieved_on": "2026-07-15",
+      "evidence_reviewed": [
+        "Task contract: natural-language instruction, verifier script, and oracle solution",
+        "Public task gallery with difficulty labels and end-to-end examples such as blind maze mapping and initramfs construction"
+      ],
+      "ideas_adapted": [
+        "End-to-end tasks in real terminal environments",
+        "A verifier script and an oracle concept per task",
+        "Self-contained reproducible task fixtures"
+      ]
+    },
+    {
+      "id": "tau_bench",
+      "name": "tau-bench",
+      "url": "https://github.com/sierra-research/tau-bench",
+      "paper_url": "https://arxiv.org/abs/2406.12045",
+      "retrieved_on": "2026-07-15",
+      "evidence_reviewed": [
+        "Database end-state comparison after dynamic user-agent interactions",
+        "pass^k reliability metric over repeated trials"
+      ],
+      "ideas_adapted": [
+        "Final state rather than conversational appearance",
+        "Repeated-run reliability with pass^k",
+        "Trajectory fault assignment and fault type labels",
+        "Policy and tool-use constraints"
+      ]
+    },
+    {
+      "id": "agent_bench",
+      "name": "AgentBench",
+      "url": "https://github.com/THUDM/AgentBench",
+      "retrieved_on": "2026-07-15",
+      "evidence_reviewed": [
+        "Containerized function-calling tasks spanning operating systems, databases, knowledge graphs, and web shopping",
+        "Separation between environment workers and the agent controller"
+      ],
+      "ideas_adapted": [
+        "Multiple task environments",
+        "Function-calling agent evaluation",
+        "Separate environment workers and agent controller"
+      ]
+    },
+    {
+      "id": "gaia",
+      "name": "GAIA",
+      "url": "https://arxiv.org/abs/2311.12983",
+      "retrieved_on": "2026-07-15",
+      "evidence_reviewed": [
+        "Real-world questions combining reasoning and external capabilities",
+        "Tasks designed to be conceptually simple for humans but difficult for assistants"
+      ],
+      "ideas_adapted": [
+        "Human-simple but agent-challenging real-world tasks",
+        "Multi-step reasoning combined with tool use",
+        "Unambiguous final answers where possible"
+      ]
+    },
+    {
+      "id": "g_eval",
+      "name": "G-Eval",
+      "url": "https://arxiv.org/abs/2303.16634",
+      "ideas_adapted": [
+        "Form-based structured LLM judging",
+        "Criterion-specific scoring",
+        "Explicit caution about evaluator model bias"
+      ]
+    }
+  ]
+}

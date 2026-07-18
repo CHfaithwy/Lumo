@@ -1,0 +1,50 @@
+{
+  "schema_version": "2.0",
+  "suite": "core",
+  "category": "context",
+  "description": "长对话目标保持、未结算依赖保护和压缩失败恢复。",
+  "tasks": [
+    {
+      "id": "core.context.long-history-common.v1",
+      "title": "长对话约束保持",
+      "objective": "验证历史缩减后仍保留原始目标和关键约束。",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["gaia", "agent_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["list_files", "read_file", "write_file"], "supporting_tools": [], "scenario_class": "common", "mechanisms": [{"name": "context_compression", "scenario": "common"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "multi_session_live_agent", "repetitions": 3, "max_steps": 20, "timeout_seconds": 420, "required_harness_features": ["workspace_materialization", "small_context_budget", "context_summary_assertions"]},
+      "model_input": {"allowed_tools": ["list_files", "read_file", "write_file"], "turns": [{"id": "start", "session_policy": "new", "prompt": "请先列出 records 下的月度数据文件，再分析其中前六个月的数据。最终生成 final-report.json：months 是按月份升序排列的 1 到 12，totals 以 YYYY-MM 为字段记录每月整数金额合计，grand_total 是全年合计。计算时必须排除 cancelled 状态。"}, {"id": "continue", "session_policy": "same", "prompt": "请继续检查剩余月份并完成最终文件，保持最初的全部要求。"}]},
+      "setup": {"workspace_files": [{"path": "records/README.md", "content": "每月一个数据文件，字段为月份、状态、金额。\n"}], "private_files": [], "directories": ["records"], "actions": [{"type": "run_command", "spec": {"fixture_generator": "twelve_long_monthly_records"}}]},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "ordered", "type": "json_value_equals", "required": true, "spec": {"path": "final-report.json", "json_path": "$.months", "value": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]}}, {"id": "totals", "type": "json_value_equals", "required": true, "spec": {"path": "final-report.json", "json_path": "$.totals", "value": {"2026-01": 12120, "2026-02": 12240, "2026-03": 12360, "2026-04": 12480, "2026-05": 12600, "2026-06": 12720, "2026-07": 12840, "2026-08": 12960, "2026-09": 13080, "2026-10": 13200, "2026-11": 13320, "2026-12": 13440}}}, {"id": "grand_total", "type": "json_value_equals", "required": true, "spec": {"path": "final-report.json", "json_path": "$.grand_total", "value": 153360}}, {"id": "cancelled_excluded", "type": "file_content_excludes", "required": true, "spec": {"path": "final-report.json", "text": "cancelled"}}, {"id": "compressed", "type": "history_state", "required": true, "spec": {"context_summary_present": true}}, {"id": "listed", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "list_files", "min_count": 1}}, {"id": "read", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "read_file", "min_count": 12}}, {"id": "write", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "write_file", "min_count": 1}}]},
+      "failure_labels": ["context_loss", "incomplete_goal", "hallucinated_evidence"]
+    },
+    {
+      "id": "core.context.pending-closure-boundary.v1",
+      "title": "长结果依赖闭包保护",
+      "objective": "验证历史缩减不会拆散尚未结算的调用与结果依赖。",
+      "difficulty": "hard",
+      "status": "requires_feature",
+      "benchmark_inspiration": ["tau_bench", "agent_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["run_shell", "read_file"], "supporting_tools": [], "scenario_class": "boundary", "mechanisms": [{"name": "context_compression", "scenario": "boundary"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "scripted_probe", "repetitions": 1, "max_steps": 8, "timeout_seconds": 180, "required_harness_features": ["scripted_provider", "small_context_budget", "protected_history_assertions"], "scripted_model": {"scenario": "Create two pending long results and enough earlier history to force compression before the next request."}},
+      "model_input": {"allowed_tools": ["run_shell", "read_file"], "turns": [{"id": "main", "session_policy": "new", "prompt": "运行 python inspect-ledgers.py，并结合 limits.md 判断 east 和 west 两个账本是否超过各自上限。最后分别写出实际值、上限和是否超限。"}]},
+      "setup": {"workspace_files": [{"path": "inspect-ledgers.py", "content": "print('fixture:two-long-ledger-results')\n"}, {"path": "limits.md", "content": "east 上限 9000，west 上限 7000。\n"}], "private_files": [], "directories": [], "actions": [{"type": "run_command", "spec": {"fixture_generator": "large_prior_history"}}]},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "answer", "type": "final_answer_contains", "required": true, "spec": {"all": ["east", "9500", "9000", "超过", "west", "6500", "7000", "未超过"]}}, {"id": "protected", "type": "history_state", "required": true, "spec": {"pending_dependency_closure_preserved": true, "control_after_results": true}}, {"id": "summary_before", "type": "history_state", "required": true, "spec": {"context_summary_before_protected_history": true}}, {"id": "ran", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "run_shell", "min_count": 1}}, {"id": "read", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "read_file", "min_count": 1}}]},
+      "failure_labels": ["context_loss", "archive_missing", "environment_error"]
+    },
+    {
+      "id": "core.context.compression-failure-recovery.v1",
+      "title": "上下文超限后的完整回合缩减",
+      "objective": "验证明确上下文超限后只丢弃完整旧回合并继续完成任务。",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["gaia", "terminal_bench"],
+      "coverage": {"track": "mechanism", "primary_tools": ["grep", "read_file", "write_file"], "supporting_tools": [], "scenario_class": "recovery", "mechanisms": [{"name": "context_compression", "scenario": "recovery"}], "prompt_language": "zh-CN"},
+      "runner": {"kind": "scripted_probe", "repetitions": 1, "max_steps": 10, "timeout_seconds": 240, "required_harness_features": ["scripted_provider", "compression_failure_injection", "context_summary_assertions"], "scripted_model": {"scenario": "Return a context-window error once, then return a valid summary after one complete older conversation turn is removed."}},
+      "model_input": {"allowed_tools": ["grep", "read_file", "write_file"], "turns": [{"id": "main", "session_policy": "new", "prompt": "请从 records 下全部客服记录中统计退款原因排名前三的类别，核对原文样例，并写入 refund-reasons.json。文件包含 count=3 和 reasons 数组；每项包含 category、所有文件中的总次数 count，以及一个原文 example。"}]},
+      "setup": {"workspace_files": [{"path": "records/README.md", "content": "记录按日期分片保存。\n"}], "private_files": [], "directories": ["records"], "actions": [{"type": "run_command", "spec": {"fixture_generator": "large_refund_records"}}]},
+      "evaluation": {"method": "composite", "pass_policy": "all_required", "checks": [{"id": "three", "type": "json_value_equals", "required": true, "spec": {"path": "refund-reasons.json", "json_path": "$.count", "value": 3}}, {"id": "reasons", "type": "json_value_equals", "required": true, "spec": {"path": "refund-reasons.json", "json_path": "$.reasons", "value": [{"category": "duplicate", "count": 2560, "example": "重复扣款"}, {"category": "damaged", "count": 1920, "example": "商品破损"}, {"category": "delayed", "count": 1280, "example": "配送延迟"}]}}, {"id": "retry", "type": "history_state", "required": true, "spec": {"compression_retry_count_at_least": 1}}, {"id": "reduced", "type": "history_state", "required": true, "spec": {"compression_retry_input_reduced": true}}, {"id": "complete_turn", "type": "history_state", "required": true, "spec": {"compression_discarded_turns_at_least": 1, "reduction_reason": "context_window_exceeded"}}, {"id": "searched", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "grep", "min_count": 1}}, {"id": "read", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "read_file", "min_count": 1}}, {"id": "write", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "write_file", "min_count": 1}}]},
+      "failure_labels": ["context_loss", "incomplete_goal", "environment_error"]
+    }
+  ]
+}

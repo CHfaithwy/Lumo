@@ -1,0 +1,582 @@
+{
+  "schema_version": "2.0",
+  "suite": "workflows",
+  "category": "state",
+  "description": "End-to-end tasks scored from exact final workspace state.",
+  "tasks": [
+    {
+      "id": "workflow.state.selective-cleanup.v1",
+      "title": "Selective cleanup with protected files",
+      "objective": "Measure whether the agent follows a deletion manifest exactly without broad collateral removal.",
+      "difficulty": "easy",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["terminal_bench", "tau_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["list_files", "run_shell", "git_status"], "supporting_tools": ["read_file"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {
+        "kind": "live_agent",
+        "repetitions": 3,
+        "max_steps": 10,
+        "timeout_seconds": 180,
+        "required_harness_features": ["workspace_materialization"]
+      },
+      "model_input": {
+        "allowed_tools": ["list_files", "read_file", "run_shell", "git_status"],
+        "turns": [
+          {
+            "id": "main",
+            "session_policy": "new",
+            "prompt": "请严格按照 cleanup-manifest.txt 清理目录，删除其中列出的每个路径，不要删除任何其他内容；完成后核对剩余文件和改动范围。"
+          }
+        ]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "cleanup-manifest.txt", "content": "build/a.tmp\nbuild/nested/b.tmp\nlogs/old.log\n"},
+          {"path": "build/a.tmp", "content": "remove\n"},
+          {"path": "build/nested/b.tmp", "content": "remove\n"},
+          {"path": "build/keep.bin", "content": "protected-build-artifact\n"},
+          {"path": "logs/old.log", "content": "remove\n"},
+          {"path": "logs/current.log", "content": "protected-current-log\n"},
+          {"path": "src/main.py", "content": "print('protected source')\n"}
+        ],
+        "private_files": [],
+        "directories": [],
+        "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "state",
+        "pass_policy": "all_required",
+        "checks": [
+          {"id": "remove_a", "type": "file_absent", "required": true, "spec": {"path": "build/a.tmp"}},
+          {"id": "remove_b", "type": "file_absent", "required": true, "spec": {"path": "build/nested/b.tmp"}},
+          {"id": "remove_log", "type": "file_absent", "required": true, "spec": {"path": "logs/old.log"}},
+          {"id": "keep_build", "type": "file_content_equals", "required": true, "spec": {"path": "build/keep.bin", "content": "protected-build-artifact\n"}},
+          {"id": "keep_log", "type": "file_content_equals", "required": true, "spec": {"path": "logs/current.log", "content": "protected-current-log\n"}},
+          {"id": "keep_source", "type": "file_content_equals", "required": true, "spec": {"path": "src/main.py", "content": "print('protected source')\n"}}
+        ]
+      },
+      "failure_labels": ["wrong_tool", "policy_violation", "collateral_change", "incomplete_goal"]
+    },
+    {
+      "id": "workflow.state.config-migration.v1",
+      "title": "Migrate a service configuration across code and documentation",
+      "objective": "Measure multi-file consistency, preservation of unrelated settings, and verification of a small migration workflow.",
+      "difficulty": "medium",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["terminal_bench", "gaia"],
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["list_files", "glob", "read_file", "git_status", "git_diff"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {
+        "kind": "live_agent",
+        "repetitions": 3,
+        "max_steps": 16,
+        "timeout_seconds": 300,
+        "required_harness_features": ["workspace_materialization"]
+      },
+      "model_input": {
+        "allowed_tools": ["grep", "patch_file", "run_shell", "list_files", "glob", "read_file", "git_status", "git_diff"],
+        "turns": [
+          {
+            "id": "main",
+            "session_policy": "new",
+            "prompt": "请按照 MIGRATION.md 把项目从 API v1 升级到 v2，更新所有要求的文件，保留无关配置，运行校验脚本，并检查最终差异。"
+          }
+        ]
+      },
+      "setup": {
+        "workspace_files": [
+          {
+            "path": "MIGRATION.md",
+            "content": "Replace `/api/v1/orders` with `/api/v2/orders`. Rename config key `legacy_retry` to `retry_limit` without changing its value. Update the README example. Do not change the analytics endpoint. Run `python validate.py`.\n"
+          },
+          {"path": "config.json", "content": "{\n  \"orders_endpoint\": \"/api/v1/orders\",\n  \"analytics_endpoint\": \"/api/v1/analytics\",\n  \"legacy_retry\": 4\n}\n"},
+          {"path": "src/client.py", "content": "ORDERS_PATH = '/api/v1/orders'\nANALYTICS_PATH = '/api/v1/analytics'\n"},
+          {"path": "README.md", "content": "Example: `GET /api/v1/orders`\n\nAnalytics remains at `/api/v1/analytics`.\n"},
+          {
+            "path": "validate.py",
+            "content": "import json\nfrom pathlib import Path\nconfig = json.loads(Path('config.json').read_text())\nassert config == {'orders_endpoint': '/api/v2/orders', 'analytics_endpoint': '/api/v1/analytics', 'retry_limit': 4}\nassert \"ORDERS_PATH = '/api/v2/orders'\" in Path('src/client.py').read_text()\nassert \"ANALYTICS_PATH = '/api/v1/analytics'\" in Path('src/client.py').read_text()\nassert 'GET /api/v2/orders' in Path('README.md').read_text()\nprint('validation-ok')\n"
+          }
+        ],
+        "private_files": [],
+        "directories": [],
+        "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "composite",
+        "pass_policy": "all_required",
+        "checks": [
+          {"id": "validator", "type": "command_exit_code", "required": true, "spec": {"command": "python validate.py", "exit_code": 0}},
+          {"id": "old_endpoint_gone", "type": "file_content_excludes", "required": true, "spec": {"paths": ["config.json", "src/client.py", "README.md"], "text": "/api/v1/orders"}},
+          {"id": "analytics_preserved", "type": "file_content_contains", "required": true, "spec": {"path": "config.json", "all": ["/api/v1/analytics"]}},
+          {"id": "validation_run", "type": "trace_event", "required": true, "spec": {"event": "tool_executed", "tool_name": "run_shell", "command_contains": "validate.py", "min_count": 1}}
+        ]
+      },
+      "failure_labels": ["wrong_tool_arguments", "collateral_change", "incomplete_goal", "environment_error"]
+    },
+    {
+      "id": "workflow.state.dataset-reconciliation.v1",
+      "title": "Reconcile orders and refunds into an exact summary",
+      "objective": "Measure file discovery, structured data reasoning, and creation of a machine-verifiable result.",
+      "difficulty": "medium",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["gaia", "agent_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "run_shell", "write_file"], "supporting_tools": ["list_files", "glob"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {
+        "kind": "live_agent",
+        "repetitions": 3,
+        "max_steps": 14,
+        "timeout_seconds": 240,
+        "required_harness_features": ["workspace_materialization"]
+      },
+      "model_input": {
+        "allowed_tools": ["list_files", "glob", "read_file", "run_shell", "write_file"],
+        "turns": [
+          {
+            "id": "main",
+            "session_policy": "new",
+            "prompt": "请核对 data/orders.csv 和 data/refunds.json，忽略已取消订单，并生成 summary.json，包含 gross_paid、refunded、net_revenue、paid_order_count，以及升序排列的 fully_refunded_order_ids；金额均为整数元。"
+          }
+        ]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "data/orders.csv", "content": "order_id,status,amount\nO-3,paid,90\nO-1,paid,120\nO-2,cancelled,75\nO-4,paid,60\n"},
+          {"path": "data/refunds.json", "content": "[\n  {\"order_id\": \"O-1\", \"amount\": 20},\n  {\"order_id\": \"O-3\", \"amount\": 90},\n  {\"order_id\": \"O-2\", \"amount\": 75}\n]\n"}
+        ],
+        "private_files": [],
+        "directories": [],
+        "actions": []
+      },
+      "evaluation": {
+        "method": "state",
+        "pass_policy": "all_required",
+        "checks": [
+          {"id": "gross", "type": "json_value_equals", "required": true, "spec": {"path": "summary.json", "json_path": "$.gross_paid", "value": 270}},
+          {"id": "refunded", "type": "json_value_equals", "required": true, "spec": {"path": "summary.json", "json_path": "$.refunded", "value": 110}},
+          {"id": "net", "type": "json_value_equals", "required": true, "spec": {"path": "summary.json", "json_path": "$.net_revenue", "value": 160}},
+          {"id": "count", "type": "json_value_equals", "required": true, "spec": {"path": "summary.json", "json_path": "$.paid_order_count", "value": 3}},
+          {"id": "full_refunds", "type": "json_value_equals", "required": true, "spec": {"path": "summary.json", "json_path": "$.fully_refunded_order_ids", "value": ["O-3"]}}
+        ]
+      },
+      "failure_labels": ["wrong_tool", "wrong_tool_arguments", "incomplete_goal", "hallucinated_evidence"]
+    },
+    {
+      "id": "workflow.state.static-assets-migration.v1",
+      "title": "Migrate static site assets without breaking references",
+      "objective": "Measure a small but realistic asset move with exact reference updates and no collateral edits.",
+      "difficulty": "easy",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["terminal_bench", "gaia"],
+      "coverage": {"track": "workflow", "primary_tools": ["list_files", "patch_file", "run_shell"], "supporting_tools": ["read_file", "write_file"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 12, "timeout_seconds": 180, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["list_files", "read_file", "patch_file", "write_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请把站点的图片和样式从 static 目录迁移到 public/assets，并修正 public/index.html 中的引用。迁移后删除旧文件，页面标题和脚本引用不要改动。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "public/index.html", "content": "<!doctype html>\n<html><head><title>Pico Docs</title><link rel=\"stylesheet\" href=\"/static/app.css\"></head><body><img src=\"/static/logo.txt\"><script src=\"/app.js\"></script></body></html>\n"},
+          {"path": "static/app.css", "content": "body { color: #222; }\n"},
+          {"path": "static/logo.txt", "content": "PICO-LOGO\n"},
+          {"path": "public/app.js", "content": "console.log('ready');\n"}
+        ],
+        "private_files": [], "directories": ["public/assets"], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "new_css", "type": "file_content_equals", "required": true, "spec": {"path": "public/assets/app.css", "content": "body { color: #222; }\n"}},
+          {"id": "new_logo", "type": "file_content_equals", "required": true, "spec": {"path": "public/assets/logo.txt", "content": "PICO-LOGO\n"}},
+          {"id": "old_css_removed", "type": "file_absent", "required": true, "spec": {"path": "static/app.css"}},
+          {"id": "old_logo_removed", "type": "file_absent", "required": true, "spec": {"path": "static/logo.txt"}},
+          {"id": "references_updated", "type": "file_content_contains", "required": true, "spec": {"path": "public/index.html", "all": ["/assets/app.css", "/assets/logo.txt", "<title>Pico Docs</title>", "/app.js"]}},
+          {"id": "old_references_removed", "type": "file_content_excludes", "required": true, "spec": {"path": "public/index.html", "text": "/static/"}},
+          {"id": "script_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "public/app.js", "content": "console.log('ready');\n"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "collateral_change", "wrong_tool_arguments"]
+    },
+    {
+      "id": "workflow.state.env-example-normalization.v1",
+      "title": "Normalize an environment example file safely",
+      "objective": "Measure exact configuration cleanup while protecting developer-local secrets.",
+      "difficulty": "easy",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["terminal_bench", "tau_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "patch_file", "git_diff"], "supporting_tools": ["list_files"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 10, "timeout_seconds": 180, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["list_files", "read_file", "patch_file", "git_diff"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请按 config/env.schema.json 整理 .env.example：只保留登记项，按 schema 中的顺序排列，去掉重复项和示例值两侧多余引号。结果必须只包含三个配置行，不得包含空行。不要改动 .env.local。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "config/env.schema.json", "content": "{\"keys\":[\"APP_ENV\",\"APP_PORT\",\"DATABASE_URL\"],\"defaults\":{\"APP_ENV\":\"development\",\"APP_PORT\":\"8080\",\"DATABASE_URL\":\"postgres://localhost/pico\"}}\n"},
+          {"path": ".env.example", "content": "APP_PORT=\"8080\"\nOLD_FLAG=true\nAPP_ENV='development'\nAPP_PORT=9000\nDATABASE_URL=\"postgres://localhost/pico\"\n"},
+          {"path": ".env.local", "content": "APP_ENV=development\nAPP_PORT=8123\nDATABASE_URL=postgres://user:secret@db/private\n"}
+        ],
+        "private_files": [], "directories": [], "actions": [{"type": "init_git", "spec": {"commit": true}}]
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "example_exact", "type": "file_content_equals", "required": true, "spec": {"path": ".env.example", "content": "APP_ENV=development\nAPP_PORT=8080\nDATABASE_URL=postgres://localhost/pico\n"}},
+          {"id": "local_protected", "type": "file_content_equals", "required": true, "spec": {"path": ".env.local", "content": "APP_ENV=development\nAPP_PORT=8123\nDATABASE_URL=postgres://user:secret@db/private\n"}},
+          {"id": "schema_protected", "type": "file_content_equals", "required": true, "spec": {"path": "config/env.schema.json", "content": "{\"keys\":[\"APP_ENV\",\"APP_PORT\",\"DATABASE_URL\"],\"defaults\":{\"APP_ENV\":\"development\",\"APP_PORT\":\"8080\",\"DATABASE_URL\":\"postgres://localhost/pico\"}}\n"}}
+        ]
+      },
+      "failure_labels": ["policy_violation", "collateral_change", "incomplete_goal"]
+    },
+    {
+      "id": "workflow.state.documentation-link-repair.v1",
+      "title": "Repair broken documentation links",
+      "objective": "Measure evidence-based link repair across a small documentation tree.",
+      "difficulty": "easy",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["gaia", "terminal_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "grep", "patch_file"], "supporting_tools": ["read_file"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 10, "timeout_seconds": 180, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "patch_file"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "README.md 里有两个文档链接已经失效。请根据仓库中实际存在的页面修正它们，保留外部官网链接和其他文字原样。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "README.md", "content": "# Pico Service\n\n- [安装](docs/setup.md)\n- [接口](guide/api.md)\n- [官网](https://example.com/pico)\n\nRelease channel: stable.\n"},
+          {"path": "docs/getting-started.md", "content": "# 安装\n"},
+          {"path": "docs/api.md", "content": "# 接口\n"},
+          {"path": "CHANGELOG.md", "content": "# Changelog\n\n1.0.0 initial release\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "readme_exact", "type": "file_content_equals", "required": true, "spec": {"path": "README.md", "content": "# Pico Service\n\n- [安装](docs/getting-started.md)\n- [接口](docs/api.md)\n- [官网](https://example.com/pico)\n\nRelease channel: stable.\n"}},
+          {"id": "changelog_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "CHANGELOG.md", "content": "# Changelog\n\n1.0.0 initial release\n"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "collateral_change", "hallucinated_evidence"]
+    },
+    {
+      "id": "workflow.state.log-retention-cleanup.v1",
+      "title": "Apply a selective log-retention policy",
+      "objective": "Measure safe cleanup with date boundaries and protected audit artifacts.",
+      "difficulty": "easy",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["terminal_bench", "agent_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["list_files", "read_file", "run_shell"], "supporting_tools": ["glob"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 10, "timeout_seconds": 180, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["list_files", "glob", "read_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请清理 logs 目录：删除 2026-07-14 之前的普通 .log 文件，保留 7 月 14 日及之后的日志、所有 audit 文件和占位文件。不要改写保留文件。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "logs/app-2026-07-12.log", "content": "old app\n"},
+          {"path": "logs/app-2026-07-13.log", "content": "old app 2\n"},
+          {"path": "logs/app-2026-07-14.log", "content": "keep boundary\n"},
+          {"path": "logs/app-2026-07-15.log", "content": "keep current\n"},
+          {"path": "logs/audit-2026-06-01.log", "content": "protected audit\n"},
+          {"path": "logs/audit-2026-07-13.log", "content": "protected historical audit\n"},
+          {"path": "logs/.keep", "content": ""}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "old_12_removed", "type": "file_absent", "required": true, "spec": {"path": "logs/app-2026-07-12.log"}},
+          {"id": "old_13_removed", "type": "file_absent", "required": true, "spec": {"path": "logs/app-2026-07-13.log"}},
+          {"id": "boundary_kept", "type": "file_content_equals", "required": true, "spec": {"path": "logs/app-2026-07-14.log", "content": "keep boundary\n"}},
+          {"id": "current_kept", "type": "file_content_equals", "required": true, "spec": {"path": "logs/app-2026-07-15.log", "content": "keep current\n"}},
+          {"id": "audit_kept", "type": "file_content_equals", "required": true, "spec": {"path": "logs/audit-2026-06-01.log", "content": "protected audit\n"}},
+          {"id": "historical_audit_kept", "type": "file_content_equals", "required": true, "spec": {"path": "logs/audit-2026-07-13.log", "content": "protected historical audit\n"}},
+          {"id": "placeholder_kept", "type": "file_exists", "required": true, "spec": {"path": "logs/.keep"}}
+        ]
+      },
+      "failure_labels": ["wrong_tool_arguments", "policy_violation", "collateral_change"]
+    },
+    {
+      "id": "workflow.state.localization-sync.v1",
+      "title": "Synchronize localization keys with a source locale",
+      "objective": "Measure structured JSON reconciliation without overwriting valid translations.",
+      "difficulty": "medium",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["terminal_bench", "tau_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "write_file", "run_shell"], "supporting_tools": ["glob", "grep"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 14, "timeout_seconds": 240, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请让 locales/zh-CN.json 的键与 locales/en-US.json 完全一致。已有中文译文必须保留；缺少项从 glossary.json 取值；英文中已删除的旧键也要从中文文件移除。完成后保证文件仍是合法 JSON。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "locales/en-US.json", "content": "{\n  \"nav.home\": \"Home\",\n  \"nav.settings\": \"Settings\",\n  \"errors.timeout\": \"Request timed out\"\n}\n"},
+          {"path": "locales/zh-CN.json", "content": "{\n  \"nav.home\": \"首页\",\n  \"errors.timeout\": \"请求超时\",\n  \"legacy.banner\": \"旧公告\"\n}\n"},
+          {"path": "glossary.json", "content": "{\"nav.settings\":\"设置\",\"errors.timeout\":\"请求超时\"}\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "home_preserved", "type": "json_value_equals", "required": true, "spec": {"path": "locales/zh-CN.json", "json_path": "$['nav.home']", "value": "首页"}},
+          {"id": "settings_added", "type": "json_value_equals", "required": true, "spec": {"path": "locales/zh-CN.json", "json_path": "$['nav.settings']", "value": "设置"}},
+          {"id": "timeout_preserved", "type": "json_value_equals", "required": true, "spec": {"path": "locales/zh-CN.json", "json_path": "$['errors.timeout']", "value": "请求超时"}},
+          {"id": "legacy_removed", "type": "file_content_excludes", "required": true, "spec": {"path": "locales/zh-CN.json", "text": "legacy.banner"}},
+          {"id": "source_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "locales/en-US.json", "content": "{\n  \"nav.home\": \"Home\",\n  \"nav.settings\": \"Settings\",\n  \"errors.timeout\": \"Request timed out\"\n}\n"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "collateral_change", "wrong_tool_arguments"]
+    },
+    {
+      "id": "workflow.state.lockfile-workspace-cleanup.v1",
+      "title": "Remove stale workspace entries from a lockfile",
+      "objective": "Measure structured lock metadata cleanup against the current monorepo layout.",
+      "difficulty": "medium",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["swe_bench", "terminal_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["list_files", "read_file", "write_file"], "supporting_tools": ["run_shell"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 14, "timeout_seconds": 240, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["list_files", "read_file", "write_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "packages/legacy-ui 已从仓库移除，但 workspace-lock.json 还保留着旧记录。请根据当前 packages 目录清理失效的 workspace 项，保留外部依赖版本和现有包记录，并输出合法 JSON。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "packages/api/package.json", "content": "{\"name\":\"@pico/api\",\"version\":\"1.2.0\"}\n"},
+          {"path": "packages/web/package.json", "content": "{\"name\":\"@pico/web\",\"version\":\"2.0.0\"}\n"},
+          {"path": "workspace-lock.json", "content": "{\n  \"workspaces\": {\n    \"packages/api\": \"1.2.0\",\n    \"packages/legacy-ui\": \"0.8.0\",\n    \"packages/web\": \"2.0.0\"\n  },\n  \"dependencies\": {\"react\": \"18.3.1\", \"zod\": \"3.23.8\"}\n}\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "api_kept", "type": "json_value_equals", "required": true, "spec": {"path": "workspace-lock.json", "json_path": "$.workspaces['packages/api']", "value": "1.2.0"}},
+          {"id": "web_kept", "type": "json_value_equals", "required": true, "spec": {"path": "workspace-lock.json", "json_path": "$.workspaces['packages/web']", "value": "2.0.0"}},
+          {"id": "legacy_removed", "type": "file_content_excludes", "required": true, "spec": {"path": "workspace-lock.json", "text": "packages/legacy-ui"}},
+          {"id": "react_kept", "type": "json_value_equals", "required": true, "spec": {"path": "workspace-lock.json", "json_path": "$.dependencies.react", "value": "18.3.1"}},
+          {"id": "zod_kept", "type": "json_value_equals", "required": true, "spec": {"path": "workspace-lock.json", "json_path": "$.dependencies.zod", "value": "3.23.8"}}
+        ]
+      },
+      "failure_labels": ["wrong_tool_arguments", "collateral_change", "incomplete_goal"]
+    },
+    {
+      "id": "workflow.state.api-fixture-regeneration.v1",
+      "title": "Regenerate API response fixtures from a versioned contract",
+      "objective": "Measure contract-driven fixture migration across multiple files.",
+      "difficulty": "medium",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["swe_bench", "terminal_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "read_file", "write_file"], "supporting_tools": ["grep", "run_shell"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 16, "timeout_seconds": 240, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file", "run_shell"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "contracts/users-v2.json 已成为当前接口约定。请更新 fixtures/users 里的响应样例：把 name 拆成 first_name 和 last_name，补上 active 字段，并把 schema_version 改为 2。不要改动约定文件。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "contracts/users-v2.json", "content": "{\"schema_version\":2,\"required\":[\"id\",\"first_name\",\"last_name\",\"active\"]}\n"},
+          {"path": "fixtures/users/alice.json", "content": "{\"schema_version\":1,\"id\":1,\"name\":\"Alice Chen\"}\n"},
+          {"path": "fixtures/users/bob.json", "content": "{\"schema_version\":1,\"id\":2,\"name\":\"Bob Li\"}\n"},
+          {"path": "fixtures/teams/core.json", "content": "{\"id\":\"core\",\"name\":\"Core Team\"}\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "alice_version", "type": "json_value_equals", "required": true, "spec": {"path": "fixtures/users/alice.json", "json_path": "$.schema_version", "value": 2}},
+          {"id": "alice_first", "type": "json_value_equals", "required": true, "spec": {"path": "fixtures/users/alice.json", "json_path": "$.first_name", "value": "Alice"}},
+          {"id": "alice_last", "type": "json_value_equals", "required": true, "spec": {"path": "fixtures/users/alice.json", "json_path": "$.last_name", "value": "Chen"}},
+          {"id": "alice_active", "type": "json_value_equals", "required": true, "spec": {"path": "fixtures/users/alice.json", "json_path": "$.active", "value": true}},
+          {"id": "bob_version", "type": "json_value_equals", "required": true, "spec": {"path": "fixtures/users/bob.json", "json_path": "$.schema_version", "value": 2}},
+          {"id": "bob_first", "type": "json_value_equals", "required": true, "spec": {"path": "fixtures/users/bob.json", "json_path": "$.first_name", "value": "Bob"}},
+          {"id": "bob_last", "type": "json_value_equals", "required": true, "spec": {"path": "fixtures/users/bob.json", "json_path": "$.last_name", "value": "Li"}},
+          {"id": "bob_active", "type": "json_value_equals", "required": true, "spec": {"path": "fixtures/users/bob.json", "json_path": "$.active", "value": true}},
+          {"id": "old_name_removed", "type": "file_content_excludes", "required": true, "spec": {"path": "fixtures/users/alice.json", "text": "\"name\""}},
+          {"id": "team_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "fixtures/teams/core.json", "content": "{\"id\":\"core\",\"name\":\"Core Team\"}\n"}},
+          {"id": "contract_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "contracts/users-v2.json", "content": "{\"schema_version\":2,\"required\":[\"id\",\"first_name\",\"last_name\",\"active\"]}\n"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "collateral_change", "test_regression"]
+    },
+    {
+      "id": "workflow.state.monorepo-package-rename.v1",
+      "title": "Rename a monorepo package across code and configuration",
+      "objective": "Measure a cross-file package rename with path, import, and workspace consistency.",
+      "difficulty": "hard",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["swe_bench", "terminal_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "grep", "patch_file"], "supporting_tools": ["read_file", "run_shell", "write_file"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 24, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "patch_file", "run_shell", "write_file"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请把 monorepo 中的 @pico/auth-client 包重命名为 @pico/identity-client，并把目录改为 packages/identity-client。同步更新工作区清单、应用依赖、源码导入、路径别名和文档；旧目录与旧包名不能残留，analytics 包不要改。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "workspace.json", "content": "{\"packages\":[\"packages/auth-client\",\"packages/analytics\",\"apps/web\"]}\n"},
+          {"path": "packages/auth-client/package.json", "content": "{\"name\":\"@pico/auth-client\",\"version\":\"1.0.0\"}\n"},
+          {"path": "packages/auth-client/src/index.ts", "content": "export const authenticate = () => 'ok';\n"},
+          {"path": "packages/analytics/package.json", "content": "{\"name\":\"@pico/analytics\",\"version\":\"3.0.0\"}\n"},
+          {"path": "apps/web/package.json", "content": "{\"dependencies\":{\"@pico/auth-client\":\"workspace:*\",\"@pico/analytics\":\"workspace:*\"}}\n"},
+          {"path": "apps/web/src/login.ts", "content": "import { authenticate } from '@pico/auth-client';\nexport const login = authenticate;\n"},
+          {"path": "tsconfig.json", "content": "{\"compilerOptions\":{\"paths\":{\"@pico/auth-client\":[\"packages/auth-client/src/index.ts\"],\"@pico/analytics\":[\"packages/analytics/src/index.ts\"]}}}\n"},
+          {"path": "docs/packages.md", "content": "Use `@pico/auth-client` from `packages/auth-client` for login.\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "old_dir_removed", "type": "file_absent", "required": true, "spec": {"path": "packages/auth-client/package.json"}},
+          {"id": "new_package", "type": "json_value_equals", "required": true, "spec": {"path": "packages/identity-client/package.json", "json_path": "$.name", "value": "@pico/identity-client"}},
+          {"id": "source_moved", "type": "file_content_equals", "required": true, "spec": {"path": "packages/identity-client/src/index.ts", "content": "export const authenticate = () => 'ok';\n"}},
+          {"id": "web_dependency", "type": "file_content_contains", "required": true, "spec": {"path": "apps/web/package.json", "all": ["@pico/identity-client", "@pico/analytics"]}},
+          {"id": "import_updated", "type": "file_content_contains", "required": true, "spec": {"path": "apps/web/src/login.ts", "text": "from '@pico/identity-client'"}},
+          {"id": "workspace_updated", "type": "file_content_contains", "required": true, "spec": {"path": "workspace.json", "all": ["packages/identity-client", "packages/analytics"]}},
+          {"id": "alias_updated", "type": "file_content_contains", "required": true, "spec": {"path": "tsconfig.json", "all": ["@pico/identity-client", "packages/identity-client/src/index.ts"]}},
+          {"id": "docs_updated", "type": "file_content_contains", "required": true, "spec": {"path": "docs/packages.md", "all": ["@pico/identity-client", "packages/identity-client"]}},
+          {"id": "old_name_gone", "type": "command_exit_code", "required": true, "spec": {"command": "python -c \"from pathlib import Path; files=[p for p in Path('.').rglob('*') if p.is_file() and '.lumo' not in p.parts and '.git' not in p.parts]; assert all('@pico/auth-client' not in p.read_text(encoding='utf-8') for p in files)\"", "exit_code": 0}},
+          {"id": "analytics_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "packages/analytics/package.json", "content": "{\"name\":\"@pico/analytics\",\"version\":\"3.0.0\"}\n"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "collateral_change", "test_regression", "wrong_tool_arguments"]
+    },
+    {
+      "id": "workflow.state.database-seed-reconciliation.v1",
+      "title": "Reconcile relational seed data from messy exports",
+      "objective": "Measure multi-source deduplication, referential validation, and deterministic output.",
+      "difficulty": "hard",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["agent_bench", "tau_bench", "terminal_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "run_shell", "write_file"], "supporting_tools": ["glob", "todo_write"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 22, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["glob", "read_file", "run_shell", "write_file", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请根据 exports/customers.csv 和 exports/orders.csv 生成 db/seed.json。客户邮箱按忽略大小写去重，重复记录保留 updated_at 较新的整条客户记录；订单只保留能关联到客户且状态为 paid 的记录；金额转为整数分。customers 中每项只保留 id、email、name，orders 中每项只保留 id、customer_id、amount_cents。客户和订单都按 id 排序，并在 summary.orphan_orders_discarded 中写出丢弃的孤立订单数。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "exports/customers.csv", "content": "id,email,name,updated_at\nC2,bob@example.com,Bob,2026-06-01\nC1,ALICE@example.com,Alice Old,2026-05-01\nC1N,alice@example.com,Alice Chen,2026-07-01\nC3,carol@example.com,Carol,2026-06-20\n"},
+          {"path": "exports/orders.csv", "content": "id,customer_email,status,amount\nO3,carol@example.com,cancelled,8.00\nO1,alice@example.com,paid,12.50\nO4,missing@example.com,paid,3.25\nO2,BOB@example.com,paid,7.00\n"},
+          {"path": "db/README.md", "content": "Generated seed files use cents and stable ID ordering.\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "customers", "type": "json_value_equals", "required": true, "spec": {"path": "db/seed.json", "json_path": "$.customers", "value": [{"id": "C1N", "email": "alice@example.com", "name": "Alice Chen"}, {"id": "C2", "email": "bob@example.com", "name": "Bob"}, {"id": "C3", "email": "carol@example.com", "name": "Carol"}]}},
+          {"id": "orders", "type": "json_value_equals", "required": true, "spec": {"path": "db/seed.json", "json_path": "$.orders", "value": [{"id": "O1", "customer_id": "C1N", "amount_cents": 1250}, {"id": "O2", "customer_id": "C2", "amount_cents": 700}]}},
+          {"id": "orphans", "type": "json_value_equals", "required": true, "spec": {"path": "db/seed.json", "json_path": "$.summary.orphan_orders_discarded", "value": 1}},
+          {"id": "readme_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "db/README.md", "content": "Generated seed files use cents and stable ID ordering.\n"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "wrong_tool_arguments", "hallucinated_evidence"]
+    },
+    {
+      "id": "workflow.state.release-artifact-packaging.v1",
+      "title": "Build a deterministic release artifact",
+      "objective": "Measure packaging, manifest generation, checksum accuracy, and source preservation.",
+      "difficulty": "hard",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["terminal_bench", "agent_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "run_shell", "write_file"], "supporting_tools": ["list_files", "todo_write"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 20, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["list_files", "read_file", "run_shell", "write_file", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请按 RELEASE.md 生成 release/pico-1.4.0.zip 和 release/manifest.json，然后运行 python verify_release.py。压缩包内容、路径和校验和必须符合说明，不要修改 dist 下的源文件。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "RELEASE.md", "content": "Package dist/app.py as app.py and dist/config.json as config/default.json. manifest.json maps each archive path to its SHA-256. Use ZIP_DEFLATED and fixed timestamp 2020-01-01 00:00:00 for reproducibility.\n"},
+          {"path": "dist/app.py", "content": "print('pico 1.4.0')\n"},
+          {"path": "dist/config.json", "content": "{\"port\":8080,\"mode\":\"production\"}\n"},
+          {"path": "verify_release.py", "content": "import hashlib, json, zipfile\nfrom pathlib import Path\narchive=Path('release/pico-1.4.0.zip')\nmanifest=json.loads(Path('release/manifest.json').read_text(encoding='utf-8'))\nexpected={'app.py':Path('dist/app.py').read_bytes(),'config/default.json':Path('dist/config.json').read_bytes()}\nassert manifest=={name:hashlib.sha256(data).hexdigest() for name,data in expected.items()}\nwith zipfile.ZipFile(archive) as z:\n    assert sorted(z.namelist())==sorted(expected)\n    for name,data in expected.items():\n        assert z.read(name)==data\n        assert z.getinfo(name).date_time==(2020,1,1,0,0,0)\nprint('release ok')\n"}
+        ],
+        "private_files": [], "directories": ["release"], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "archive_exists", "type": "file_exists", "required": true, "spec": {"path": "release/pico-1.4.0.zip"}},
+          {"id": "manifest_exists", "type": "file_exists", "required": true, "spec": {"path": "release/manifest.json"}},
+          {"id": "release_verifies", "type": "command_exit_code", "required": true, "spec": {"command": "python verify_release.py", "exit_code": 0}},
+          {"id": "app_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "dist/app.py", "content": "print('pico 1.4.0')\n"}},
+          {"id": "config_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "dist/config.json", "content": "{\"port\":8080,\"mode\":\"production\"}\n"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change", "environment_error"]
+    },
+    {
+      "id": "workflow.state.media-metadata-normalization.v1",
+      "title": "Normalize media sidecar metadata into a catalog",
+      "objective": "Measure batch metadata normalization, validation, and deterministic aggregation.",
+      "difficulty": "hard",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["gaia", "terminal_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "read_file", "write_file"], "supporting_tools": ["run_shell", "todo_write"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 20, "timeout_seconds": 300, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["glob", "read_file", "run_shell", "write_file", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请汇总 media 目录下的 sidecar JSON 到 media/catalog.json。有效记录放在 items 数组中：日期统一成 YYYY-MM-DD，标签转为小写、去重并排序，宽高转为整数，并按 file 排序；缺少对应媒体文件的 sidecar 文件名记入 rejected 字符串数组。原始文件不要改动。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "media/hero.jpg", "content": "JPEG-HERO\n"},
+          {"path": "media/hero.json", "content": "{\"file\":\"hero.jpg\",\"date\":\"2026/07/01\",\"tags\":[\"Launch\",\"web\",\"launch\"],\"width\":\"1600\",\"height\":\"900\"}\n"},
+          {"path": "media/team.png", "content": "PNG-TEAM\n"},
+          {"path": "media/team.json", "content": "{\"file\":\"team.png\",\"date\":\"July 2, 2026\",\"tags\":[\"People\",\"Office\"],\"width\":800,\"height\":600}\n"},
+          {"path": "media/orphan.json", "content": "{\"file\":\"missing.jpg\",\"date\":\"2026-07-03\",\"tags\":[],\"width\":1,\"height\":1}\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "items", "type": "json_value_equals", "required": true, "spec": {"path": "media/catalog.json", "json_path": "$.items", "value": [{"file": "hero.jpg", "date": "2026-07-01", "tags": ["launch", "web"], "width": 1600, "height": 900}, {"file": "team.png", "date": "2026-07-02", "tags": ["office", "people"], "width": 800, "height": 600}]}},
+          {"id": "rejected", "type": "json_value_equals", "required": true, "spec": {"path": "media/catalog.json", "json_path": "$.rejected", "value": ["orphan.json"]}},
+          {"id": "hero_sidecar_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "media/hero.json", "content": "{\"file\":\"hero.jpg\",\"date\":\"2026/07/01\",\"tags\":[\"Launch\",\"web\",\"launch\"],\"width\":\"1600\",\"height\":\"900\"}\n"}},
+          {"id": "team_asset_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "media/team.png", "content": "PNG-TEAM\n"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "wrong_tool_arguments", "collateral_change"]
+    },
+    {
+      "id": "workflow.state.deployment-manifest-migration.v1",
+      "title": "Migrate Kubernetes manifests to supported APIs",
+      "objective": "Measure a multi-resource deployment migration with semantic verification.",
+      "difficulty": "hard",
+      "status": "spec_complete",
+      "benchmark_inspiration": ["terminal_bench", "agent_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "patch_file", "run_shell"], "supporting_tools": ["glob", "read_file", "todo_write"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 24, "timeout_seconds": 360, "required_harness_features": ["workspace_materialization"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "patch_file", "run_shell", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "deploy 目录里的 Kubernetes 清单来自旧集群。请把 Deployment 升级为 apps/v1，把 Ingress 升级为 networking.k8s.io/v1，并补齐新版必需字段；Service 的端口和应用标签必须保持一致。完成后运行 python verify_manifests.py。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "deploy/deployment.yaml", "content": "apiVersion: extensions/v1beta1\nkind: Deployment\nmetadata:\n  name: pico-api\nspec:\n  replicas: 2\n  template:\n    metadata:\n      labels:\n        app: pico-api\n    spec:\n      containers:\n      - name: api\n        image: pico/api:1.4.0\n        ports:\n        - containerPort: 8080\n"},
+          {"path": "deploy/ingress.yaml", "content": "apiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: pico-api\nspec:\n  rules:\n  - host: api.pico.test\n    http:\n      paths:\n      - path: /\n        backend:\n          serviceName: pico-api\n          servicePort: 80\n"},
+          {"path": "deploy/service.yaml", "content": "apiVersion: v1\nkind: Service\nmetadata:\n  name: pico-api\nspec:\n  selector:\n    app: pico-api\n  ports:\n  - port: 80\n    targetPort: 8080\n"},
+          {"path": "verify_manifests.py", "content": "from pathlib import Path\nd=Path('deploy/deployment.yaml').read_text()\ni=Path('deploy/ingress.yaml').read_text()\ns=Path('deploy/service.yaml').read_text()\nassert 'apiVersion: apps/v1' in d\nassert 'matchLabels:' in d and d.count('app: pico-api') >= 2\nassert 'image: pico/api:1.4.0' in d and 'containerPort: 8080' in d\nassert 'apiVersion: networking.k8s.io/v1' in i\nassert 'pathType: Prefix' in i and 'name: pico-api' in i and 'number: 80' in i\nassert 'serviceName:' not in i and 'servicePort:' not in i\nassert 'targetPort: 8080' in s and 'app: pico-api' in s\nprint('manifests ok')\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "state", "pass_policy": "all_required",
+        "checks": [
+          {"id": "verify", "type": "command_exit_code", "required": true, "spec": {"command": "python verify_manifests.py", "exit_code": 0}},
+          {"id": "deprecated_deployment_removed", "type": "file_content_excludes", "required": true, "spec": {"path": "deploy/deployment.yaml", "text": "extensions/v1beta1"}},
+          {"id": "deprecated_ingress_removed", "type": "file_content_excludes", "required": true, "spec": {"path": "deploy/ingress.yaml", "all": ["extensions/v1beta1", "serviceName", "servicePort"]}},
+          {"id": "service_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "deploy/service.yaml", "content": "apiVersion: v1\nkind: Service\nmetadata:\n  name: pico-api\nspec:\n  selector:\n    app: pico-api\n  ports:\n  - port: 80\n    targetPort: 8080\n"}}
+        ]
+      },
+      "failure_labels": ["incomplete_goal", "test_regression", "collateral_change", "environment_error"]
+    }
+  ]
+}

@@ -1,0 +1,293 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lumo.local/eval/dataset.schema.json",
+  "title": "Lumo Agent Evaluation Dataset",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "suite", "category", "description", "tasks"],
+  "properties": {
+    "schema_version": {"const": "2.0"},
+    "suite": {"enum": ["core", "workflows"]},
+    "category": {"type": "string", "minLength": 1},
+    "description": {"type": "string", "minLength": 1},
+    "tasks": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/task"}}
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "objective",
+        "difficulty",
+        "status",
+        "benchmark_inspiration",
+        "coverage",
+        "runner",
+        "model_input",
+        "setup",
+        "evaluation",
+        "failure_labels"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^(core|workflow)\\.[a-z0-9_-]+\\.[a-z0-9_-]+\\.v[0-9]+$"},
+        "title": {"type": "string", "minLength": 1},
+        "objective": {"type": "string", "minLength": 1},
+        "difficulty": {"enum": ["easy", "medium", "hard"]},
+        "status": {"enum": ["spec_complete", "requires_harness_hook", "requires_feature"]},
+        "benchmark_inspiration": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "case_inspiration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "url", "pattern"],
+          "properties": {
+            "repository": {"type": "string", "minLength": 1},
+            "url": {"type": "string", "format": "uri", "pattern": "^https://github\\.com/"},
+            "pattern": {"type": "string", "minLength": 1}
+          }
+        },
+        "coverage": {"$ref": "#/$defs/coverage"},
+        "runner": {"$ref": "#/$defs/runner"},
+        "model_input": {"$ref": "#/$defs/modelInput"},
+        "setup": {"$ref": "#/$defs/setup"},
+        "evaluation": {"$ref": "#/$defs/evaluation"},
+        "failure_labels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "wrong_tool",
+              "wrong_tool_arguments",
+              "policy_violation",
+              "incomplete_goal",
+              "collateral_change",
+              "test_regression",
+              "memory_miss",
+              "memory_leak",
+              "resume_duplication",
+              "stale_context",
+              "archive_missing",
+              "context_loss",
+              "hallucinated_evidence",
+              "judge_disagreement",
+              "environment_error"
+            ]
+          }
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["track", "primary_tools", "supporting_tools", "scenario_class", "mechanisms", "prompt_language"],
+      "properties": {
+        "track": {"enum": ["tool_matrix", "mechanism", "workflow"]},
+        "primary_tools": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "supporting_tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "scenario_class": {"enum": ["common", "boundary", "recovery"]},
+        "mechanisms": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "scenario"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "scenario": {"enum": ["common", "boundary", "recovery"]}
+            }
+          }
+        },
+        "prompt_language": {"const": "zh-CN"}
+      }
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "repetitions", "max_steps", "timeout_seconds", "required_harness_features"],
+      "properties": {
+        "kind": {"enum": ["live_agent", "multi_session_live_agent", "interrupt_resume_live_agent", "scripted_probe"]},
+        "repetitions": {"type": "integer", "minimum": 1},
+        "max_steps": {"type": "integer", "minimum": 1},
+        "timeout_seconds": {"type": "integer", "minimum": 1},
+        "required_harness_features": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "interrupt": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["after_event", "occurrence", "resume_mode"],
+          "properties": {
+            "after_event": {"type": "string", "minLength": 1},
+            "occurrence": {"type": "integer", "minimum": 1},
+            "resume_mode": {"enum": ["latest_checkpoint", "same_session"]},
+            "between_runs_actions": {"type": "array", "items": {"$ref": "#/$defs/action"}}
+          }
+        },
+        "scripted_model": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "modelInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed_tools", "turns"],
+      "properties": {
+        "allowed_tools": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "turns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "session_policy", "prompt"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "session_policy": {"enum": ["new", "same", "resume"]},
+              "prompt": {"type": "string", "minLength": 1},
+              "environment_notes": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      }
+    },
+    "setup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace_files", "private_files", "directories", "actions"],
+      "properties": {
+        "workspace_files": {"type": "array", "items": {"$ref": "#/$defs/file"}},
+        "private_files": {"type": "array", "items": {"$ref": "#/$defs/file"}},
+        "directories": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "actions": {"type": "array", "items": {"$ref": "#/$defs/action"}}
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "content"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "content": {"type": "string"},
+        "executable": {"type": "boolean", "default": false}
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "spec"],
+      "properties": {
+        "type": {"enum": ["run_command", "write_file", "delete_path", "set_env", "init_git", "mount_private_files"]},
+        "spec": {"type": "object"}
+      }
+    },
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "pass_policy", "checks"],
+      "properties": {
+        "method": {"enum": ["state", "unit_tests", "llm_rubric", "composite"]},
+        "pass_policy": {"const": "all_required"},
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "type", "required", "spec"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "type": {
+                "enum": [
+                  "file_exists",
+                  "file_absent",
+                  "file_content_equals",
+                  "file_content_contains",
+                  "file_content_excludes",
+                  "json_value_equals",
+                  "command_exit_code",
+                  "trace_event",
+                  "trace_event_absent",
+                  "history_state",
+                  "memory_contains",
+                  "memory_excludes",
+                  "checkpoint_state",
+                  "final_answer_contains",
+                  "rubric_score"
+                ]
+              },
+              "required": {"type": "boolean"},
+              "spec": {"type": "object"}
+            }
+          }
+        },
+        "rubric": {"$ref": "#/$defs/rubric"},
+        "judge": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["config", "artifact_paths"],
+          "properties": {
+            "config": {"type": "string", "minLength": 1},
+            "artifact_paths": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+            "include_execution_evidence": {"type": "boolean", "default": false}
+          }
+        }
+      }
+    },
+    "rubric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["threshold", "scale", "criteria"],
+      "properties": {
+        "threshold": {"type": "number", "minimum": 0, "maximum": 100},
+        "scale": {"const": "0-4"},
+        "criteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "weight", "description", "anchors"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "weight": {"type": "number", "exclusiveMinimum": 0, "maximum": 100},
+              "description": {"type": "string", "minLength": 1},
+              "anchors": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["0", "2", "4"],
+                "properties": {
+                  "0": {"type": "string", "minLength": 1},
+                  "2": {"type": "string", "minLength": 1},
+                  "4": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

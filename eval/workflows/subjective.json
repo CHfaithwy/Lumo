@@ -1,0 +1,740 @@
+{
+  "schema_version": "2.0",
+  "suite": "workflows",
+  "category": "subjective",
+  "description": "End-to-end analysis and documentation tasks with structural integrity gates and evidence-grounded semantic rubric judging.",
+  "tasks": [
+    {
+      "id": "workflow.subjective.incident-diagnosis.v1",
+      "title": "Diagnose a database connection incident",
+      "objective": "Measure evidence-grounded diagnosis, causal reasoning, and actionable remediation across logs, metrics, and deployment changes.",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["gaia", "agent_bench", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "grep", "write_file"], "supporting_tools": ["list_files", "read_file"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {
+        "kind": "live_agent",
+        "repetitions": 3,
+        "max_steps": 18,
+        "timeout_seconds": 720,
+        "required_harness_features": ["workspace_materialization", "rubric_judge"]
+      },
+      "model_input": {
+        "allowed_tools": ["list_files", "glob", "grep", "read_file", "write_file"],
+        "turns": [
+          {
+            "id": "main",
+            "session_policy": "new",
+            "prompt": "请根据 incident 目录中的材料调查这次故障，编写 incident-report.md，包含时间线、根因、促成因素、立即缓解措施、长期改进和仍未确定的问题。每个重要结论都要引用文件中的具体证据。 证据引用请使用相对路径:行号格式。"
+          }
+        ]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "incident/app.log", "content": "03:09:58 deploy version=2.8.0 completed\n03:10:11 worker=1 database pool initialized size=80\n03:10:12 worker=2 database pool initialized size=80\n03:10:12 worker=3 database pool initialized size=80\n03:10:13 worker=4 database pool initialized size=80\n03:12:04 ERROR checkout timed out after 5s route=/orders\n03:12:06 ERROR checkout timed out after 5s route=/payments\n03:16:20 config rollback started\n03:17:02 error rate returned below 1%\n"},
+          {"path": "incident/database.log", "content": "03:11:49 WARNING connections=98 max_connections=100\n03:12:01 FATAL remaining connection slots are reserved\n03:12:02 FATAL remaining connection slots are reserved\n03:16:41 INFO connections=43 max_connections=100\n"},
+          {"path": "incident/metrics.csv", "content": "time,request_error_pct,db_connections,latency_ms\n03:09,0.2,31,140\n03:10,0.3,72,150\n03:11,1.1,98,240\n03:12,38.0,100,5200\n03:16,14.0,92,2100\n03:17,0.7,43,180\n"},
+          {"path": "incident/deploy.diff", "content": "- DB_POOL_SIZE=20\n+ DB_POOL_SIZE=80\n  WEB_WORKERS=4\n  DB_MAX_CONNECTIONS=100\n"},
+          {"path": "incident/runbook.md", "content": "If database connections exceed 90% and checkout timeouts occur, first reduce application pool capacity, then inspect leaked transactions. Do not increase max_connections without a database capacity review.\n"}
+        ],
+        "private_files": [],
+        "directories": [],
+        "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric",
+        "pass_policy": "all_required",
+        "checks": [
+          {"id": "report_exists", "type": "file_exists", "required": true, "spec": {"path": "incident-report.md"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 82}}
+        ],
+        "rubric": {
+          "threshold": 82,
+          "scale": "0-4",
+          "criteria": [
+            {
+              "id": "causal_diagnosis",
+              "weight": 30,
+              "description": "Identifies connection pool over-allocation after the deployment as the primary cause and distinguishes evidence from speculation.",
+              "anchors": {"0": "No defensible root cause or a contradicted cause.", "2": "Mentions connection pressure but gives an incomplete causal chain.", "4": "Connects 4 workers x pool size 80 against max_connections 100 to exhaustion and observed timeouts."}
+            },
+            {
+              "id": "evidence_and_timeline",
+              "weight": 25,
+              "description": "Uses timestamps and values from multiple artifacts to establish sequence and recovery.",
+              "anchors": {"0": "No artifact evidence.", "2": "Some correct facts but weak sequencing or source coverage.", "4": "Accurate multi-source timeline from deploy through saturation, rollback, and recovery."}
+            },
+            {
+              "id": "remediation_quality",
+              "weight": 25,
+              "description": "Proposes safe immediate and preventive actions aligned with the runbook and capacity constraints.",
+              "anchors": {"0": "Unsafe or irrelevant remediation.", "2": "Reasonable rollback advice without prevention detail.", "4": "Covers pool rollback, capacity budgeting, alerts, load testing, and guarded configuration rollout."}
+            },
+            {
+              "id": "uncertainty_and_clarity",
+              "weight": 20,
+              "description": "States unresolved questions and communicates conclusions concisely without inventing evidence.",
+              "anchors": {"0": "Overconfident, unclear, or fabricated.", "2": "Readable but uncertainty is generic.", "4": "Separates confirmed cause, possible contributors such as leaks, and concrete follow-up evidence needed."}
+            }
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["incident-report.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.architecture-decision.v1",
+      "title": "Choose a durable job transport",
+      "objective": "Measure constraint-driven architecture reasoning rather than preference-based technology selection.",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["gaia", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "write_file"], "supporting_tools": ["list_files"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {
+        "kind": "live_agent",
+        "repetitions": 3,
+        "max_steps": 16,
+        "timeout_seconds": 600,
+        "required_harness_features": ["workspace_materialization", "rubric_judge"]
+      },
+      "model_input": {
+        "allowed_tools": ["list_files", "read_file", "write_file"],
+        "turns": [
+          {
+            "id": "main",
+            "session_policy": "new",
+            "prompt": "请阅读 architecture/requirements.md 和 architecture/options.md，编写 architecture/decision.md 并推荐一个方案。内容必须包括最终决策、逐项约束分析、未选方案、失败处理以及上线与验证计划；不要引入需求没有依据的基础设施。 证据引用请使用相对路径:行号格式。"
+          }
+        ]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "architecture/requirements.md", "content": "# Export jobs\n\n- Sustained 500 jobs/second, bursts to 2,000.\n- Each job may run for 30 minutes.\n- Jobs must survive worker and broker restarts.\n- At-least-once delivery is acceptable if handlers are idempotent.\n- Preserve order for jobs belonging to the same customer; global order is unnecessary.\n- Operators need retry visibility and a dead-letter path.\n- The team operates PostgreSQL and RabbitMQ today; it does not operate Kafka.\n- Initial delivery target is six weeks with a small platform team.\n"},
+          {"path": "architecture/options.md", "content": "# Candidate options\n\n## PostgreSQL polling table\nDurable and familiar, but requires polling/locking design and careful cleanup at sustained load.\n\n## RabbitMQ quorum queues\nDurable replicated queues, acknowledgements, dead-letter exchanges, routing keys, and existing operational experience.\n\n## Kafka\nHigh throughput and partition ordering, but requires a new operational platform and long-running job acknowledgement semantics need an additional design.\n\n## Redis Pub/Sub\nLow latency, but messages are not retained for disconnected consumers.\n"}
+        ],
+        "private_files": [],
+        "directories": [],
+        "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric",
+        "pass_policy": "all_required",
+        "checks": [
+          {"id": "decision_exists", "type": "file_exists", "required": true, "spec": {"path": "architecture/decision.md"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 80}}
+        ],
+        "rubric": {
+          "threshold": 80,
+          "scale": "0-4",
+          "criteria": [
+            {
+              "id": "constraint_fit",
+              "weight": 35,
+              "description": "Recommendation satisfies durability, throughput, ordering, observability, team capability, and schedule constraints.",
+              "anchors": {"0": "Recommendation violates a hard constraint.", "2": "Covers major constraints but misses important tradeoffs.", "4": "Makes a coherent recommendation, normally RabbitMQ quorum queues, and maps every hard constraint to concrete behavior."}
+            },
+            {
+              "id": "tradeoff_reasoning",
+              "weight": 25,
+              "description": "Rejects alternatives for task-specific reasons rather than generic product claims.",
+              "anchors": {"0": "No comparison or incorrect claims.", "2": "Lists alternatives with shallow comparison.", "4": "Explains why PostgreSQL, Kafka, and Redis are weaker under the stated load, operations, or durability constraints."}
+            },
+            {
+              "id": "failure_semantics",
+              "weight": 20,
+              "description": "Defines acknowledgement, retries, idempotency, per-customer ordering, and dead-letter behavior.",
+              "anchors": {"0": "No failure handling.", "2": "Mentions retries and DLQ without semantics.", "4": "Provides a consistent at-least-once design with bounded retries, idempotency keys, routing/partition strategy, and operator visibility."}
+            },
+            {
+              "id": "rollout_validation",
+              "weight": 20,
+              "description": "Proposes measurable validation and a staged six-week rollout.",
+              "anchors": {"0": "No rollout plan.", "2": "Generic staging and monitoring plan.", "4": "Includes load/soak tests, restart recovery, ordering tests, DLQ drills, capacity targets, and staged rollout/rollback."}
+            }
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["architecture/decision.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.repo-onboarding.v1",
+      "title": "Create an accurate repository startup guide",
+      "objective": "Measure repository inspection, command accuracy, prerequisite discovery, and concise developer-facing documentation.",
+      "difficulty": "medium",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["terminal_bench", "gaia", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "run_shell", "write_file"], "supporting_tools": ["list_files", "glob", "grep"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {
+        "kind": "live_agent",
+        "repetitions": 3,
+        "max_steps": 16,
+        "timeout_seconds": 600,
+        "required_harness_features": ["workspace_materialization", "rubric_judge"]
+      },
+      "model_input": {
+        "allowed_tools": ["list_files", "glob", "grep", "read_file", "run_shell", "write_file"],
+        "turns": [
+          {
+            "id": "main",
+            "session_policy": "new",
+            "prompt": "请检查这个仓库并为新开发者编写 STARTUP.md，覆盖前置条件、环境准备、必需变量、开发启动、测试、健康检查和最可能的启动故障。能实际验证的命令要验证，但不要修改应用代码。 证据引用请使用相对路径:行号格式。"
+          }
+        ]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "pyproject.toml", "content": "[project]\nname = 'mini-service'\nrequires-python = '>=3.11'\ndependencies = []\n\n[project.scripts]\nmini-service = 'app.__main__:main'\n"},
+          {"path": ".env.example", "content": "APP_ENV=development\nAPP_PORT=8123\nDATA_FILE=data/items.json\n"},
+          {"path": "app/__main__.py", "content": "import json\nimport os\nfrom pathlib import Path\n\ndef main():\n    data_file = Path(os.environ['DATA_FILE'])\n    json.loads(data_file.read_text(encoding='utf-8'))\n    print(f\"healthy:{os.environ.get('APP_PORT', '8123')}\")\n\nif __name__ == '__main__':\n    main()\n"},
+          {"path": "data/items.json", "content": "[{\"id\": 1, \"name\": \"demo\"}]\n"},
+          {"path": "tests/test_data.py", "content": "import json\nfrom pathlib import Path\n\ndef test_fixture_is_valid_json():\n    assert json.loads(Path('data/items.json').read_text())[0]['id'] == 1\n"},
+          {"path": "Makefile", "content": "run:\n\tpython -m app\n\nhealth:\n\tpython -m app | findstr healthy\n\ntest:\n\tpython -m pytest -q\n"}
+        ],
+        "private_files": [],
+        "directories": [],
+        "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric",
+        "pass_policy": "all_required",
+        "checks": [
+          {"id": "guide_exists", "type": "file_exists", "required": true, "spec": {"path": "STARTUP.md"}},
+          {"id": "app_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "app/__main__.py", "content": "import json\nimport os\nfrom pathlib import Path\n\ndef main():\n    data_file = Path(os.environ['DATA_FILE'])\n    json.loads(data_file.read_text(encoding='utf-8'))\n    print(f\"healthy:{os.environ.get('APP_PORT', '8123')}\")\n\nif __name__ == '__main__':\n    main()\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 85}}
+        ],
+        "rubric": {
+          "threshold": 85,
+          "scale": "0-4",
+          "criteria": [
+            {
+              "id": "technical_accuracy",
+              "weight": 35,
+              "description": "Commands, prerequisites, variables, paths, and port match repository evidence.",
+              "anchors": {"0": "Contains commands that cannot work or misses hard prerequisites.", "2": "Mostly correct with one material omission.", "4": "All startup and test instructions are directly supported by repository files."}
+            },
+            {
+              "id": "workflow_completeness",
+              "weight": 30,
+              "description": "Covers setup through health verification and common failure recovery.",
+              "anchors": {"0": "Only a startup command.", "2": "Covers setup and run but lacks verification or troubleshooting.", "4": "Provides an efficient sequence for install, env configuration, run, test, health check, and missing DATA_FILE diagnosis."}
+            },
+            {
+              "id": "verification_discipline",
+              "weight": 20,
+              "description": "Distinguishes commands actually verified from commands inferred from configuration.",
+              "anchors": {"0": "Claims unsupported verification or invents results.", "2": "Commands are plausible but verification is unclear.", "4": "Reports verification precisely and avoids pretending a persistent server was started when only a one-shot health command exists."}
+            },
+            {
+              "id": "developer_usability",
+              "weight": 15,
+              "description": "Guide is concise, ordered, and easy to execute on the current platform.",
+              "anchors": {"0": "Disorganized or ambiguous.", "2": "Usable but verbose or missing command context.", "4": "Short, ordered sections with copyable commands and clear expected signals."}
+            }
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["STARTUP.md"], "include_execution_evidence": true}
+      },
+      "failure_labels": ["wrong_tool", "incomplete_goal", "collateral_change", "hallucinated_evidence", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.frontend-accessibility-audit.v1",
+      "title": "Audit a checkout page for accessibility risks",
+      "objective": "Measure evidence-based frontend accessibility analysis and prioritized remediation.",
+      "difficulty": "easy",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["gaia", "g_eval", "swe_bench"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "grep", "write_file"], "supporting_tools": ["read_file"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 14, "timeout_seconds": 480, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请审查 checkout 页面现有实现，并把无障碍问题写入 reports/accessibility.md。按影响分级，引用具体文件证据，说明键盘、表单标签、错误提示和颜色对比方面的问题，并给出最小修复建议。不要修改源码。 证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "web/checkout.html", "content": "<main><h1>Checkout</h1><div class=\"field\"><span>Email</span><input id=\"email\"></div><div class=\"error\">Invalid email</div><div class=\"pay\" onclick=\"submitOrder()\">Pay now</div></main>\n"},
+          {"path": "web/checkout.css", "content": ".error{color:#aaa;background:#fff}.pay{background:#1261a0;color:#fff;padding:8px}.pay:focus{outline:none}\n"},
+          {"path": "web/checkout.js", "content": "export function submitOrder(){ document.querySelector('.error').textContent='Payment failed'; }\n"}
+        ],
+        "private_files": [], "directories": ["reports"], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "report_exists", "type": "file_exists", "required": true, "spec": {"path": "reports/accessibility.md"}},
+          {"id": "source_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "web/checkout.html", "content": "<main><h1>Checkout</h1><div class=\"field\"><span>Email</span><input id=\"email\"></div><div class=\"error\">Invalid email</div><div class=\"pay\" onclick=\"submitOrder()\">Pay now</div></main>\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 80}}
+        ],
+        "rubric": {
+          "threshold": 80, "scale": "0-4",
+          "criteria": [
+            {"id": "evidence", "weight": 40, "description": "Findings cite the actual markup, style, and behavior evidence.", "anchors": {"0": "Claims are unsupported or materially wrong.", "2": "Finds major issues but misses evidence or impact.", "4": "Correctly connects labels, keyboard semantics, focus, live errors, and contrast to exact repository evidence."}},
+            {"id": "prioritization", "weight": 30, "description": "Severity reflects user impact and blocks before refinements.", "anchors": {"0": "No prioritization.", "2": "Has severities with weak rationale.", "4": "Prioritizes keyboard-inaccessible payment and unlabeled input, then feedback and visual issues with clear rationale."}},
+            {"id": "remediation", "weight": 30, "description": "Recommendations are minimal, technically correct, and testable.", "anchors": {"0": "Advice is generic or harmful.", "2": "Plausible fixes without validation.", "4": "Proposes semantic button/label, focus-visible behavior, announced errors, contrast verification, and concrete regression checks."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["reports/accessibility.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "collateral_change", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.dependency-upgrade-risk.v1",
+      "title": "Assess a dependency upgrade proposal",
+      "objective": "Measure concise compatibility and rollout risk analysis grounded in manifests and release notes.",
+      "difficulty": "easy",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench", "gaia", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "grep", "write_file"], "supporting_tools": ["glob"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 14, "timeout_seconds": 480, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "团队准备把 web 应用升级到 React 19。请根据仓库里的依赖清单和供应商说明，在 reports/react19-risk.md 中给出是否现在升级的建议、主要兼容风险、验证清单和回退方案。不要改依赖文件。 证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "web/package.json", "content": "{\"engines\":{\"node\":\">=18 <21\"},\"dependencies\":{\"react\":\"18.3.1\",\"react-dom\":\"18.3.1\",\"legacy-grid\":\"4.2.0\"},\"devDependencies\":{\"@testing-library/react\":\"14.3.1\"}}\n"},
+          {"path": "vendor/react-19-notes.md", "content": "React 19 requires the new JSX transform. Legacy string refs are removed. Libraries should declare React 19 peer support. Node 18.17 or newer is supported.\n"},
+          {"path": "vendor/legacy-grid.md", "content": "legacy-grid 4.2 supports peer react ^17 || ^18. React 19 support is planned for 5.0. The application uses its EditableGrid component.\n"},
+          {"path": "web/src/orders.jsx", "content": "import {EditableGrid} from 'legacy-grid';\nexport const Orders=()=> <EditableGrid />;\n"}
+        ],
+        "private_files": [], "directories": ["reports"], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "report_exists", "type": "file_exists", "required": true, "spec": {"path": "reports/react19-risk.md"}},
+          {"id": "manifest_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "web/package.json", "content": "{\"engines\":{\"node\":\">=18 <21\"},\"dependencies\":{\"react\":\"18.3.1\",\"react-dom\":\"18.3.1\",\"legacy-grid\":\"4.2.0\"},\"devDependencies\":{\"@testing-library/react\":\"14.3.1\"}}\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 80}}
+        ],
+        "rubric": {
+          "threshold": 80, "scale": "0-4",
+          "criteria": [
+            {"id": "compatibility", "weight": 40, "description": "Analysis accurately identifies direct and transitive compatibility constraints.", "anchors": {"0": "Misses the incompatible grid dependency.", "2": "Flags it but lacks code-use evidence.", "4": "Ties peer range, actual EditableGrid usage, JSX requirements, and Node range to a defensible recommendation."}},
+            {"id": "decision", "weight": 30, "description": "Recommendation distinguishes blockers from manageable work.", "anchors": {"0": "Unjustified go/no-go.", "2": "Reasonable direction with weak conditions.", "4": "Defers production upgrade or gates it on grid replacement/support, with explicit decision criteria."}},
+            {"id": "validation", "weight": 30, "description": "Plan covers test, canary, monitoring, and rollback.", "anchors": {"0": "No execution plan.", "2": "Generic testing and rollback.", "4": "Includes grid editing flows, render/hydration tests, dependency audit, staged rollout, signals, and a lockfile rollback."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["reports/react19-risk.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.repository-architecture-report.v1",
+      "title": "Explain a small service architecture accurately",
+      "objective": "Measure repository comprehension and communication of real data flow and ownership.",
+      "difficulty": "easy",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["gaia", "agent_bench", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "read_file", "write_file"], "supporting_tools": ["grep"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 14, "timeout_seconds": 480, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请阅读这个订单服务，为接手维护的工程师编写 ARCHITECTURE.md。说明入口、请求流、业务层、数据访问、外部支付边界、配置来源和测试分层；只写仓库中能证实的内容，不要修改代码。 证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "app/main.py", "content": "from app.routes import create_order\ndef handle(request, db, payment): return create_order(request, db, payment)\n"},
+          {"path": "app/routes.py", "content": "from app.service import OrderService\ndef create_order(request, db, payment): return OrderService(db,payment).create(request['customer'],request['amount'])\n"},
+          {"path": "app/service.py", "content": "from app.store import OrderStore\nclass OrderService:\n def __init__(self,db,payment): self.store=OrderStore(db); self.payment=payment\n def create(self,customer,amount):\n  charge=self.payment.charge(amount); return self.store.insert(customer,amount,charge)\n"},
+          {"path": "app/store.py", "content": "class OrderStore:\n def __init__(self,db): self.db=db\n def insert(self,customer,amount,charge): return self.db.insert({'customer':customer,'amount':amount,'charge':charge})\n"},
+          {"path": "config/settings.py", "content": "import os\nDATABASE_URL=os.environ['DATABASE_URL']\nPAYMENT_TIMEOUT=int(os.environ.get('PAYMENT_TIMEOUT','3'))\n"},
+          {"path": "tests/test_service.py", "content": "# service tests inject fake db and payment collaborators\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "doc_exists", "type": "file_exists", "required": true, "spec": {"path": "ARCHITECTURE.md"}},
+          {"id": "source_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "app/service.py", "content": "from app.store import OrderStore\nclass OrderService:\n def __init__(self,db,payment): self.store=OrderStore(db); self.payment=payment\n def create(self,customer,amount):\n  charge=self.payment.charge(amount); return self.store.insert(customer,amount,charge)\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 82}}
+        ],
+        "rubric": {
+          "threshold": 82, "scale": "0-4",
+          "criteria": [
+            {"id": "accuracy", "weight": 45, "description": "Architecture and call flow match source evidence.", "anchors": {"0": "Invents components or reverses flow.", "2": "Mostly correct but misses a material boundary.", "4": "Accurately traces main to route to service to payment/store and describes injected dependencies."}},
+            {"id": "boundaries", "weight": 30, "description": "Ownership, configuration, and external boundaries are explicit.", "anchors": {"0": "No boundaries.", "2": "Lists modules without ownership implications.", "4": "Clearly separates transport, business logic, persistence, payment, environment configuration, and tests."}},
+            {"id": "usability", "weight": 25, "description": "Document helps a maintainer locate changes and tests.", "anchors": {"0": "Unusable inventory.", "2": "Readable but not actionable.", "4": "Concise map with change-location guidance, verified paths, and stated evidence limits."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["ARCHITECTURE.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "collateral_change", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.data-quality-assessment.v1",
+      "title": "Assess customer export data quality",
+      "objective": "Measure exact factual profiling plus practical remediation recommendations.",
+      "difficulty": "easy",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["gaia", "agent_bench", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["read_file", "run_shell", "write_file"], "supporting_tools": ["grep"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 14, "timeout_seconds": 480, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["grep", "read_file", "run_shell", "write_file"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请分析 data/customers.csv 的质量，并把结果写入 reports/data-quality.md。给出总行数、重复 id、缺失邮箱、非法日期和金额异常的准确统计，说明业务影响，并提出导入前的拦截与修复顺序。不要改原始数据。 证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "data/customers.csv", "content": "id,email,joined_at,lifetime_value\nC1,a@example.com,2026-01-10,120.50\nC2,b@example.com,2026-02-20,80.00\nC2,b2@example.com,2026-02-21,90.00\nC3,,2026-03-01,10.00\nC4,d@example.com,2026-13-02,-5.00\n"},
+          {"path": "data/import-rules.md", "content": "id must be unique; email is required; joined_at is an ISO calendar date; lifetime_value cannot be negative.\n"}
+        ],
+        "private_files": [], "directories": ["reports"], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "report_exists", "type": "file_exists", "required": true, "spec": {"path": "reports/data-quality.md"}},
+          {"id": "data_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "data/customers.csv", "content": "id,email,joined_at,lifetime_value\nC1,a@example.com,2026-01-10,120.50\nC2,b@example.com,2026-02-20,80.00\nC2,b2@example.com,2026-02-21,90.00\nC3,,2026-03-01,10.00\nC4,d@example.com,2026-13-02,-5.00\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 82}}
+        ],
+        "rubric": {
+          "threshold": 82, "scale": "0-4",
+          "criteria": [
+            {"id": "profiling", "weight": 45, "description": "All requested counts and offending records are exact.", "anchors": {"0": "Materially wrong counts.", "2": "Finds most issues with ambiguity.", "4": "Reports five rows, duplicate C2, one missing email, one invalid date, and one negative value with record evidence."}},
+            {"id": "impact", "weight": 25, "description": "Business impact follows from each violated import rule.", "anchors": {"0": "No impact analysis.", "2": "Generic quality concerns.", "4": "Connects duplicates to overwrites, missing contact data, date parsing, and negative value corruption."}},
+            {"id": "remediation", "weight": 30, "description": "Validation and repair sequence is deterministic and auditable.", "anchors": {"0": "Suggests deleting bad rows blindly.", "2": "Lists checks without sequencing.", "4": "Proposes quarantine, uniqueness resolution, required-field recovery, typed validation, owner review, and re-run evidence."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["reports/data-quality.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "collateral_change", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.deployment-readiness-review.v1",
+      "title": "Review a service for production deployment readiness",
+      "objective": "Measure a focused readiness review across container, health, configuration, and rollback evidence.",
+      "difficulty": "easy",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["terminal_bench", "gaia", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "read_file", "write_file"], "supporting_tools": ["grep"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 14, "timeout_seconds": 480, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请评估这个服务是否可以进入生产环境，把结论写入 READINESS.md。列出阻塞项、上线前检查、观测信号和回退步骤，并单独评估健康检查是否足够。还要评估部署文件直接写入连接串的风险，给出可判定的启动、健康、连接、请求、错误、延迟、资源和副本检查，以及分阶段发布、暂停条件和回退演练。仓库没有提供数值门槛时，明确标为上线前待确认，不能虚构。所有判断都要引用仓库证据。不要修改部署文件。证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "Dockerfile", "content": "FROM python:3.12\nWORKDIR /app\nCOPY . .\nCMD [\"python\",\"-m\",\"app\"]\n"},
+          {"path": "deploy.yaml", "content": "replicas: 1\nimage: pico/api:latest\nenv:\n  DATABASE_URL: postgres://prod/app\nresources: {}\n"},
+          {"path": "app/__main__.py", "content": "from app.server import serve\nserve(port=8080)\n"},
+          {"path": "app/server.py", "content": "def serve(port): print(f'listening:{port}')\n"},
+          {"path": "ops/runbook.md", "content": "Rollback requires redeploying the previous immutable image tag. No previous tag is recorded automatically.\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "report_exists", "type": "file_exists", "required": true, "spec": {"path": "READINESS.md"}},
+          {"id": "deploy_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "deploy.yaml", "content": "replicas: 1\nimage: pico/api:latest\nenv:\n  DATABASE_URL: postgres://prod/app\nresources: {}\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 80}}
+        ],
+        "rubric": {
+          "threshold": 80, "scale": "0-4",
+          "criteria": [
+            {"id": "blockers", "weight": 40, "description": "Readiness blockers are grounded in concrete deployment evidence.", "anchors": {"0": "Declares ready or invents blockers.", "2": "Finds some risks without severity.", "4": "Treats mutable image, one replica, absent health checks/resources, a connection string written directly in the manifest, and weak rollback traceability appropriately."}},
+            {"id": "verification", "weight": 30, "description": "Preflight and monitoring checks are specific to the service.", "anchors": {"0": "No checks.", "2": "Generic smoke tests.", "4": "Defines startup, health, DB connectivity, request/error/latency, resource, and replica checks with pass criteria."}},
+            {"id": "rollout", "weight": 30, "description": "Rollout and rollback plan is safe and executable.", "anchors": {"0": "No rollback.", "2": "Mentions previous version.", "4": "Pins immutable tags, records previous version, stages traffic, defines stop conditions, and gives tested rollback steps."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["READINESS.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "collateral_change", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.api-migration-plan.v1",
+      "title": "Plan a backward-compatible API migration",
+      "objective": "Measure contract comparison, client discovery, sequencing, and rollback design.",
+      "difficulty": "medium",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench", "gaia", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["grep", "read_file", "write_file"], "supporting_tools": ["glob", "todo_write"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 18, "timeout_seconds": 600, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "订单接口准备从 v1 迁移到 v2。请检查契约和仓库中的调用方，在 plans/orders-v2.md 中制定兼容迁移方案，覆盖字段映射、消费者顺序、双写或适配策略、监控、弃用节奏和回退条件。不要修改代码。 证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "contracts/orders-v1.json", "content": "{\"path\":\"/api/v1/orders\",\"response\":{\"id\":\"string\",\"total\":\"number\",\"status\":\"paid|cancelled\"}}\n"},
+          {"path": "contracts/orders-v2.json", "content": "{\"path\":\"/api/v2/orders\",\"response\":{\"order_id\":\"string\",\"total_cents\":\"integer\",\"state\":\"completed|voided\",\"currency\":\"string\"}}\n"},
+          {"path": "web/src/orders.ts", "content": "fetch('/api/v1/orders').then(r=>r.json()).then(rows=>rows.map(x=>x.total))\n"},
+          {"path": "jobs/export.py", "content": "URL='/api/v1/orders'\ndef row(order): return [order['id'],order['status']]\n"},
+          {"path": "mobile/README.md", "content": "Mobile 6.x consumes /api/v1/orders and updates quarterly. Current installed minimum is 6.2.\n"},
+          {"path": "ops/slo.md", "content": "Orders API error rate < 0.5%; p95 latency < 300 ms.\n"}
+        ],
+        "private_files": [], "directories": ["plans"], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "plan_exists", "type": "file_exists", "required": true, "spec": {"path": "plans/orders-v2.md"}},
+          {"id": "contracts_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "contracts/orders-v2.json", "content": "{\"path\":\"/api/v2/orders\",\"response\":{\"order_id\":\"string\",\"total_cents\":\"integer\",\"state\":\"completed|voided\",\"currency\":\"string\"}}\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 84}}
+        ],
+        "rubric": {
+          "threshold": 84, "scale": "0-4",
+          "criteria": [
+            {"id": "contract_mapping", "weight": 35, "description": "Every breaking contract change is mapped with semantics and validation.", "anchors": {"0": "Misses material field changes.", "2": "Lists mappings without semantics.", "4": "Covers identifiers, currency conversion, state mapping, required currency, rounding, and compatibility behavior."}},
+            {"id": "consumer_sequence", "weight": 35, "description": "Plan accounts for all discovered consumers and release cadence.", "anchors": {"0": "Single cutover.", "2": "Mentions clients without sequencing.", "4": "Sequences adapter/server, web, export job, and slower mobile release with measurable adoption gates."}},
+            {"id": "safety", "weight": 30, "description": "Monitoring, deprecation, and rollback preserve service continuity.", "anchors": {"0": "No safety plan.", "2": "Generic metrics and rollback.", "4": "Defines comparison telemetry, SLO gates, shadow/dual serving, deprecation evidence, and reversible routing."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["plans/orders-v2.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.test-strategy.v1",
+      "title": "Design a risk-based test strategy for billing changes",
+      "objective": "Measure repository-aware test planning across units, integration boundaries, and failure modes.",
+      "difficulty": "medium",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench", "terminal_bench", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "grep", "write_file"], "supporting_tools": ["read_file", "run_shell"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 18, "timeout_seconds": 600, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "run_shell", "write_file"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "下个版本要修改订阅续费和优惠券叠加规则。请检查现有实现与测试，在 plans/billing-test-strategy.md 中给出风险排序、缺口、建议用例、测试层级、数据隔离和发布后验证。建议用例必须覆盖并发与重试；执行方案必须说明 CI 执行位置、测试责任归属、发布门禁和回滚信号。仓库没有给出 owner 或流水线现状时，将其写作建议或待确认项，不能虚构既有事实。不要实现测试或改业务代码。证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "billing/renewal.py", "content": "def renew(plan, coupon, gateway):\n subtotal=plan.monthly_cents\n discount=coupon.discount(subtotal) if coupon else 0\n charge=max(0,subtotal-discount)\n return gateway.charge(charge, idempotency_key=plan.subscription_id)\n"},
+          {"path": "billing/coupons.py", "content": "class Coupon:\n def __init__(self,percent=None,fixed_cents=None): self.percent=percent; self.fixed_cents=fixed_cents\n def discount(self,total): return self.fixed_cents or total*self.percent//100\n"},
+          {"path": "tests/test_coupons.py", "content": "def test_fixed_coupon(): pass\ndef test_percent_coupon(): pass\n"},
+          {"path": "tests/test_renewal.py", "content": "def test_renewal_without_coupon(): pass\n"},
+          {"path": "docs/change.md", "content": "New rule: one fixed and one percentage coupon may stack; percentage applies first. Retries must never double-charge. Expired coupons are rejected.\n"}
+        ],
+        "private_files": [], "directories": ["plans"], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "plan_exists", "type": "file_exists", "required": true, "spec": {"path": "plans/billing-test-strategy.md"}},
+          {"id": "source_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "billing/renewal.py", "content": "def renew(plan, coupon, gateway):\n subtotal=plan.monthly_cents\n discount=coupon.discount(subtotal) if coupon else 0\n charge=max(0,subtotal-discount)\n return gateway.charge(charge, idempotency_key=plan.subscription_id)\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 84}}
+        ],
+        "rubric": {
+          "threshold": 84, "scale": "0-4",
+          "criteria": [
+            {"id": "risk_model", "weight": 35, "description": "Strategy prioritizes financial correctness and duplicate-charge prevention.", "anchors": {"0": "No risk ranking.", "2": "General billing risks.", "4": "Ranks stacking order, boundaries, expiry, zero floor, retries/idempotency, and gateway failures by impact."}},
+            {"id": "coverage", "weight": 40, "description": "Test cases and layers map to code and change requirements.", "anchors": {"0": "Generic test list.", "2": "Covers happy paths and some edges.", "4": "Defines unit matrices, integration fakes, retry/concurrency cases, contract checks, and regression coverage for existing behavior."}},
+            {"id": "execution", "weight": 25, "description": "Data isolation, CI placement, and production validation are executable.", "anchors": {"0": "No execution details.", "2": "Mentions CI and monitoring.", "4": "Specifies deterministic fixtures, gateway isolation, suite ownership, release gates, canary comparison, alerts, and rollback signals."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["plans/billing-test-strategy.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.observability-gap-analysis.v1",
+      "title": "Analyze observability gaps in an order worker",
+      "objective": "Measure telemetry design grounded in existing logs, metrics, dashboards, and SLOs.",
+      "difficulty": "medium",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["terminal_bench", "gaia", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "grep", "write_file"], "supporting_tools": ["read_file"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 18, "timeout_seconds": 600, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "订单 worker 最近出现过延迟，但值班同学无法快速定位。请检查现有日志、指标、看板和 SLO，在 reports/observability-gaps.md 中列出缺口，设计优先补充的信号、标签约束、告警和排障入口。不要修改源码。 证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "worker/process.py", "content": "def process(order, logger, metrics):\n logger.info('processing order')\n metrics.inc('orders_total')\n charge(order)\n metrics.observe('duration_seconds', order.elapsed)\n"},
+          {"path": "ops/dashboard.json", "content": "{\"panels\":[{\"metric\":\"orders_total\",\"group_by\":[\"instance\"]}]}\n"},
+          {"path": "ops/alerts.yaml", "content": "alerts:\n- name: worker-down\n  expr: up == 0\n  for: 10m\n"},
+          {"path": "ops/slo.md", "content": "99% of paid orders begin processing within 60 seconds. Failed charges below 0.2%.\n"},
+          {"path": "logs/sample.log", "content": "INFO processing order\nINFO processing order\nERROR charge failed\n"}
+        ],
+        "private_files": [], "directories": ["reports"], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "report_exists", "type": "file_exists", "required": true, "spec": {"path": "reports/observability-gaps.md"}},
+          {"id": "source_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "worker/process.py", "content": "def process(order, logger, metrics):\n logger.info('processing order')\n metrics.inc('orders_total')\n charge(order)\n metrics.observe('duration_seconds', order.elapsed)\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 84}}
+        ],
+        "rubric": {
+          "threshold": 84, "scale": "0-4",
+          "criteria": [
+            {"id": "gap_accuracy", "weight": 40, "description": "Gaps follow from current signals and SLO requirements.", "anchors": {"0": "Invents existing coverage or misses SLO mismatch.", "2": "Finds weak logs and alerts.", "4": "Identifies absent identifiers/status, wrong duration semantics, no queue-age/failure metrics, weak aggregation, and SLO-unaware alerting."}},
+            {"id": "signal_design", "weight": 35, "description": "Proposed logs, metrics, and traces are useful and cardinality-safe.", "anchors": {"0": "Unbounded labels or generic telemetry.", "2": "Reasonable signals with incomplete dimensions.", "4": "Defines structured correlation, bounded outcome/cause labels, queue age histograms, charge failures, exemplars, and ownership."}},
+            {"id": "operations", "weight": 25, "description": "Dashboards, alerts, and runbook entry points support fast diagnosis.", "anchors": {"0": "No operator workflow.", "2": "Lists dashboards and alerts.", "4": "Maps SLO burn/latency/failure alerts to drilldowns, queries, decision points, and validation of signal quality."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["reports/observability-gaps.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.performance-investigation.v1",
+      "title": "Investigate a slow product search endpoint",
+      "objective": "Measure multi-source performance diagnosis and experiment design without premature changes.",
+      "difficulty": "medium",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench", "gaia", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "grep", "write_file"], "supporting_tools": ["read_file", "run_shell"], "scenario_class": "common", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 18, "timeout_seconds": 600, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "run_shell", "write_file"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "商品搜索的 p95 从 180ms 升到 920ms。请根据 samples 中的剖析结果、查询计划、发布记录和 ops/constraints.md，在 reports/search-performance.md 中提出最可能原因、证据链、需要验证的假设、低风险缓解和长期修复。长期修复必须保留中缀匹配需求，并考虑维护窗口与索引磁盘余量。不要改代码或数据库。 证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "samples/profile.txt", "content": "search total 910ms\n  db.query 720ms\n  serialize 35ms\n  feature_flags 18ms\n  other 137ms\n"},
+          {"path": "samples/explain.txt", "content": "Seq Scan on products rows=482000\nFilter: lower(name) ~~ '%phone%'\nRows Removed by Filter: 470120\n"},
+          {"path": "src/search.py", "content": "def search(db,q): return db.query('SELECT * FROM products WHERE lower(name) LIKE ?',('%'+q.lower()+'%',))\n"},
+          {"path": "ops/releases.md", "content": "2026-07-01 product catalog imported 420k new rows. No search code change.\n2026-07-02 p95 alert began.\n"},
+          {"path": "ops/constraints.md", "content": "Search must support infix matches. Maintenance window is Sunday. New indexes require disk headroom check.\n"}
+        ],
+        "private_files": [], "directories": ["reports"], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "report_exists", "type": "file_exists", "required": true, "spec": {"path": "reports/search-performance.md"}},
+          {"id": "code_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "src/search.py", "content": "def search(db,q): return db.query('SELECT * FROM products WHERE lower(name) LIKE ?',('%'+q.lower()+'%',))\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 84}}
+        ],
+        "rubric": {
+          "threshold": 84, "scale": "0-4",
+          "criteria": [
+            {"id": "diagnosis", "weight": 40, "description": "Primary cause and alternatives follow from timing, plan, and chronology.", "anchors": {"0": "Blames unrelated code.", "2": "Identifies sequential scan without causal depth.", "4": "Connects catalog growth, infix lower LIKE, sequential scan, and DB share while bounding secondary contributors."}},
+            {"id": "experiments", "weight": 30, "description": "Proposed measurements can confirm or falsify the diagnosis safely.", "anchors": {"0": "No validation.", "2": "Suggests generic load testing.", "4": "Defines representative queries, buffers/timing, candidate index explain, disk/build impact, cold/warm comparisons, and success thresholds."}},
+            {"id": "remediation", "weight": 30, "description": "Mitigation and durable fix respect infix behavior and operational constraints.", "anchors": {"0": "Suggests removing required behavior.", "2": "Recommends an index without rollout detail.", "4": "Separates short-term load controls from a compatible trigram/search index path with maintenance, monitoring, and rollback."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["reports/search-performance.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.database-latency-incident.v1",
+      "title": "Diagnose a production database latency incident",
+      "objective": "Measure incident reasoning across query logs, plans, schema, deployment timing, and mitigations.",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["swe_bench", "agent_bench", "gaia", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "grep", "write_file"], "supporting_tools": ["read_file", "todo_write"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 24, "timeout_seconds": 840, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "昨晚订单详情接口延迟暴涨并触发连接池耗尽。请分析 incident 目录中的证据，在 incident/report.md 中写出时间线、根因与促成因素、证据和反证、立即缓解、永久修复、验证与回退方案。立即缓解需覆盖流量或负载控制、沟通，以及为何不能把扩大连接池当作根治；预防方案需包含 canary 门禁和自动回滚阈值。数值门槛只能复用仓库证据，否则标为待 SRE 确认。不要修改应用或数据库文件。证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "incident/timeline.log", "content": "21:00 deploy api 4.8.0 complete\n21:06 p95 240ms -> 2.8s\n21:09 db pool active 40/40\n21:14 rollback api 4.7.3\n21:17 p95 260ms; pool active 11/40\n"},
+          {"path": "incident/queries.log", "content": "GET /orders/42 queries=1 duration=84ms version=4.7.3\nGET /orders/42 queries=52 duration=2710ms version=4.8.0\n"},
+          {"path": "incident/diff.txt", "content": "+ for item in order.items:\n+     item.product = db.products.get(item.product_id)\n- products = db.products.where_id_in(item_ids)\n"},
+          {"path": "incident/explain.txt", "content": "Index Scan products_pkey actual time=0.08ms loops=51\norders query actual time=76ms loops=1\n"},
+          {"path": "db/schema.sql", "content": "CREATE TABLE products(id bigint primary key,name text);\nCREATE TABLE order_items(order_id bigint,product_id bigint);\nCREATE INDEX order_items_order_id ON order_items(order_id);\n"},
+          {"path": "ops/limits.md", "content": "API pool max 40. Normal traffic 18 requests/s. Rollback target under five minutes.\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "report_exists", "type": "file_exists", "required": true, "spec": {"path": "incident/report.md"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 86}}
+        ],
+        "rubric": {
+          "threshold": 86, "scale": "0-4",
+          "criteria": [
+            {"id": "causal_analysis", "weight": 40, "description": "Root cause is proven across code change, query amplification, timing, and rollback.", "anchors": {"0": "Misidentifies root cause.", "2": "Calls it N+1 with incomplete chain.", "4": "Builds a precise deploy-to-N+1-to-connection occupancy-to-latency chain and distinguishes fast individual indexed lookups from aggregate cost."}},
+            {"id": "incident_response", "weight": 30, "description": "Immediate actions protect service while preserving evidence.", "anchors": {"0": "Unsafe or irrelevant response.", "2": "Rollback plus generic scaling.", "4": "Prioritizes rollback, traffic/load controls, pool observation, query sampling, communications, and explicitly avoids treating pool expansion as the fix."}},
+            {"id": "prevention", "weight": 30, "description": "Permanent fix, tests, monitoring, and rollout prevent recurrence.", "anchors": {"0": "No prevention.", "2": "Suggests eager loading and a test.", "4": "Specifies batched loading, query-count regression tests, representative load, per-route query telemetry, canary gates, and rollback thresholds."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["incident/report.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.queue-backlog-incident.v1",
+      "title": "Diagnose a queue backlog and duplicate processing incident",
+      "objective": "Measure distributed-systems incident reasoning from throughput, timing, retry, and worker evidence.",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["tau_bench", "agent_bench", "terminal_bench", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "grep", "write_file"], "supporting_tools": ["read_file", "todo_write"], "scenario_class": "boundary", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 24, "timeout_seconds": 840, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "邮件队列积压并出现重复发送。请审查 incident/queue 下的指标、配置和日志，在 incident/queue-report.md 中给出时间线、根因、重复机制、容量判断、立即止损和分阶段修复计划，并明确如何验证不会再次重复发送。 证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "incident/queue/metrics.csv", "content": "time,publish_per_min,complete_per_min,backlog,processing_p99_s\n10:00,500,520,80,22\n10:10,500,310,1980,74\n10:20,500,300,3980,81\n"},
+          {"path": "incident/queue/config.yaml", "content": "workers: 10\nvisibility_timeout_seconds: 45\nmax_attempts: 5\nprefetch_per_worker: 20\ndead_letter: email-dlq\n"},
+          {"path": "incident/queue/worker.log", "content": "10:11 job=J42 attempt=1 send accepted provider_id=P9 duration=71s\n10:11 job=J42 visibility expired at 45s\n10:12 job=J42 attempt=2 send accepted provider_id=P10 duration=68s\n"},
+          {"path": "incident/queue/code.txt", "content": "def handle(job):\n response=mail.send(job.message)\n db.mark_sent(job.id,response.id)\n queue.ack(job)\n"},
+          {"path": "incident/queue/provider.md", "content": "Mail API accepts an Idempotency-Key header for 24 hours. Current client does not set it.\n"}
+        ],
+        "private_files": [], "directories": [], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "report_exists", "type": "file_exists", "required": true, "spec": {"path": "incident/queue-report.md"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 86}}
+        ],
+        "rubric": {
+          "threshold": 86, "scale": "0-4",
+          "criteria": [
+            {"id": "causal_model", "weight": 40, "description": "Report explains both backlog growth and duplicate delivery from evidence.", "anchors": {"0": "Blames only worker count.", "2": "Finds timeout mismatch or throughput deficit.", "4": "Quantifies arrival versus completion, ties p99 above visibility timeout to redelivery, and explains send-before-record/ack plus absent idempotency."}},
+            {"id": "containment", "weight": 25, "description": "Immediate actions reduce customer harm without losing work.", "anchors": {"0": "Purges the queue or blindly retries.", "2": "Pauses producers and changes timeout.", "4": "Controls ingress, prevents duplicate sends, adjusts visibility based on runtime, preserves DLQ/evidence, and scales only with downstream capacity."}},
+            {"id": "durable_fix", "weight": 35, "description": "Design and validation address idempotency, timeout, capacity, and recovery.", "anchors": {"0": "Only increases workers.", "2": "Adds idempotency and tuning.", "4": "Defines stable keys/outbox or state transition, provider semantics, heartbeat/visibility, capacity targets, retry/DLQ policy, failure injection, and duplicate assertions."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["incident/queue-report.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "judge_disagreement"]
+    },
+    {
+      "id": "workflow.subjective.security-configuration-review.v1",
+      "title": "Review a production web stack for configuration risks",
+      "objective": "Measure cross-layer security review, exploitability reasoning, and safe remediation planning.",
+      "difficulty": "hard",
+      "status": "requires_harness_hook",
+      "benchmark_inspiration": ["agent_bench", "gaia", "terminal_bench", "g_eval"],
+      "coverage": {"track": "workflow", "primary_tools": ["glob", "grep", "write_file"], "supporting_tools": ["read_file", "todo_write"], "scenario_class": "recovery", "mechanisms": [], "prompt_language": "zh-CN"},
+      "runner": {"kind": "live_agent", "repetitions": 3, "max_steps": 24, "timeout_seconds": 840, "required_harness_features": ["workspace_materialization", "rubric_judge"]},
+      "model_input": {
+        "allowed_tools": ["glob", "grep", "read_file", "write_file", "todo_write"],
+        "turns": [{"id": "main", "session_policy": "new", "prompt": "请对这个生产 Web 服务做配置安全审查，把结果写入 security/review.md。按可利用性和影响排序，引用具体文件与配置，区分立即修复和后续加固，并为每项给出验证与回退办法。不要修改任何配置。 证据引用请使用相对路径:行号格式。"}]
+      },
+      "setup": {
+        "workspace_files": [
+          {"path": "config/app.env", "content": "APP_ENV=production\nDEBUG=true\nSECRET_KEY=dev-secret-123\nCORS_ORIGINS=*\nSESSION_COOKIE_SECURE=false\nSESSION_COOKIE_SAMESITE=None\n"},
+          {"path": "nginx/site.conf", "content": "server { listen 80; server_name app.pico.test; location / { proxy_pass http://app:8080; add_header Access-Control-Allow-Origin *; } }\n"},
+          {"path": "deploy/pod.yaml", "content": "spec:\n  containers:\n  - name: app\n    image: pico/web:2.1.0\n    securityContext:\n      runAsUser: 0\n      privileged: true\n    envFrom:\n    - configMapRef: {name: app-config}\n"},
+          {"path": "app/errors.py", "content": "def render_error(exc, debug): return repr(exc) if debug else 'internal error'\n"},
+          {"path": "ops/context.md", "content": "The app handles customer addresses and order history. TLS is expected to terminate at nginx. Session cookies authenticate all account actions.\n"}
+        ],
+        "private_files": [], "directories": ["security"], "actions": []
+      },
+      "evaluation": {
+        "method": "llm_rubric", "pass_policy": "all_required",
+        "checks": [
+          {"id": "review_exists", "type": "file_exists", "required": true, "spec": {"path": "security/review.md"}},
+          {"id": "config_unchanged", "type": "file_content_equals", "required": true, "spec": {"path": "config/app.env", "content": "APP_ENV=production\nDEBUG=true\nSECRET_KEY=dev-secret-123\nCORS_ORIGINS=*\nSESSION_COOKIE_SECURE=false\nSESSION_COOKIE_SAMESITE=None\n"}},
+          {"id": "rubric_gate", "type": "rubric_score", "required": true, "spec": {"threshold": 86}}
+        ],
+        "rubric": {
+          "threshold": 86, "scale": "0-4",
+          "criteria": [
+            {"id": "finding_accuracy", "weight": 40, "description": "Findings are technically correct, deduplicated across layers, and evidence-backed.", "anchors": {"0": "Misses critical exposures or invents vulnerabilities.", "2": "Finds most insecure settings with shallow analysis.", "4": "Correctly analyzes exposed secret/debug output, wildcard cross-origin policy, insecure cookies/TLS gap, and privileged root container with data context."}},
+            {"id": "risk_priority", "weight": 30, "description": "Severity combines exploit path, affected data, and existing controls.", "anchors": {"0": "Flat or arbitrary severity.", "2": "Reasonable ranking without attack chains.", "4": "Explains credential/session/data exposure paths, interactions among settings, prerequisites, and why immediate items outrank hardening."}},
+            {"id": "remediation", "weight": 30, "description": "Fix plan is sequenced, testable, and operationally reversible.", "anchors": {"0": "Generic hardening checklist.", "2": "Correct fixes without rollout safety.", "4": "Covers secret rotation, debug disablement, origin allowlist, TLS/cookie coordination, least privilege, validation probes, staged rollout, and explicit rollback cautions."}}
+          ]
+        },
+        "judge": {"config": "judge/rubric-judge.json", "artifact_paths": ["security/review.md"]}
+      },
+      "failure_labels": ["incomplete_goal", "hallucinated_evidence", "policy_violation", "collateral_change", "judge_disagreement"]
+    }
+  ]
+}
